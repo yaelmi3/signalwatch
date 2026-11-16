@@ -1,0 +1,31 @@
+[project]
+name = "signalwatch"
+version = "0.1.0"
+description = "Competitor content monitoring with audience-specific insights."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.163.1",
+    "pydantic>=2.14.3",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2==2.16.2",
+    "pytest==9.2.0",
+    "ruff==0.17.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
