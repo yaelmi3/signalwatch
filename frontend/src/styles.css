@@ -30,8 +30,45 @@ main {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding-block: 2.25rem;
+  padding-block: 1.25rem;
 }
+
+.configuration { max-width: 56rem; padding-block: 1rem 3rem; }
+.configuration h1 { font-size: 2rem; line-height: 1.25; letter-spacing: -0.025em; }
+.configuration h2 { margin: 0 0 0.5rem; font-size: 1.1rem; }
+.configuration p { margin: 0.5rem 0; line-height: 1.5; }
+.configuration section { margin-top: 1.75rem; }
+.configuration .muted { color: #56665e; }
+.configuration fieldset {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.configuration label { display: grid; flex: 1 1 12rem; gap: 0.35rem; font-size: 0.875rem; }
+.configuration input, .configuration button {
+  min-height: 2.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #a5b4a7;
+  border-radius: 4px;
+  font: inherit;
+}
+.configuration input { width: 100%; color: inherit; background: #fff; }
+.configuration button { color: #183a32; background: #eef1e8; cursor: pointer; }
+.configuration button:hover { background: #e0e8da; }
+.configuration button:disabled { cursor: wait; opacity: 0.6; }
+.configuration input:focus-visible, .configuration button:focus-visible { outline: 2px solid #237761; outline-offset: 3px; }
+.configuration [role="alert"] { color: #9b3028; }
+.configuration [role="status"] { color: #315e50; }
+.configuration .competitor { padding-top: 1rem; border-top: 1px solid #d5ddd1; }
+.page-list { margin: 0.75rem 0 1rem; padding: 0; list-style: none; }
+.page-item { padding-block: 0.75rem; border-bottom: 1px solid #e0e5db; }
+.configuration .page-url { overflow-wrap: anywhere; }
+.page-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-block: 0.5rem; }
+.watch-status { font-size: 0.875rem; }
 
 .brand {
   display: flex;
