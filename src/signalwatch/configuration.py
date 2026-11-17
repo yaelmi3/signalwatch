@@ -44,7 +44,7 @@ class PageInput(BaseModel):
 def _page(page_id: int) -> Page:
     page = storage.get_page(page_id)
     if page is None:
-        raise HTTPException(404, "Page not found.")
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Page not found.")
     return page
 
 
@@ -53,21 +53,38 @@ def list_competitors() -> list[Competitor]:
     return storage.list_competitors()
 
 
-@router.post("/competitors", status_code=201)
+@router.post("/competitors", status_code=HTTPStatus.CREATED)
 def add_competitor(payload: CompetitorInput) -> Competitor:
     competitor = storage.save_competitor(payload.name, str(payload.website))
     competitor.pages = [connect_page(competitor.pages[0].id)]
     return competitor
 
 
-@router.post("/competitors/{competitor_id}/pages", status_code=201)
+@router.delete("/competitors/{competitor_id}", status_code=HTTPStatus.NO_CONTENT)
+def delete_competitor(competitor_id: int) -> Response:
+    snapshot = storage.competitor_snapshot(competitor_id)
+    if snapshot is not None:
+        if any(page["state"] in (PageState.CREATING, PageState.ATTENTION) for page in snapshot.pages):
+            raise HTTPException(HTTPStatus.CONFLICT, "Watch creation is unconfirmed; maintainer attention is required.")
+        try:
+            for page in snapshot.pages:
+                if page["watch_id"] is not None:
+                    changedetection.delete_watch(page["watch_id"])
+        except changedetection.EngineError as error:
+            raise HTTPException(HTTPStatus.BAD_GATEWAY, str(error)) from None
+        if not storage.delete_competitor(snapshot):
+            raise HTTPException(HTTPStatus.CONFLICT, "The competitor or its pages changed; refresh before retrying.")
+    return Response(status_code=HTTPStatus.NO_CONTENT)
+
+
+@router.post("/competitors/{competitor_id}/pages", status_code=HTTPStatus.CREATED)
 def add_page(competitor_id: int, payload: PageInput) -> Page:
     try:
         page = storage.save_page(competitor_id, str(payload.url))
     except LookupError as error:
-        raise HTTPException(404, str(error)) from None
+        raise HTTPException(HTTPStatus.NOT_FOUND, str(error)) from None
     except ValueError as error:
-        raise HTTPException(409, str(error)) from None
+        raise HTTPException(HTTPStatus.CONFLICT, str(error)) from None
     return connect_page(page.id)
 
 
@@ -78,7 +95,7 @@ def connect_page(page_id: int) -> Page:
         return page
     title = storage.claim_watch_creation(page)
     if title is None:
-        raise HTTPException(409, "Watch creation is unconfirmed; maintainer attention is required.")
+        raise HTTPException(HTTPStatus.CONFLICT, "Watch creation is unconfirmed; maintainer attention is required.")
     try:
         watch_id = changedetection.create_watch(page.url, title)
     except changedetection.EngineError as error:

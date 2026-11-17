@@ -271,3 +271,110 @@ def test_delete_page_engine_failure_retains_page_for_retry(tmp_path: Path, monke
 
     assert [call.args[0].method for call in handler.call_args_list] == [HTTPMethod.DELETE, HTTPMethod.DELETE]
     assert all(call.args[0].url.path == f"/api/v1/watch/{watch_id}" for call in handler.call_args_list)
+
+
+def test_delete_competitor_cleans_children_and_preserves_unrelated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    competitor = storage.save_competitor("Original", "https://example.com/")
+    extra = storage.save_page(competitor.id, "https://example.com/pricing")
+    unrelated = storage.save_competitor("Unrelated", competitor.website)
+    first_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
+    second_id = "a655d37b-0928-4a73-aa9f-031411c407bc"
+    storage.link_watch(competitor.pages[0].id, first_id)
+    storage.link_watch(extra.id, second_id)
+    storage.link_watch(unrelated.pages[0].id, "bcb36d70-c935-4ae0-8424-c20811ae8196")
+    unrelated.pages = [storage.get_page(unrelated.pages[0].id)]
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.BAD_REQUEST, json={"message": f"No watch exists with the UUID of {first_id}"}),
+            httpx2.Response(HTTPStatus.NO_CONTENT),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        deleted = client.delete(f"/api/competitors/{competitor.id}")
+        assert deleted.status_code == HTTPStatus.NO_CONTENT
+        assert deleted.content == b""
+    with TestClient(app) as client:
+        assert client.get("/api/competitors").json() == [unrelated.model_dump(mode="json")]
+
+    assert storage.get_page(competitor.pages[0].id) is None
+    assert storage.get_page(extra.id) is None
+    assert [call.args[0].method for call in handler.call_args_list] == [HTTPMethod.DELETE, HTTPMethod.DELETE]
+    assert [call.args[0].url.path for call in handler.call_args_list] == [
+        f"/api/v1/watch/{first_id}",
+        f"/api/v1/watch/{second_id}",
+    ]
+
+
+def test_delete_empty_competitor_preserves_new_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(database_path))
+    with sqlite3.connect(database_path) as database:
+        database.execute("CREATE TABLE competitors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, website TEXT NOT NULL)")
+        database.execute("INSERT INTO competitors VALUES (1, 'Original', 'https://example.com/')")
+    handler = Mock()
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        deleted = client.delete("/api/competitors/1")
+        assert deleted.status_code == HTTPStatus.NO_CONTENT
+        assert deleted.content == b""
+        replacement = storage.save_competitor("Replacement", "https://example.org/")
+        assert replacement.id > 1
+        assert client.delete("/api/competitors/1").status_code == HTTPStatus.NO_CONTENT
+        assert client.get("/api/competitors").json() == [replacement.model_dump(mode="json")]
+
+    handler.assert_not_called()
+
+
+def test_delete_competitor_blocks_creation_then_retries_partial_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    competitor = storage.save_competitor("Example", "https://example.com/")
+    extra = storage.save_page(competitor.id, "https://example.com/pricing")
+    first_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
+    second_id = "a655d37b-0928-4a73-aa9f-031411c407bc"
+    storage.link_watch(competitor.pages[0].id, first_id)
+    assert storage.claim_watch_creation(extra) == competitor.name
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.NO_CONTENT),
+            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE, json={"message": "private test-api-key failure"}),
+            httpx2.Response(HTTPStatus.BAD_REQUEST, json={"message": f"No watch exists with the UUID of {first_id}"}),
+            httpx2.Response(HTTPStatus.NO_CONTENT),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        blocked = client.delete(f"/api/competitors/{competitor.id}")
+        assert blocked.status_code == HTTPStatus.CONFLICT
+        assert storage.get_page(extra.id).state == storage.PageState.CREATING
+        handler.assert_not_called()
+        storage.link_watch(extra.id, second_id)
+        before = client.get("/api/competitors").json()
+        failed = client.delete(f"/api/competitors/{competitor.id}")
+        assert failed.status_code == HTTPStatus.BAD_GATEWAY
+        assert failed.json() == {"detail": "The engine rejected the request (HTTP 503)."}
+        assert "test-api-key" not in failed.text
+        assert client.get("/api/competitors").json() == before
+    with TestClient(app) as client:
+        assert client.delete(f"/api/competitors/{competitor.id}").status_code == HTTPStatus.NO_CONTENT
+        assert client.get("/api/competitors").json() == []
+
+    assert [call.args[0].method for call in handler.call_args_list] == [HTTPMethod.DELETE] * 4
+    assert [call.args[0].url.path for call in handler.call_args_list] == [
+        f"/api/v1/watch/{first_id}",
+        f"/api/v1/watch/{second_id}",
+        f"/api/v1/watch/{first_id}",
+        f"/api/v1/watch/{second_id}",
+    ]
