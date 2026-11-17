@@ -23,13 +23,16 @@ const pageStates = {
   linked: "Watch connected", attention: "Needs attention",
 };
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+function request<T>(path: string, options?: RequestInit): Promise<T>;
+async function request(path: string, options?: RequestInit): Promise<unknown> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
     const detail = body && typeof body === "object" && "detail" in body ? body.detail : null;
     throw new Error(typeof detail === "string" ? detail : `Request failed (${response.status}).`);
   }
+  if (response.status === 204) return;
+  if (options?.method === "DELETE") throw new Error(`Unexpected deletion response (${response.status}).`);
   return response.json();
 }
 
@@ -43,18 +46,26 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : "The request could not be completed. Please try again.";
 }
 
-function PageItem({ page, onChange }: { page: Page; onChange: (page: Page) => void }) {
-  const [busy, setBusy] = useState<"connect" | "status" | null>(null);
+function PageItem({ page, onChange, onDelete, disabled }: {
+  page: Page; onChange: (page: Page) => void; onDelete: (page: Page) => void; disabled: boolean;
+}) {
+  const [busy, setBusy] = useState<"connect" | "status" | "delete" | null>(null);
   const [error, setError] = useState("");
   const [status, setStatus] = useState<WatchStatus | null>(null);
 
-  async function run(action: "connect" | "status") {
+  async function run(action: "connect" | "status" | "delete") {
+    if (action === "delete" && !window.confirm(
+      `Delete page ${page.url} and its changedetection watch and history? This cannot be undone.`,
+    )) return;
     setBusy(action);
     setError("");
     setStatus(null);
     try {
       if (action === "connect") {
         onChange(await post<Page>(`/api/pages/${page.id}/connect`));
+      } else if (action === "delete") {
+        await request<void>(`/api/pages/${page.id}`, { method: "DELETE" });
+        onDelete(page);
       } else {
         setStatus(await request<WatchStatus>(`/api/pages/${page.id}/status`));
       }
@@ -72,12 +83,16 @@ function PageItem({ page, onChange }: { page: Page; onChange: (page: Page) => vo
       {page.error && <p role="alert">{page.error}</p>}
       <div className="page-actions">
         {page.state === "pending" && (
-          <button disabled={busy !== null} onClick={() => void run("connect")}>
+          <button disabled={busy !== null || disabled} onClick={() => void run("connect")}>
             {busy === "connect" ? "Connecting…" : "Retry connection"}
           </button>
         )}
-        <button disabled={busy !== null} onClick={() => void run("status")}>
+        <button disabled={busy !== null || disabled} onClick={() => void run("status")}>
           {busy === "status" ? "Refreshing…" : "Refresh status"}
+        </button>
+        <button disabled={busy !== null || disabled} onClick={() => void run("delete")}
+          aria-label={`Delete page ${page.url}`}>
+          {busy === "delete" ? "Deleting…" : "Delete page"}
         </button>
       </div>
       {error && <p role="alert">{error}</p>}
@@ -93,10 +108,11 @@ function PageItem({ page, onChange }: { page: Page; onChange: (page: Page) => vo
   );
 }
 
-function CompetitorSection({ competitor, onPage }: {
-  competitor: Competitor; onPage: (page: Page) => void;
+function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
+  competitor: Competitor; onPage: (page: Page) => void; onDelete: (page: Page) => void;
+  onRemove: (competitorId: number) => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<"add" | "delete" | null>(null);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
 
@@ -104,7 +120,7 @@ function CompetitorSection({ competitor, onPage }: {
     event.preventDefault();
     const form = event.currentTarget;
     const url = String(new FormData(form).get("url") ?? "");
-    setBusy(true);
+    setBusy("add");
     setError("");
     setSaved(false);
     try {
@@ -114,7 +130,25 @@ function CompetitorSection({ competitor, onPage }: {
     } catch (cause) {
       setError(message(cause));
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function deleteCompetitor() {
+    if (!window.confirm(
+      `Delete source ${competitor.name}, all its pages, ` +
+      "and all linked changedetection watches and history? This cannot be undone.",
+    )) return;
+    setBusy("delete");
+    setError("");
+    setSaved(false);
+    try {
+      await request<void>(`/api/competitors/${competitor.id}`, { method: "DELETE" });
+      onRemove(competitor.id);
+    } catch (cause) {
+      setError(message(cause));
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -122,17 +156,21 @@ function CompetitorSection({ competitor, onPage }: {
     <section className="competitor" aria-labelledby={`competitor-${competitor.id}`}>
       <h2 id={`competitor-${competitor.id}`}>{competitor.name}</h2>
       <p className="muted">{competitor.website}</p>
+      <button disabled={busy !== null} onClick={() => void deleteCompetitor()}
+        aria-label={`Delete source ${competitor.name}`}>
+        {busy === "delete" ? "Deleting…" : "Delete source"}
+      </button>
       {competitor.pages.length ? (
         <ul className="page-list">{competitor.pages.map((page) => (
-          <PageItem key={page.id} page={page} onChange={onPage} />
+          <PageItem key={page.id} page={page} onChange={onPage} onDelete={onDelete} disabled={busy === "delete"} />
         ))}</ul>
       ) : <p>No pages saved.</p>}
       <form onSubmit={addPage} aria-label={`Add page for ${competitor.name}`}>
-        <fieldset disabled={busy}>
+        <fieldset disabled={busy !== null}>
           <label>Page URL
             <input name="url" type="url" placeholder="https://example.com/updates" required />
           </label>
-          <button type="submit">{busy ? "Saving…" : "Add page"}</button>
+          <button type="submit">{busy === "add" ? "Saving…" : "Add page"}</button>
         </fieldset>
         {error && <p role="alert">{error}</p>}
         {saved && <p role="status">Page saved.</p>}
@@ -194,6 +232,12 @@ function App() {
     }));
   }
 
+  function deletePage(page: Page) {
+    setCompetitors((current) => current.map((competitor) => competitor.id === page.competitor_id
+      ? { ...competitor, pages: competitor.pages.filter((item) => item.id !== page.id) }
+      : competitor));
+  }
+
   return (
     <>
       <header className="site-header">
@@ -204,30 +248,32 @@ function App() {
       </header>
       <main className="configuration">
         <h1>Configuration</h1>
-        <p className="muted">Save competitors and the pages you want to monitor.</p>
+        <p className="muted">Add sources and choose which pages to monitor.</p>
         <section aria-labelledby="add-competitor-title">
-          <h2 id="add-competitor-title">Add competitor</h2>
+          <h2 id="add-competitor-title">Add source</h2>
           <form onSubmit={addCompetitor}>
             <fieldset disabled={saving || loading || Boolean(loadError)}>
               <label>Name<input name="name" required /></label>
               <label>Website
                 <input name="website" type="url" placeholder="https://example.com" required />
               </label>
-              <button type="submit">{saving ? "Saving…" : "Add competitor"}</button>
+              <button type="submit">{saving ? "Saving…" : "Add source"}</button>
             </fieldset>
             {saveError && <p role="alert">{saveError}</p>}
-            {saved && <p role="status">Competitor saved, including its homepage.</p>}
+            {saved && <p role="status">Source saved, including its homepage.</p>}
           </form>
         </section>
         <section aria-labelledby="competitors-title">
-          <h2 id="competitors-title">Competitors</h2>
-          {loading ? <p role="status">Loading competitors…</p> : loadError ? (
+          <h2 id="competitors-title">Sources</h2>
+          {loading ? <p role="status">Loading sources…</p> : loadError ? (
             <div>
               <p role="alert">{loadError}</p>
               <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
             </div>
-          ) : competitors.length === 0 ? <p>No competitors saved.</p> : competitors.map((competitor) => (
-            <CompetitorSection key={competitor.id} competitor={competitor} onPage={updatePage} />
+          ) : competitors.length === 0 ? <p>No sources saved.</p> : competitors.map((competitor) => (
+            <CompetitorSection key={competitor.id} competitor={competitor}
+              onPage={updatePage} onDelete={deletePage}
+              onRemove={(id) => setCompetitors((current) => current.filter((item) => item.id !== id))} />
           ))}
         </section>
       </main>

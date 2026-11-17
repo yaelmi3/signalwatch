@@ -10,9 +10,10 @@ from signalwatch.network import send_request
 
 
 class EngineError(Exception):
-    def __init__(self, message: str, uncertain: bool = False) -> None:
+    def __init__(self, message: str, uncertain: bool = False, *, response: httpx2.Response | None = None) -> None:
         super().__init__(message)
         self.uncertain = uncertain
+        self.response = response
 
 
 class CreatedWatch(BaseModel):
@@ -70,6 +71,20 @@ def read_watch(watch_id: str) -> WatchStatus:
     )
 
 
+def delete_watch(watch_id: str) -> None:
+    try:
+        _request(method=HTTPMethod.DELETE, path=f"watch/{quote(watch_id, safe='')}")
+    except EngineError as error:
+        if error.response is None or error.response.status_code != HTTPStatus.BAD_REQUEST:
+            raise
+        try:
+            missing = error.response.json() == {"message": f"No watch exists with the UUID of {watch_id}"}
+        except ValueError:
+            missing = False
+        if not missing:
+            raise
+
+
 def _request(*, method: HTTPMethod, path: str, payload: dict[str, str | bool] | None = None) -> object:
     address, key = os.getenv("CHANGEDETECTION_URL"), os.getenv("CHANGEDETECTION_API_KEY")
     if not address or not key:
@@ -97,7 +112,12 @@ def _request(*, method: HTTPMethod, path: str, payload: dict[str, str | bool] | 
         raise EngineError(
             f"The engine rejected the request (HTTP {code}).",
             method == HTTPMethod.POST and not HTTPStatus.BAD_REQUEST <= code < HTTPStatus.INTERNAL_SERVER_ERROR,
+            response=error.response,
         ) from None
+    if method == HTTPMethod.DELETE:
+        if response.status_code != HTTPStatus.NO_CONTENT:
+            raise EngineError("The engine returned an invalid deletion response.")
+        return None
     try:
         return response.json()
     except ValueError:
