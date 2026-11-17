@@ -1,7 +1,8 @@
+from http import HTTPStatus
 from ipaddress import ip_address
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import AfterValidator, BaseModel, BeforeValidator, HttpUrl, StringConstraints
 
 from signalwatch import changedetection, storage
@@ -86,6 +87,22 @@ def connect_page(page_id: int) -> Page:
     else:
         storage.link_watch(page_id, watch_id)
     return _page(page_id)
+
+
+@router.delete("/pages/{page_id}", status_code=HTTPStatus.NO_CONTENT)
+def delete_page(page_id: int) -> Response:
+    page = storage.get_page(page_id)
+    if page is not None:
+        if page.state in (PageState.CREATING, PageState.ATTENTION):
+            raise HTTPException(HTTPStatus.CONFLICT, "Watch creation is unconfirmed; maintainer attention is required.")
+        if page.watch_id is not None:
+            try:
+                changedetection.delete_watch(page.watch_id)
+            except changedetection.EngineError as error:
+                raise HTTPException(HTTPStatus.BAD_GATEWAY, str(error)) from None
+        if not storage.delete_page(page):
+            raise HTTPException(HTTPStatus.CONFLICT, "The page changed during deletion; refresh before retrying.")
+    return Response(status_code=HTTPStatus.NO_CONTENT)
 
 
 @router.get("/pages/{page_id}/status")

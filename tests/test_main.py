@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from functools import partial
 from http import HTTPMethod, HTTPStatus
 from pathlib import Path
@@ -8,6 +9,7 @@ import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
+from signalwatch import storage
 from signalwatch.main import app
 
 
@@ -151,3 +153,121 @@ def test_creation_retry_stops_after_uncertain_outcome(tmp_path: Path, monkeypatc
         assert client.post(f"/api/pages/{page['id']}/connect").status_code == HTTPStatus.CONFLICT
 
     assert [call.args[0].method for call in handler.call_args_list] == [HTTPMethod.POST, HTTPMethod.POST]
+
+
+def test_delete_page_persists_and_preserves_other_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(database_path))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    watch_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
+    with sqlite3.connect(database_path) as database:
+        database.executescript("""
+            CREATE TABLE competitors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, website TEXT NOT NULL);
+            CREATE TABLE pages (
+                id INTEGER PRIMARY KEY, competitor_id INTEGER NOT NULL REFERENCES competitors(id), url TEXT NOT NULL,
+                watch_id TEXT, state TEXT NOT NULL DEFAULT 'pending', error TEXT, attempted_at TEXT,
+                UNIQUE (competitor_id, url)
+            );
+            INSERT INTO competitors VALUES (1, 'Example', 'https://example.com/');
+            INSERT INTO pages (competitor_id, url) VALUES (1, 'https://example.com/');
+        """)
+        database.execute(
+            "INSERT INTO pages (competitor_id, url, watch_id, state) VALUES (?, ?, ?, ?)",
+            (1, "https://example.com/pricing", watch_id, storage.PageState.LINKED),
+        )
+    competitor = storage.list_competitors()[0]
+    other_page, page = competitor.pages
+    handler = Mock(return_value=httpx2.Response(HTTPStatus.NO_CONTENT))
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        deleted = client.delete(f"/api/pages/{page.id}")
+        assert deleted.status_code == HTTPStatus.NO_CONTENT
+        assert deleted.content == b""
+
+    with TestClient(app) as client:
+        competitor.pages = [other_page]
+        assert client.get("/api/competitors").json() == [competitor.model_dump(mode="json")]
+        replacement = storage.save_page(competitor.id, "https://example.com/new")
+        replacement_watch_id = "a655d37b-0928-4a73-aa9f-031411c407bc"
+        storage.link_watch(replacement.id, replacement_watch_id)
+        assert replacement.id > page.id
+        assert client.delete(f"/api/pages/{page.id}").status_code == HTTPStatus.NO_CONTENT
+        competitor.pages.append(storage.get_page(replacement.id))
+        assert client.get("/api/competitors").json() == [competitor.model_dump(mode="json")]
+        assert storage.get_page(replacement.id).watch_id == replacement_watch_id
+
+    handler.assert_called_once()
+    request = handler.call_args.args[0]
+    assert request.method == HTTPMethod.DELETE
+    assert request.url.path == f"/api/v1/watch/{watch_id}"
+
+
+def test_delete_missing_watch_preserves_same_url_replacement(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    competitor = storage.save_competitor("Original", "https://example.com/")
+    replacement = storage.save_competitor("Replacement", competitor.website)
+    page = competitor.pages[0]
+    watch_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
+    replacement_id = "a655d37b-0928-4a73-aa9f-031411c407bc"
+    storage.link_watch(page.id, watch_id)
+    storage.link_watch(replacement.pages[0].id, replacement_id)
+    replacement.pages = [storage.get_page(replacement.pages[0].id)]
+    handler = Mock(
+        return_value=httpx2.Response(
+            HTTPStatus.BAD_REQUEST, json={"message": f"No watch exists with the UUID of {watch_id}"}
+        )
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        deleted = client.delete(f"/api/pages/{page.id}")
+        assert deleted.status_code == HTTPStatus.NO_CONTENT
+        assert deleted.content == b""
+        competitor.pages = []
+        assert client.get("/api/competitors").json() == [
+            competitor.model_dump(mode="json"),
+            replacement.model_dump(mode="json"),
+        ]
+
+    handler.assert_called_once()
+    request = handler.call_args.args[0]
+    assert request.method == HTTPMethod.DELETE
+    assert request.url.path == f"/api/v1/watch/{watch_id}"
+    assert replacement_id not in str(request.url)
+
+
+def test_delete_page_engine_failure_retains_page_for_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    competitor = storage.save_competitor("Example", "https://example.com/")
+    page = competitor.pages[0]
+    watch_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
+    storage.link_watch(page.id, watch_id)
+    competitor.pages = [storage.get_page(page.id)]
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.BAD_REQUEST, json={"message": "Other rejection: test-api-key"}),
+            httpx2.Response(HTTPStatus.NO_CONTENT),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+
+    with TestClient(app) as client:
+        rejected = client.delete(f"/api/pages/{page.id}")
+        assert rejected.status_code == HTTPStatus.BAD_GATEWAY
+        assert rejected.json() == {"detail": "The engine rejected the request (HTTP 400)."}
+        assert "test-api-key" not in rejected.text
+        assert client.get("/api/competitors").json() == [competitor.model_dump(mode="json")]
+
+    with TestClient(app) as client:
+        assert client.delete(f"/api/pages/{page.id}").status_code == HTTPStatus.NO_CONTENT
+        competitor.pages = []
+        assert client.get("/api/competitors").json() == [competitor.model_dump(mode="json")]
+
+    assert [call.args[0].method for call in handler.call_args_list] == [HTTPMethod.DELETE, HTTPMethod.DELETE]
+    assert all(call.args[0].url.path == f"/api/v1/watch/{watch_id}" for call in handler.call_args_list)

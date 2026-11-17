@@ -8,6 +8,12 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+_PAGES_SCHEMA = """(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, competitor_id INTEGER NOT NULL REFERENCES competitors(id), url TEXT NOT NULL,
+    watch_id TEXT, state TEXT NOT NULL DEFAULT 'pending', error TEXT, attempted_at TEXT,
+    UNIQUE (competitor_id, url)
+)"""
+
 
 class PageState(StrEnum):
     PENDING = "pending"
@@ -91,6 +97,15 @@ def claim_watch_creation(page: Page) -> str | None:
     return title if claimed else None
 
 
+def delete_page(page: Page) -> bool:
+    with _database() as database:
+        deleted = database.execute(
+            "DELETE FROM pages WHERE id = ? AND state = ? AND watch_id IS ?",
+            (page.id, page.state, page.watch_id),
+        ).rowcount
+        return bool(deleted) or database.execute("SELECT id FROM pages WHERE id = ?", (page.id,)).fetchone() is None
+
+
 def record_watch_error(*, page_id: int, state: PageState, error: str) -> None:
     with _database() as database:
         database.execute("UPDATE pages SET state = ?, error = ? WHERE id = ?", (state, error, page_id))
@@ -111,12 +126,18 @@ def _database() -> Iterator[sqlite3.Connection]:
     with closing(sqlite3.connect(path)) as database, database:
         database.row_factory = sqlite3.Row
         database.execute("PRAGMA foreign_keys = ON")
-        database.executescript("""
-            CREATE TABLE IF NOT EXISTS competitors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, website TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS pages (
-                id INTEGER PRIMARY KEY, competitor_id INTEGER NOT NULL REFERENCES competitors(id), url TEXT NOT NULL,
-                watch_id TEXT, state TEXT NOT NULL DEFAULT 'pending', error TEXT, attempted_at TEXT,
-                UNIQUE (competitor_id, url)
-            );
-        """)
+        database.execute(
+            "CREATE TABLE IF NOT EXISTS competitors (id INTEGER PRIMARY KEY, name TEXT NOT NULL, website TEXT NOT NULL)"
+        )
+        database.execute(f"CREATE TABLE IF NOT EXISTS pages {_PAGES_SCHEMA}")
+        schema_query = "SELECT sql FROM sqlite_schema WHERE name = 'pages'"
+        if "AUTOINCREMENT" not in database.execute(schema_query).fetchone()["sql"].upper():
+            database.execute("BEGIN IMMEDIATE")
+            # Another connection may have upgraded the table while this one waited for the write lock.
+            if "AUTOINCREMENT" not in database.execute(schema_query).fetchone()["sql"].upper():
+                database.execute(f"CREATE TABLE pages_upgraded {_PAGES_SCHEMA}")
+                database.execute("INSERT INTO pages_upgraded SELECT * FROM pages")
+                database.execute("DROP TABLE pages")
+                database.execute("ALTER TABLE pages_upgraded RENAME TO pages")
+            database.commit()
         yield database

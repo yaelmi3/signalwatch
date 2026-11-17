@@ -23,13 +23,16 @@ const pageStates = {
   linked: "Watch connected", attention: "Needs attention",
 };
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+function request<T>(path: string, options?: RequestInit): Promise<T>;
+async function request(path: string, options?: RequestInit): Promise<unknown> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
     const detail = body && typeof body === "object" && "detail" in body ? body.detail : null;
     throw new Error(typeof detail === "string" ? detail : `Request failed (${response.status}).`);
   }
+  if (response.status === 204) return;
+  if (options?.method === "DELETE") throw new Error(`Unexpected deletion response (${response.status}).`);
   return response.json();
 }
 
@@ -43,18 +46,26 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : "The request could not be completed. Please try again.";
 }
 
-function PageItem({ page, onChange }: { page: Page; onChange: (page: Page) => void }) {
-  const [busy, setBusy] = useState<"connect" | "status" | null>(null);
+function PageItem({ page, onChange, onDelete }: {
+  page: Page; onChange: (page: Page) => void; onDelete: (page: Page) => void;
+}) {
+  const [busy, setBusy] = useState<"connect" | "status" | "delete" | null>(null);
   const [error, setError] = useState("");
   const [status, setStatus] = useState<WatchStatus | null>(null);
 
-  async function run(action: "connect" | "status") {
+  async function run(action: "connect" | "status" | "delete") {
+    if (action === "delete" && !window.confirm(
+      `Delete page ${page.url} and its changedetection watch and history? This cannot be undone.`,
+    )) return;
     setBusy(action);
     setError("");
     setStatus(null);
     try {
       if (action === "connect") {
         onChange(await post<Page>(`/api/pages/${page.id}/connect`));
+      } else if (action === "delete") {
+        await request<void>(`/api/pages/${page.id}`, { method: "DELETE" });
+        onDelete(page);
       } else {
         setStatus(await request<WatchStatus>(`/api/pages/${page.id}/status`));
       }
@@ -79,6 +90,10 @@ function PageItem({ page, onChange }: { page: Page; onChange: (page: Page) => vo
         <button disabled={busy !== null} onClick={() => void run("status")}>
           {busy === "status" ? "Refreshing…" : "Refresh status"}
         </button>
+        <button disabled={busy !== null} onClick={() => void run("delete")}
+          aria-label={`Delete page ${page.url}`}>
+          {busy === "delete" ? "Deleting…" : "Delete page"}
+        </button>
       </div>
       {error && <p role="alert">{error}</p>}
       {status && <div className="watch-status" role="status">
@@ -93,8 +108,8 @@ function PageItem({ page, onChange }: { page: Page; onChange: (page: Page) => vo
   );
 }
 
-function CompetitorSection({ competitor, onPage }: {
-  competitor: Competitor; onPage: (page: Page) => void;
+function CompetitorSection({ competitor, onPage, onDelete }: {
+  competitor: Competitor; onPage: (page: Page) => void; onDelete: (page: Page) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -124,7 +139,7 @@ function CompetitorSection({ competitor, onPage }: {
       <p className="muted">{competitor.website}</p>
       {competitor.pages.length ? (
         <ul className="page-list">{competitor.pages.map((page) => (
-          <PageItem key={page.id} page={page} onChange={onPage} />
+          <PageItem key={page.id} page={page} onChange={onPage} onDelete={onDelete} />
         ))}</ul>
       ) : <p>No pages saved.</p>}
       <form onSubmit={addPage} aria-label={`Add page for ${competitor.name}`}>
@@ -194,6 +209,12 @@ function App() {
     }));
   }
 
+  function deletePage(page: Page) {
+    setCompetitors((current) => current.map((competitor) => competitor.id === page.competitor_id
+      ? { ...competitor, pages: competitor.pages.filter((item) => item.id !== page.id) }
+      : competitor));
+  }
+
   return (
     <>
       <header className="site-header">
@@ -227,7 +248,8 @@ function App() {
               <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
             </div>
           ) : competitors.length === 0 ? <p>No competitors saved.</p> : competitors.map((competitor) => (
-            <CompetitorSection key={competitor.id} competitor={competitor} onPage={updatePage} />
+            <CompetitorSection key={competitor.id} competitor={competitor}
+              onPage={updatePage} onDelete={deletePage} />
           ))}
         </section>
       </main>
