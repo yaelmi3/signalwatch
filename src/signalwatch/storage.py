@@ -44,6 +44,12 @@ class PageChange(BaseModel):
     after: str
 
 
+@dataclass(frozen=True)
+class LinkedWatch:
+    page_id: int
+    watch_id: str
+
+
 class Competitor(BaseModel):
     id: int
     name: str
@@ -97,6 +103,14 @@ def get_linked_page_id(watch_id: str) -> int | None:
             "SELECT id FROM pages WHERE watch_id = ? AND state = ?", (watch_id, PageState.LINKED)
         ).fetchone()
     return row["id"] if row is not None else None
+
+
+def list_linked_watches() -> list[LinkedWatch]:
+    with _database() as database:
+        rows = database.execute(
+            "SELECT id, watch_id FROM pages WHERE state = ? AND watch_id IS NOT NULL ORDER BY id", (PageState.LINKED,)
+        ).fetchall()
+    return [LinkedWatch(page_id=row["id"], watch_id=row["watch_id"]) for row in rows]
 
 
 def list_page_changes(page_id: int) -> list[PageChange]:

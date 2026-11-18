@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 
 from signalwatch import changedetection, storage
+from signalwatch.changes import save_new_changes
 
 router = APIRouter(tags=["Webhooks"])
 
@@ -40,28 +41,7 @@ def receive_changedetection_webhook(payload: ChangedetectionWebhook) -> Response
     if page_id is None:
         raise HTTPException(HTTPStatus.NOT_FOUND, "No page is linked to this watch.")
     try:
-        _save_new_changes(page_id, watch_id)
+        save_new_changes(page_id, watch_id)
     except changedetection.EngineError as error:
         raise HTTPException(HTTPStatus.BAD_GATEWAY, str(error)) from None
     return Response(status_code=HTTPStatus.NO_CONTENT)
-
-
-def _save_new_changes(page_id: int, watch_id: str) -> None:
-    history = changedetection.read_history(watch_id)
-    checkpoint = storage.latest_page_change(page_id)
-    if checkpoint is None:
-        if len(history) < 2:
-            return
-        baseline = history[0]
-        before = changedetection.read_snapshot(watch_id, baseline)
-    else:
-        baseline = int(checkpoint.version)
-        before = checkpoint.after
-
-    for version in history:
-        if version <= baseline:
-            continue
-        after = changedetection.read_snapshot(watch_id, version)
-        change = storage.PageChange(version=str(version), before=before, after=after)
-        storage.save_page_change(page_id=page_id, watch_id=watch_id, change=change)
-        before = after

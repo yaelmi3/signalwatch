@@ -4,7 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from http import HTTPMethod, HTTPStatus
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
+from time import monotonic, sleep
 from unittest.mock import Mock
 
 import httpx2
@@ -29,6 +30,11 @@ _WATCH_NOTIFICATIONS = {
 _WATCH_ID = "520e831c-6d74-4c6d-96c6-c782061b0249"
 
 
+@pytest.fixture(autouse=True)
+def disable_scheduled_catchup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "0")
+
+
 def test_serves_frontend_and_api_docs() -> None:
     with TestClient(app) as client:
         page = client.get("/")
@@ -39,6 +45,52 @@ def test_serves_frontend_and_api_docs() -> None:
         docs = client.get("/docs")
         assert docs.status_code == HTTPStatus.OK
         assert "Swagger UI" in docs.text
+
+
+def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "60")
+    source = storage.save_competitor("Example", "https://example.com/")
+    failed_page = source.pages[0]
+    page = storage.save_page(source.id, "https://example.com/watched")
+    storage.link_watch(failed_page.id, "a655d37b-0928-4a73-aa9f-031411c407bc")
+    storage.link_watch(page.id, _WATCH_ID)
+    history_path = f"/api/v1/watch/{_WATCH_ID}/history"
+    first_read = Event()
+    new_version = Event()
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path
+        if path == history_path:
+            versions = {"1": "a.txt", "2": "b.txt"}
+            if new_version.is_set():
+                versions["3"] = "c.txt"
+            first_read.set()
+            return httpx2.Response(HTTPStatus.OK, json=versions)
+        if path.startswith(f"{history_path}/"):
+            return httpx2.Response(HTTPStatus.OK, text={"1": "A", "2": "B", "3": "C"}[path.rsplit("/", 1)[1]])
+        assert path == "/api/v1/watch/a655d37b-0928-4a73-aa9f-031411c407bc/history"
+        return httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def wait_for_changes(client: TestClient, expected: list[dict[str, str]]) -> None:
+        deadline = monotonic() + 5
+        while (actual := client.get(f"/api/pages/{page.id}/changes").json()) != expected and monotonic() < deadline:
+            sleep(0.02)
+        assert actual == expected
+
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handle)))
+    baseline = {"version": "2", "before": "A", "after": "B"}
+    with TestClient(app) as client:
+        wait_for_changes(client, [baseline])
+
+    first_read.clear()
+    monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "1")
+    with TestClient(app) as client:
+        assert first_read.wait(5)
+        new_version.set()
+        wait_for_changes(client, [{"version": "3", "before": "B", "after": "C"}, baseline])
 
 
 def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
