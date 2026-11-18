@@ -25,8 +25,8 @@ const pageStates = {
   linked: "Watch connected", attention: "Needs attention",
 };
 
-function request<T>(path: string, options?: RequestInit): Promise<T>;
-async function request(path: string, options?: RequestInit): Promise<unknown> {
+function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
+async function request(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<unknown> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
@@ -35,7 +35,9 @@ async function request(path: string, options?: RequestInit): Promise<unknown> {
   }
   if (response.status === 204) return;
   if (options?.method === "DELETE") throw new Error(`Unexpected deletion response (${response.status}).`);
-  return response.json();
+  const body: unknown = await response.json();
+  readHeaders?.(response.headers);
+  return body;
 }
 
 function post<T>(path: string, body?: object) {
@@ -53,6 +55,7 @@ function ChangeHistory({ pageId }: { pageId: number }) {
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [historyGap, setHistoryGap] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -62,7 +65,9 @@ function ChangeHistory({ pageId }: { pageId: number }) {
     async function refresh() {
       const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
       try {
-        const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal });
+        const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal }, (headers) => {
+          if (!controller.signal.aborted) setHistoryGap(headers.get("X-SignalWatch-History-Gap") === "true");
+        });
         if (!controller.signal.aborted) setChanges(changes);
       } catch (cause) {
         if (!controller.signal.aborted) setError(message(cause));
@@ -83,6 +88,7 @@ function ChangeHistory({ pageId }: { pageId: number }) {
         </button>
       </div>
       {error && <p role="alert">{error}</p>}
+      {historyGap && <p role="status">Possible history gap</p>}
       {loading && <p role="status">{changes === null ? "Loading changes…" : "Refreshing changes…"}</p>}
       {!loading && !error && changes?.length === 0 && <p role="status">No changes recorded yet.</p>}
       {changes && changes.length > 0 && (

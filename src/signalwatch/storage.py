@@ -20,6 +20,11 @@ _PAGE_CHANGES_SCHEMA = """(
     version INTEGER NOT NULL CHECK (typeof(version) = 'integer'), before TEXT, after TEXT NOT NULL,
     PRIMARY KEY (page_id, version)
 )"""
+_HISTORY_GAPS_SCHEMA = """(
+    page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    watch_id TEXT NOT NULL,
+    PRIMARY KEY (page_id, watch_id)
+)"""
 
 
 class PageState(StrEnum):
@@ -135,6 +140,24 @@ def latest_page_snapshot(page_id: int) -> PageSnapshot | None:
             "SELECT version, after FROM page_changes WHERE page_id = ? ORDER BY version DESC LIMIT 1", (page_id,)
         ).fetchone()
     return PageSnapshot(version=row["version"], after=row["after"]) if row is not None else None
+
+
+def has_history_gap(page_id: int, watch_id: str) -> bool:
+    with _database() as database:
+        gap = database.execute(
+            "SELECT 1 FROM history_gaps WHERE page_id = ? AND watch_id = ?", (page_id, watch_id)
+        ).fetchone()
+    return gap is not None
+
+
+def record_history_gap(page_id: int, watch_id: str) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO history_gaps (page_id, watch_id)
+            SELECT id, watch_id FROM pages WHERE id = ? AND watch_id = ? AND state = ?
+            ON CONFLICT (page_id, watch_id) DO NOTHING""",
+            (page_id, watch_id, PageState.LINKED),
+        )
 
 
 def save_page_version(*, page_id: int, watch_id: str, version: int, before: str | None, after: str) -> bool:
@@ -268,4 +291,5 @@ def _database() -> Iterator[sqlite3.Connection]:
                 database.execute("DROP TABLE page_changes")
                 database.execute("ALTER TABLE page_changes_upgraded RENAME TO page_changes")
             database.commit()
+        database.execute(f"CREATE TABLE IF NOT EXISTS history_gaps {_HISTORY_GAPS_SCHEMA}")
         yield database

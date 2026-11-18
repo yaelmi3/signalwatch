@@ -20,6 +20,7 @@ from signalwatch.main import app
 
 _WEBHOOK = "/api/webhooks/changedetection"
 _WEBHOOK_HEADERS = {"Authorization": "Basic " + b64encode(b"signalwatch:test-webhook-secret").decode("ascii")}
+_HISTORY_GAP_HEADER = "X-SignalWatch-History-Gap"
 _WEBHOOK_SETUP_URL = "https://hooks.example.com/api/webhooks/changedetection"
 _WEBHOOK_SETUP_SECRET = "test-webhook-secret"
 _WATCH_NOTIFICATIONS = {
@@ -153,7 +154,9 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
 
     with TestClient(app) as client:
         assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
-        assert client.get(changes_url).json() == []
+        first_import = client.get(changes_url)
+        assert first_import.json() == []
+        assert _HISTORY_GAP_HEADER not in first_import.headers
 
     history = {"11": "latest.txt"}
     with TestClient(app) as client:
@@ -161,16 +164,20 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
             calls = [executor.submit(deliver, client) for _ in range(2)]
             assert [call.result() for call in calls] == [HTTPStatus.NO_CONTENT, HTTPStatus.NO_CONTENT]
         assert snapshot_reads == ["10", "11"]
-        assert client.get(changes_url).json() == [{"version": "11", "before": "Price: $10", "after": "Price: $15"}]
+        recovered = client.get(changes_url)
+        assert recovered.json() == [{"version": "11", "before": "Price: $10", "after": "Price: $15"}]
+        assert recovered.headers[_HISTORY_GAP_HEADER] == "true"
 
         assert client.delete(f"/api/pages/{page.id}").status_code == HTTPStatus.NO_CONTENT
         assert client.get(changes_url).status_code == HTTPStatus.NOT_FOUND
     with sqlite3.connect(db_path) as database:
         assert database.execute("SELECT COUNT(*) FROM page_changes").fetchone() == (0,)
+        assert database.execute("SELECT COUNT(*) FROM history_gaps").fetchone() == (0,)
 
 
+@pytest.mark.parametrize("empty_history", [False, True])
 def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_history: bool
 ) -> None:
     db_path = tmp_path / "configuration.sqlite3"
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
@@ -185,12 +192,16 @@ def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
             page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
             version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, PRIMARY KEY (page_id, version))""")
         database.execute("INSERT INTO page_changes VALUES (?, '2', 'A', 'B')", (page.id,))
-    retained_history = {"11": "e.txt", "10": "d.txt", "3": "c.txt"}
+    retained_history = {"11": "e.txt", "10": "d.txt"}
+    empty_listing = [httpx2.Response(HTTPStatus.OK, json={})] if empty_history else []
     handler = Mock(
         side_effect=[
-            httpx2.Response(HTTPStatus.OK, json={"10": "d.txt", "3": "c.txt"}),
+            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
+            httpx2.Response(HTTPStatus.OK, json=[]),
+            httpx2.Response(HTTPStatus.OK, json={"10": "d.txt", "3": "c.txt", "2": "b.txt"}),
             httpx2.Response(HTTPStatus.OK, text="C"),
             httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
+            *empty_listing,
             httpx2.Response(HTTPStatus.OK, json=retained_history),
             httpx2.Response(HTTPStatus.OK, text="D"),
             httpx2.Response(HTTPStatus.OK, text="E"),
@@ -201,22 +212,47 @@ def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
     payload = {"message": _WATCH_ID}
     changes_url = f"/api/pages/{page.id}/changes"
     with TestClient(app) as client:
-        assert client.get(changes_url).json() == [{"version": "2", "before": "A", "after": "B"}]
+        first_import = client.get(changes_url)
+        assert first_import.json() == [{"version": "2", "before": "A", "after": "B"}]
+        assert _HISTORY_GAP_HEADER not in first_import.headers
+        for _ in range(2):
+            assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.BAD_GATEWAY
+            unchanged = client.get(changes_url)
+            assert unchanged.json() == first_import.json()
+            assert _HISTORY_GAP_HEADER not in unchanged.headers
+
         assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.BAD_GATEWAY
         completed = [{"version": "3", "before": "B", "after": "C"}, {"version": "2", "before": "A", "after": "B"}]
-        assert client.get(changes_url).json() == completed
+        partial_import = client.get(changes_url)
+        assert partial_import.json() == completed
+        assert _HISTORY_GAP_HEADER not in partial_import.headers
+
+        if empty_history:
+            assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+            no_new_changes = client.get(changes_url)
+            assert no_new_changes.json() == completed
+            assert no_new_changes.headers[_HISTORY_GAP_HEADER] == "true"
 
         assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
         expected = [{"version": "11", "before": "D", "after": "E"}, {"version": "10", "before": "C", "after": "D"}]
-        assert client.get(changes_url).json() == expected + completed
+        recovered = client.get(changes_url)
+        assert recovered.json() == expected + completed
+        assert recovered.headers[_HISTORY_GAP_HEADER] == "true"
+
+    with TestClient(app) as client:
         assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
-        assert client.get(changes_url).json() == expected + completed
+        repeated = client.get(changes_url)
+        assert repeated.json() == expected + completed
+        assert repeated.headers[_HISTORY_GAP_HEADER] == "true"
 
     history_path = f"/api/v1/watch/{_WATCH_ID}/history"
     assert [call.args[0].url.path.removeprefix(history_path) for call in handler.call_args_list] == [
         "",
+        "",
+        "",
         "/3",
         "/10",
+        *([""] if empty_history else []),
         "",
         "/10",
         "/11",
