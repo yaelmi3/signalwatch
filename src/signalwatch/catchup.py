@@ -4,6 +4,7 @@ import os
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from threading import Event
 
 from fastapi import FastAPI
 
@@ -22,12 +23,14 @@ async def catchup_lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
         return
 
-    stop = asyncio.Event()
-    task = asyncio.create_task(_run_catchup(interval, stop))
+    stop = Event()
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(_run_catchup(interval=interval, shutdown=shutdown, stop=stop))
     try:
         yield
     finally:
         stop.set()
+        shutdown.set()
         await task
 
 
@@ -42,14 +45,14 @@ def _catchup_interval() -> int:
     return interval
 
 
-async def _run_catchup(interval: int, stop: asyncio.Event) -> None:
+async def _run_catchup(*, interval: int, shutdown: asyncio.Event, stop: Event) -> None:
     while not stop.is_set():
         await _catch_up_once(stop)
         with suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=interval)
+            await asyncio.wait_for(shutdown.wait(), timeout=interval)
 
 
-async def _catch_up_once(stop: asyncio.Event) -> None:
+async def _catch_up_once(stop: Event) -> None:
     try:
         watches = await asyncio.to_thread(storage.list_linked_watches)
     except (sqlite3.OperationalError, OSError) as error:
@@ -60,7 +63,7 @@ async def _catch_up_once(stop: asyncio.Event) -> None:
         if stop.is_set():
             return
         try:
-            await asyncio.to_thread(save_new_changes, watch.page_id, watch.watch_id)
+            await asyncio.to_thread(save_new_changes, watch.page_id, watch.watch_id, stop=stop)
         except (changedetection.EngineError, sqlite3.OperationalError, OSError) as error:
             _LOGGER.warning(
                 "Could not catch up page changes.", extra={"page_id": watch.page_id, "error_type": type(error).__name__}

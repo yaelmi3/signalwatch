@@ -1,5 +1,7 @@
+import asyncio
 import json
 import sqlite3
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from http import HTTPMethod, HTTPStatus
@@ -13,17 +15,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from signalwatch import storage
+from signalwatch.catchup import catchup_lifespan
 from signalwatch.main import app
 
 _WEBHOOK = "/api/webhooks/changedetection"
-_WEBHOOK_HEADERS = {"X-SignalWatch-Webhook-Secret": "test-webhook-secret"}
+_WEBHOOK_HEADERS = {"Authorization": "Basic " + b64encode(b"signalwatch:test-webhook-secret").decode("ascii")}
 _WEBHOOK_SETUP_URL = "https://hooks.example.com/api/webhooks/changedetection"
-_WEBHOOK_SETUP_SECRET = "test-webhook+secret"
+_WEBHOOK_SETUP_SECRET = "test-webhook-secret"
 _WATCH_NOTIFICATIONS = {
     "notification_muted": False,
-    "notification_urls": [
-        "jsons://hooks.example.com/api/webhooks/changedetection?%2BX-SignalWatch-Webhook-Secret=test-webhook%2Bsecret"
-    ],
+    "notification_urls": ["jsons://hooks.example.com/api/webhooks/changedetection"],
     "notification_format": "text",
     "notification_body": "{{watch_uuid}}",
 }
@@ -58,21 +59,32 @@ def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypat
     storage.link_watch(failed_page.id, "a655d37b-0928-4a73-aa9f-031411c407bc")
     storage.link_watch(page.id, _WATCH_ID)
     history_path = f"/api/v1/watch/{_WATCH_ID}/history"
-    first_read = Event()
+    first_change_read = Event()
+    complete_first_change = Event()
     new_version = Event()
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
         if path == history_path:
-            versions = {"1": "a.txt", "2": "b.txt"}
+            versions = {"1": "a.txt", "2": "b.txt", "3": "c.txt"}
             if new_version.is_set():
-                versions["3"] = "c.txt"
-            first_read.set()
+                versions["4"] = "d.txt"
             return httpx2.Response(HTTPStatus.OK, json=versions)
         if path.startswith(f"{history_path}/"):
-            return httpx2.Response(HTTPStatus.OK, text={"1": "A", "2": "B", "3": "C"}[path.rsplit("/", 1)[1]])
+            version = path.rsplit("/", 1)[1]
+            if version == "2":
+                first_change_read.set()
+                assert complete_first_change.wait(5)
+            return httpx2.Response(HTTPStatus.OK, text={"1": "A", "2": "B", "3": "C", "4": "D"}[version])
         assert path == "/api/v1/watch/a655d37b-0928-4a73-aa9f-031411c407bc/history"
         return httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE)
+
+    async def interrupt_startup() -> None:
+        async with catchup_lifespan(app):
+            try:
+                assert await asyncio.to_thread(first_change_read.wait, 5)
+            finally:
+                asyncio.get_running_loop().call_soon(complete_first_change.set)
 
     def wait_for_changes(client: TestClient, expected: list[dict[str, str]]) -> None:
         deadline = monotonic() + 5
@@ -82,15 +94,15 @@ def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handle)))
     baseline = {"version": "2", "before": "A", "after": "B"}
-    with TestClient(app) as client:
-        wait_for_changes(client, [baseline])
+    asyncio.run(interrupt_startup())
+    assert [change.model_dump() for change in storage.list_page_changes(page.id)] == [baseline]
 
-    first_read.clear()
     monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "1")
     with TestClient(app) as client:
-        assert first_read.wait(5)
+        recovered = {"version": "3", "before": "B", "after": "C"}
+        wait_for_changes(client, [recovered, baseline])
         new_version.set()
-        wait_for_changes(client, [{"version": "3", "before": "B", "after": "C"}, baseline])
+        wait_for_changes(client, [{"version": "4", "before": "C", "after": "D"}, recovered, baseline])
 
 
 def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
@@ -105,7 +117,10 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
     storage.link_watch(page.id, _WATCH_ID)
     engine_path = f"/api/v1/watch/{_WATCH_ID}"
     history = {"10": "previous.txt"}
-    storage_race = Barrier(2, timeout=5)
+    deliver_together = Barrier(2, timeout=5)
+    reading_snapshot = Event()
+    overlapping_history = Event()
+    snapshot_reads: list[str] = []
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         assert request.headers["x-api-key"] == "test-api-key"
@@ -114,26 +129,38 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
         assert request.method == HTTPMethod.GET
         match request.url.path:
             case path if path == f"{engine_path}/history":
+                if reading_snapshot.is_set():
+                    overlapping_history.set()
                 return httpx2.Response(HTTPStatus.OK, json=history)
             case path if path == f"{engine_path}/history/10":
+                snapshot_reads.append("10")
                 return httpx2.Response(HTTPStatus.OK, text="Price: $10")
             case path if path == f"{engine_path}/history/11":
-                storage_race.wait()
+                snapshot_reads.append("11")
+                reading_snapshot.set()
+                assert not overlapping_history.wait(0.25)
+                reading_snapshot.clear()
                 return httpx2.Response(HTTPStatus.OK, text="Price: $15")
         raise AssertionError(f"Unexpected snapshot request: {request.url.path}")
 
     monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handle)))
     payload = {"title": "Watch changed", "message": _WATCH_ID, "version": "1.1"}
     changes_url = f"/api/pages/{page.id}/changes"
+
+    def deliver(client: TestClient) -> int:
+        deliver_together.wait()
+        return client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code
+
     with TestClient(app) as client:
-        baseline = client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS)
-        assert baseline.status_code == HTTPStatus.NO_CONTENT
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
         assert client.get(changes_url).json() == []
 
-        history["11"] = "latest.txt"
+    history = {"11": "latest.txt"}
+    with TestClient(app) as client:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            calls = [executor.submit(client.post, _WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS) for _ in range(2)]
-            assert [call.result().status_code for call in calls] == [HTTPStatus.NO_CONTENT, HTTPStatus.NO_CONTENT]
+            calls = [executor.submit(deliver, client) for _ in range(2)]
+            assert [call.result() for call in calls] == [HTTPStatus.NO_CONTENT, HTTPStatus.NO_CONTENT]
+        assert snapshot_reads == ["10", "11"]
         assert client.get(changes_url).json() == [{"version": "11", "before": "Price: $10", "after": "Price: $15"}]
 
         assert client.delete(f"/api/pages/{page.id}").status_code == HTTPStatus.NO_CONTENT
@@ -145,18 +172,22 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
 def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
     monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
     monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
     monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
     page = storage.save_competitor("Example", "https://example.com/").pages[0]
     storage.link_watch(page.id, _WATCH_ID)
+    with sqlite3.connect(db_path) as database:
+        database.execute("DROP TABLE page_changes")
+        database.execute("""CREATE TABLE page_changes (
+            page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+            version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, PRIMARY KEY (page_id, version))""")
+        database.execute("INSERT INTO page_changes VALUES (?, '2', 'A', 'B')", (page.id,))
     retained_history = {"11": "e.txt", "10": "d.txt", "3": "c.txt"}
     handler = Mock(
         side_effect=[
-            httpx2.Response(HTTPStatus.OK, json={"2": "b.txt", "1": "a.txt"}),
-            httpx2.Response(HTTPStatus.OK, text="A"),
-            httpx2.Response(HTTPStatus.OK, text="B"),
             httpx2.Response(HTTPStatus.OK, json={"10": "d.txt", "3": "c.txt"}),
             httpx2.Response(HTTPStatus.OK, text="C"),
             httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
@@ -170,7 +201,7 @@ def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
     payload = {"message": _WATCH_ID}
     changes_url = f"/api/pages/{page.id}/changes"
     with TestClient(app) as client:
-        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        assert client.get(changes_url).json() == [{"version": "2", "before": "A", "after": "B"}]
         assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.BAD_GATEWAY
         completed = [{"version": "3", "before": "B", "after": "C"}, {"version": "2", "before": "A", "after": "B"}]
         assert client.get(changes_url).json() == completed
@@ -184,9 +215,6 @@ def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
     history_path = f"/api/v1/watch/{_WATCH_ID}/history"
     assert [call.args[0].url.path.removeprefix(history_path) for call in handler.call_args_list] == [
         "",
-        "/1",
-        "/2",
-        "",
         "/3",
         "/10",
         "",
@@ -194,6 +222,9 @@ def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
         "/11",
         "",
     ]
+    with sqlite3.connect(db_path) as database:
+        rows = database.execute("SELECT version FROM page_changes WHERE page_id = ? ORDER BY version", (page.id,))
+        assert rows.fetchall() == [(2,), (3,), (10,), (11,)]
 
 
 def test_changedetection_webhook_rejects_invalid_access_before_engine_request(
@@ -210,6 +241,9 @@ def test_changedetection_webhook_rejects_invalid_access_before_engine_request(
         assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NOT_FOUND
         monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
         assert client.post(_WEBHOOK, json=payload).status_code == HTTPStatus.UNAUTHORIZED
+        assert client.post(_WEBHOOK, json=payload, auth=("signalwatch", "wrong-secret")).status_code == (
+            HTTPStatus.UNAUTHORIZED
+        )
         unknown_watch = client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS)
         assert unknown_watch.status_code == HTTPStatus.NOT_FOUND
     handler.assert_not_called()
@@ -242,6 +276,9 @@ def test_watch_creation_requires_webhook_setup_and_can_retry(tmp_path: Path, mon
         handler.assert_not_called()
 
         monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+        monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "bad secret%20")
+        assert client.get(settings_url).json() == {"configured": False}
+        monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
         assert client.get(settings_url).json() == {"configured": True}
         retried = client.post(f"/api/pages/{pending['id']}/connect")
         assert retried.status_code == HTTPStatus.OK and retried.json()["watch_id"] == _WATCH_ID

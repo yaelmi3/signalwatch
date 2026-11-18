@@ -1,6 +1,7 @@
 import os
+import re
 from http import HTTPMethod, HTTPStatus
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx2
@@ -10,7 +11,6 @@ from signalwatch.network import send_request
 
 WEBHOOK_PATH = "/api/webhooks/changedetection"
 WEBHOOK_SECRET_ENV = "CHANGEDETECTION_WEBHOOK_SECRET"
-WEBHOOK_SECRET_HEADER = "X-SignalWatch-Webhook-Secret"
 WEBHOOK_CONFIGURATION_ERROR = "Configure the SignalWatch webhook URL and secret on the server."
 _HISTORY = TypeAdapter(dict[int, str])
 
@@ -54,9 +54,16 @@ class WatchStatus(BaseModel):
     error: str | None = None
 
 
+def webhook_secret() -> str | None:
+    secret = os.getenv(WEBHOOK_SECRET_ENV)
+    if secret is None or not re.fullmatch(r"[A-Za-z0-9._~-]+", secret):
+        return None
+    return secret
+
+
 def webhook_notification_url() -> str | None:
-    address, secret = os.getenv("SIGNALWATCH_WEBHOOK_URL"), os.getenv(WEBHOOK_SECRET_ENV)
-    if not address or not secret or not secret.isascii() or not secret.isprintable() or secret != secret.strip():
+    address = os.getenv("SIGNALWATCH_WEBHOOK_URL")
+    if not address or webhook_secret() is None:
         return None
     try:
         target = HttpUrl(address)
@@ -67,9 +74,8 @@ def webhook_notification_url() -> str | None:
     if target.path != WEBHOOK_PATH:
         return None
     scheme = "jsons" if target.scheme == "https" else "json"
-    return urlunsplit(
-        (scheme, urlsplit(str(target)).netloc, WEBHOOK_PATH, urlencode({f"+{WEBHOOK_SECRET_HEADER}": secret}), "")
-    )
+    # changedetection logs this URL. Requests reads the Basic Auth credentials from netrc.
+    return urlunsplit((scheme, urlsplit(str(target)).netloc, WEBHOOK_PATH, "", ""))
 
 
 def create_watch(url: str, title: str) -> str:

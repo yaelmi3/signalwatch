@@ -17,7 +17,7 @@ _PAGES_SCHEMA = """(
 )"""
 _PAGE_CHANGES_SCHEMA = """(
     page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
-    version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (typeof(version) = 'integer'), before TEXT, after TEXT NOT NULL,
     PRIMARY KEY (page_id, version)
 )"""
 
@@ -41,6 +41,12 @@ class Page(BaseModel):
 class PageChange(BaseModel):
     version: str
     before: str
+    after: str
+
+
+@dataclass(frozen=True)
+class PageSnapshot:
+    version: int
     after: str
 
 
@@ -116,30 +122,30 @@ def list_linked_watches() -> list[LinkedWatch]:
 def list_page_changes(page_id: int) -> list[PageChange]:
     with _database() as database:
         rows = database.execute(
-            "SELECT version, before, after FROM page_changes WHERE page_id = ? ORDER BY CAST(version AS INTEGER) DESC",
+            """SELECT CAST(version AS TEXT) AS version, before, after FROM page_changes
+            WHERE page_id = ? AND before IS NOT NULL ORDER BY page_changes.version DESC""",
             (page_id,),
         ).fetchall()
     return [PageChange.model_validate(dict(row)) for row in rows]
 
 
-def latest_page_change(page_id: int) -> PageChange | None:
+def latest_page_snapshot(page_id: int) -> PageSnapshot | None:
     with _database() as database:
         row = database.execute(
-            """SELECT version, before, after FROM page_changes WHERE page_id = ?
-            ORDER BY CAST(version AS INTEGER) DESC LIMIT 1""",
-            (page_id,),
+            "SELECT version, after FROM page_changes WHERE page_id = ? ORDER BY version DESC LIMIT 1", (page_id,)
         ).fetchone()
-    return PageChange.model_validate(dict(row)) if row is not None else None
+    return PageSnapshot(version=row["version"], after=row["after"]) if row is not None else None
 
 
-def save_page_change(*, page_id: int, watch_id: str, change: PageChange) -> None:
+def save_page_version(*, page_id: int, watch_id: str, version: int, before: str | None, after: str) -> bool:
     with _database() as database:
-        database.execute(
+        inserted = database.execute(
             """INSERT INTO page_changes (page_id, version, before, after)
             SELECT id, ?, ?, ? FROM pages WHERE id = ? AND watch_id = ? AND state = ?
             ON CONFLICT (page_id, version) DO NOTHING""",
-            (change.version, change.before, change.after, page_id, watch_id, PageState.LINKED),
-        )
+            (version, before, after, page_id, watch_id, PageState.LINKED),
+        ).rowcount
+    return bool(inserted)
 
 
 def list_competitors() -> list[Competitor]:
@@ -253,4 +259,13 @@ def _database() -> Iterator[sqlite3.Connection]:
             database.commit()
             database.execute("PRAGMA foreign_keys = ON")
         database.execute(f"CREATE TABLE IF NOT EXISTS page_changes {_PAGE_CHANGES_SCHEMA}")
+        schema_query = "SELECT type FROM pragma_table_info('page_changes') WHERE name = 'version'"
+        if database.execute(schema_query).fetchone()["type"].upper() == "TEXT":
+            database.execute("BEGIN IMMEDIATE")
+            if database.execute(schema_query).fetchone()["type"].upper() == "TEXT":
+                database.execute(f"CREATE TABLE page_changes_upgraded {_PAGE_CHANGES_SCHEMA}")
+                database.execute("INSERT INTO page_changes_upgraded SELECT * FROM page_changes")
+                database.execute("DROP TABLE page_changes")
+                database.execute("ALTER TABLE page_changes_upgraded RENAME TO page_changes")
+            database.commit()
         yield database
