@@ -20,6 +20,11 @@ _PAGE_CHANGES_SCHEMA = """(
     version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL,
     PRIMARY KEY (page_id, version)
 )"""
+_HISTORY_GAPS_SCHEMA = """(
+    page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    watch_id TEXT NOT NULL,
+    PRIMARY KEY (page_id, watch_id)
+)"""
 
 
 class PageState(StrEnum):
@@ -130,6 +135,24 @@ def latest_page_change(page_id: int) -> PageChange | None:
             (page_id,),
         ).fetchone()
     return PageChange.model_validate(dict(row)) if row is not None else None
+
+
+def has_history_gap(page_id: int, watch_id: str) -> bool:
+    with _database() as database:
+        gap = database.execute(
+            "SELECT 1 FROM history_gaps WHERE page_id = ? AND watch_id = ?", (page_id, watch_id)
+        ).fetchone()
+    return gap is not None
+
+
+def record_history_gap(page_id: int, watch_id: str) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO history_gaps (page_id, watch_id)
+            SELECT id, watch_id FROM pages WHERE id = ? AND watch_id = ? AND state = ?
+            ON CONFLICT (page_id, watch_id) DO NOTHING""",
+            (page_id, watch_id, PageState.LINKED),
+        )
 
 
 def save_page_change(*, page_id: int, watch_id: str, change: PageChange) -> None:
@@ -253,4 +276,5 @@ def _database() -> Iterator[sqlite3.Connection]:
             database.commit()
             database.execute("PRAGMA foreign_keys = ON")
         database.execute(f"CREATE TABLE IF NOT EXISTS page_changes {_PAGE_CHANGES_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS history_gaps {_HISTORY_GAPS_SCHEMA}")
         yield database

@@ -2,8 +2,8 @@ from signalwatch import changedetection, storage
 
 
 def save_new_changes(page_id: int, watch_id: str) -> None:
-    history = changedetection.read_history(watch_id)
     checkpoint = storage.latest_page_change(page_id)
+    history = changedetection.read_history(watch_id)
     if checkpoint is None:
         if len(history) < 2:
             return
@@ -12,6 +12,8 @@ def save_new_changes(page_id: int, watch_id: str) -> None:
     else:
         baseline = int(checkpoint.version)
         before = checkpoint.after
+        if baseline not in history:
+            storage.record_history_gap(page_id, watch_id)
 
     for version in history:
         if version <= baseline:
