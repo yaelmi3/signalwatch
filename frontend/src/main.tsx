@@ -25,8 +25,8 @@ const pageStates = {
   linked: "Watch connected", attention: "Needs attention",
 };
 
-function request<T>(path: string, options?: RequestInit): Promise<T>;
-async function request(path: string, options?: RequestInit): Promise<unknown> {
+function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
+async function request(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<unknown> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
@@ -35,7 +35,9 @@ async function request(path: string, options?: RequestInit): Promise<unknown> {
   }
   if (response.status === 204) return;
   if (options?.method === "DELETE") throw new Error(`Unexpected deletion response (${response.status}).`);
-  return response.json();
+  const body: unknown = await response.json();
+  readHeaders?.(response.headers);
+  return body;
 }
 
 function post<T>(path: string, body?: object) {
@@ -50,38 +52,45 @@ function message(error: unknown) {
 
 function ChangeHistory({ pageId }: { pageId: number }) {
   const [changes, setChanges] = useState<PageChange[] | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [historyGap, setHistoryGap] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
-    let timer: number | undefined;
+    setLoading(true);
+    setError("");
 
     async function refresh() {
       const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
       try {
-        const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal });
-        if (controller.signal.aborted) return;
-        setChanges(changes);
-        setError("");
+        const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal }, (headers) => {
+          if (!controller.signal.aborted) setHistoryGap(headers.get("X-SignalWatch-History-Gap") === "true");
+        });
+        if (!controller.signal.aborted) setChanges(changes);
       } catch (cause) {
         if (!controller.signal.aborted) setError(message(cause));
       } finally {
-        if (!controller.signal.aborted) timer = window.setTimeout(refresh, 3000);
+        if (!controller.signal.aborted) setLoading(false);
       }
     }
 
     void refresh();
-    return () => {
-      controller.abort();
-      window.clearTimeout(timer);
-    };
-  }, [pageId]);
+    return () => controller.abort();
+  }, [pageId, loadAttempt]);
 
   return (
     <>
+      <div className="page-actions">
+        <button type="button" disabled={loading} onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
+          Refresh changes
+        </button>
+      </div>
       {error && <p role="alert">{error}</p>}
-      {!error && changes === null && <p role="status">Loading changes…</p>}
-      {!error && changes?.length === 0 && <p role="status">No changes recorded yet.</p>}
+      {historyGap && <p role="status">Possible history gap</p>}
+      {loading && <p role="status">{changes === null ? "Loading changes…" : "Refreshing changes…"}</p>}
+      {!loading && !error && changes?.length === 0 && <p role="status">No changes recorded yet.</p>}
       {changes && changes.length > 0 && (
         <ul className="change-entries">{changes.map((change) => (
           <li key={change.version}>
@@ -271,9 +280,9 @@ function MaintainerSettings() {
           <h2 id="webhooks-title">changedetection webhooks</h2>
           {status ? (
             <>
-              <p role="status"><strong>{status.configured ? "Ready" : "Setup required"}</strong></p>
+              <p role="status"><strong>{status.configured ? "Webhook settings configured" : "Setup required"}</strong></p>
               <p className="muted">{status.configured
-                ? "New pages will record changes automatically."
+                ? "SignalWatch checked the format of the webhook URL and shared secret set on the server."
                 : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
             </>
           ) : !error && <p role="status">Loading webhook status…</p>}
