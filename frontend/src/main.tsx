@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useState, type FormEvent } from "react";
+import { StrictMode, useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -12,7 +12,19 @@ type Page = {
 };
 type Competitor = { id: number; name: string; website: string; pages: Page[] };
 type PageChange = { version: string; before: string; after: string };
+type TeamDecision = { relevant: boolean; reason: string; quote: string | null };
+type ChangeAnalysisResult = {
+  summary: string;
+  marketing: TeamDecision;
+  product: TeamDecision;
+  research_and_development: TeamDecision;
+};
+type PageChangeAnalysis = {
+  status: "queued" | "completed" | "failed";
+  result: ChangeAnalysisResult | null;
+};
 type WebhookStatus = { configured: boolean };
+type AnalysisSettings = { quality: "economy" | "higher_quality" };
 type WatchStatus = {
   available: boolean;
   paused: boolean | null;
@@ -24,6 +36,33 @@ const pageStates = {
   pending: "Watch pending", creating: "Creation unconfirmed — needs attention",
   linked: "Watch connected", attention: "Needs attention",
 };
+const analysisTeams = [
+  ["marketing", "Marketing"],
+  ["product", "Product"],
+  ["research_and_development", "R&D"],
+] as const;
+type TeamKey = (typeof analysisTeams)[number][0];
+type TeamInterests = Record<TeamKey | "business_context", string>;
+type DigestEntry = {
+  version: string;
+  source_name: string;
+  status: PageChangeAnalysis["status"] | "pending";
+  summary: string | null;
+  relevant_teams: TeamKey[];
+  team_reasons: Partial<Record<TeamKey, string>>;
+} & (
+  | { kind?: never; page_id: number; page_url: string; hold_reason?: "discovery_only" }
+  | { kind: "article"; title: string; article_url: string }
+);
+const digestAnalysisStatus = {
+  pending: "Analysis pending.",
+  queued: "Analysis queued.",
+  completed: "Analysis summary unavailable.",
+  failed: "Analysis failed.",
+} satisfies Record<DigestEntry["status"], string>;
+const discoveryOnlyReason = "Held because Hacker News is used to discover articles.";
+const configurationPath = "/?view=configuration";
+const summarySentences = new Intl.Segmenter(undefined, { granularity: "sentence" });
 
 function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
 async function request(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<unknown> {
@@ -50,12 +89,76 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : "The request could not be completed. Please try again.";
 }
 
-function ChangeHistory({ pageId }: { pageId: number }) {
-  const [changes, setChanges] = useState<PageChange[] | null>(null);
+function ChangeTime({ version }: { version: string }) {
+  const date = new Date(Number(version) * 1000);
+  if (Number.isNaN(date.getTime())) return <span>Version {version}</span>;
+  return (
+    <time className="change-time" dateTime={date.toISOString()}>
+      <span>{date.toLocaleDateString(undefined, { dateStyle: "medium" })}</span>
+      <span className="muted">{date.toLocaleTimeString(undefined, { timeStyle: "short" })}</span>
+    </time>
+  );
+}
+
+function changeHeadline(summary: string) {
+  return summarySentences.segment(summary.trim()).containing(0)?.segment.trim() ?? summary;
+}
+
+function TeamTakeaways({ result }: { result: ChangeAnalysisResult }) {
+  return (
+    <>
+      <h2>Team takeaways</h2>
+      <ul className="team-takeaways">
+        {analysisTeams.map(([key, name]) => {
+          const decision = result[key];
+          return (
+            <li key={key}>
+              <strong>{name}</strong>
+              <span>{decision.reason}</span>
+              <span className={decision.relevant ? "team-status relevant" : "team-status"}>
+                {decision.relevant ? "Relevant" : "Held"}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </>
+  );
+}
+
+function RawComparison({ change, result }: { change: PageChange; result?: ChangeAnalysisResult | null }) {
+  return (
+    <details className="raw-comparison">
+      <summary>View raw comparison</summary>
+      {result && analysisTeams.map(([key, name]) => {
+        const quote = result[key].quote;
+        return quote && <blockquote key={key}><strong>{name}: </strong>{quote}</blockquote>;
+      })}
+      <dl className="snapshots">
+        <div><dt>Before</dt><dd><pre>{change.before}</pre></dd></div>
+        <div><dt>After</dt><dd><pre>{change.after}</pre></dd></div>
+      </dl>
+    </details>
+  );
+}
+
+function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
+  pageId: number; pageUrl: string; requestedVersion: string | null;
+}) {
+  const [history, setHistory] = useState<{ changes: PageChange[]; historyGap: boolean; discoveryOnly: boolean } | null>(
+    null,
+  );
+  const [selectedVersion, setSelectedVersion] = useState(requestedVersion);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [historyGap, setHistoryGap] = useState(false);
+  const [analyses, setAnalyses] = useState<Record<string, PageChangeAnalysis> | null>(null);
+  const [analysisError, setAnalysisError] = useState(false);
+  const changes = history?.changes ?? null;
+  const discoveryOnly = history?.discoveryOnly;
+  const selected = selectedVersion === null ? changes?.[0] : changes?.find((change) => change.version === selectedVersion);
+  const analysis = selected && analyses?.[selected.version];
+  const result = analysis?.status === "completed" ? analysis.result : null;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -65,10 +168,17 @@ function ChangeHistory({ pageId }: { pageId: number }) {
     async function refresh() {
       const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
       try {
+        const metadata = { historyGap: false, discoveryOnly: false };
         const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal }, (headers) => {
-          if (!controller.signal.aborted) setHistoryGap(headers.get("X-SignalWatch-History-Gap") === "true");
+          metadata.historyGap = headers.get("X-SignalWatch-History-Gap") === "true";
+          metadata.discoveryOnly = headers.get("X-SignalWatch-Hold-Reason") === "discovery_only";
         });
-        if (!controller.signal.aborted) setChanges(changes);
+        if (!controller.signal.aborted) {
+          setHistory({ changes, ...metadata });
+          setSelectedVersion((version) =>
+            version === requestedVersion || changes.some((change) => change.version === version) ? version : null,
+          );
+        }
       } catch (cause) {
         if (!controller.signal.aborted) setError(message(cause));
       } finally {
@@ -78,29 +188,111 @@ function ChangeHistory({ pageId }: { pageId: number }) {
 
     void refresh();
     return () => controller.abort();
+  }, [pageId, requestedVersion, loadAttempt]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    setAnalysisError(false);
+    request<Record<string, PageChangeAnalysis>>(`/api/pages/${pageId}/analysis`, { signal })
+      .then((analyses) => { if (!controller.signal.aborted) setAnalyses(analyses); })
+      .catch(() => { if (!controller.signal.aborted) setAnalysisError(true); });
+    return () => controller.abort();
   }, [pageId, loadAttempt]);
 
   return (
-    <>
-      <div className="page-actions">
+    <div className="history-layout">
+      <div className="history-sidebar">
+        <h2>Change history</h2>
         <button type="button" disabled={loading} onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
           Refresh changes
         </button>
+        {error && <p role="alert">{error}</p>}
+        {history?.historyGap && <p role="status">Possible history gap</p>}
+        {loading && <p role="status">{changes === null ? "Loading changes…" : "Refreshing changes…"}</p>}
+        {!loading && !error && !selected && (
+          <p role="status">{selectedVersion !== null
+            ? "This saved edit is no longer available."
+            : "No changes recorded yet."}</p>
+        )}
+        {changes && changes.length > 0 && (
+          <ul className="history-versions" aria-label="Saved changes">
+            {changes.map((change, index) => (
+              <li key={change.version}>
+                <button type="button" aria-pressed={change.version === selected?.version}
+                  onClick={() => setSelectedVersion(index === 0 ? null : change.version)}>
+                  <strong className="history-version-title">
+                    {changeHeadline(analyses?.[change.version]?.result?.summary ?? "Page changed")}
+                  </strong>
+                  <ChangeTime version={change.version} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
-      {error && <p role="alert">{error}</p>}
-      {historyGap && <p role="status">Possible history gap</p>}
-      {loading && <p role="status">{changes === null ? "Loading changes…" : "Refreshing changes…"}</p>}
-      {!loading && !error && changes?.length === 0 && <p role="status">No changes recorded yet.</p>}
-      {changes && changes.length > 0 && (
-        <ul className="change-entries">{changes.map((change) => (
-          <li key={change.version}>
-            <dl>
-              <dt>Before</dt><dd><pre>{change.before}</pre></dd>
-              <dt>After</dt><dd><pre>{change.after}</pre></dd>
-            </dl>
-          </li>
-        ))}</ul>
+      {selected && (
+        <article className="history-detail" aria-label="Selected change">
+          <div className="history-meta">
+            <ChangeTime version={selected.version} />
+            <a href={pageUrl}>Open source page</a>
+          </div>
+          {analysisError && <p role="alert">Could not load change analysis. Use Refresh changes to try again.</p>}
+          {result ? (
+            <>
+              <h2 className="change-summary-title">Summary</h2>
+              <p className="change-summary">{result.summary}</p>
+            </>
+          ) : !analysisError && (
+            <p role="status">
+              {analyses === null ? "Loading analysis…" : analysis?.status === "failed"
+                ? "Analysis failed for this edit." : "Analysis pending."}
+            </p>
+          )}
+          {discoveryOnly ? <p className="muted">{discoveryOnlyReason}</p> : result && <TeamTakeaways result={result} />}
+          <RawComparison key={selected.version} change={selected} result={discoveryOnly ? null : result} />
+        </article>
       )}
+    </div>
+  );
+}
+
+function DeleteConfirmation({ kind, target, disabled, deleting, onConfirm }: {
+  kind: "page" | "source"; target: string; disabled: boolean; deleting: boolean; onConfirm: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
+  const titleId = useId();
+  const detailsId = useId();
+  const label = kind === "page" ? "Delete page" : "Delete source";
+
+  return (
+    <>
+      <button type="button" disabled={disabled || deleting} aria-label={`${label} ${target}`}
+        onClick={() => {
+          dialog.current?.showModal();
+          cancel.current?.focus();
+        }}>
+        {deleting ? "Deleting…" : label}
+      </button>
+      <dialog ref={dialog} className="delete-dialog" aria-labelledby={titleId} aria-describedby={detailsId}>
+        <h2 id={titleId}>{label}?</h2>
+        <div id={detailsId}>
+          <p><strong>{target}</strong></p>
+          <p>{kind === "page"
+            ? "This removes the page, its linked changedetection watch, and its saved history."
+            : "This removes the source, all its pages, their linked changedetection watches, and saved history."}
+          </p>
+          <p>This cannot be undone.</p>
+        </div>
+        <div className="delete-dialog-actions">
+          <button type="button" ref={cancel} onClick={() => dialog.current?.close()}>Cancel</button>
+          <button type="button" className="delete-confirm" onClick={() => {
+            dialog.current?.close();
+            onConfirm();
+          }}>{label}</button>
+        </div>
+      </dialog>
     </>
   );
 }
@@ -111,12 +303,8 @@ function PageItem({ page, onChange, onDelete, disabled }: {
   const [busy, setBusy] = useState<"connect" | "status" | "delete" | null>(null);
   const [error, setError] = useState("");
   const [status, setStatus] = useState<WatchStatus | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(false);
 
   async function run(action: "connect" | "status" | "delete") {
-    if (action === "delete" && !window.confirm(
-      `Delete page ${page.url} and its changedetection watch and history? This cannot be undone.`,
-    )) return;
     setBusy(action);
     setError("");
     setStatus(null);
@@ -150,10 +338,8 @@ function PageItem({ page, onChange, onDelete, disabled }: {
         <button disabled={busy !== null || disabled} onClick={() => void run("status")}>
           {busy === "status" ? "Refreshing…" : "Refresh status"}
         </button>
-        <button disabled={busy !== null || disabled} onClick={() => void run("delete")}
-          aria-label={`Delete page ${page.url}`}>
-          {busy === "delete" ? "Deleting…" : "Delete page"}
-        </button>
+        <DeleteConfirmation kind="page" target={page.url} disabled={busy !== null || disabled}
+          deleting={busy === "delete"} onConfirm={() => void run("delete")} />
       </div>
       {error && <p role="alert">{error}</p>}
       {status && <div className="watch-status" role="status">
@@ -165,10 +351,7 @@ function PageItem({ page, onChange, onDelete, disabled }: {
         {status.error && <p>{status.error}</p>}
       </div>}
       {page.state === "linked" && (
-        <details className="change-history" onToggle={(event) => setHistoryOpen(event.currentTarget.open)}>
-          <summary>Change history</summary>
-          {historyOpen && <ChangeHistory pageId={page.id} />}
-        </details>
+        <a href={`/?view=history&page=${page.id}`} aria-label={`Change history for ${page.url}`}>Change history</a>
       )}
     </li>
   );
@@ -201,10 +384,6 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
   }
 
   async function deleteCompetitor() {
-    if (!window.confirm(
-      `Delete source ${competitor.name}, all its pages, ` +
-      "and all linked changedetection watches and history? This cannot be undone.",
-    )) return;
     setBusy("delete");
     setError("");
     setSaved(false);
@@ -221,11 +400,8 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
   return (
     <section className="competitor" aria-labelledby={`competitor-${competitor.id}`}>
       <h2 id={`competitor-${competitor.id}`}>{competitor.name}</h2>
-      <p className="muted">{competitor.website}</p>
-      <button disabled={busy !== null} onClick={() => void deleteCompetitor()}
-        aria-label={`Delete source ${competitor.name}`}>
-        {busy === "delete" ? "Deleting…" : "Delete source"}
-      </button>
+      <DeleteConfirmation kind="source" target={competitor.name} disabled={busy !== null}
+        deleting={busy === "delete"} onConfirm={() => void deleteCompetitor()} />
       {competitor.pages.length ? (
         <ul className="page-list">{competitor.pages.map((page) => (
           <PageItem key={page.id} page={page} onChange={onPage} onDelete={onDelete} disabled={busy === "delete"} />
@@ -245,15 +421,147 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
   );
 }
 
-function SiteHeader({ maintainer }: { maintainer: boolean }) {
+function SiteHeader() {
   return (
     <header className="site-header">
       <div className="brand">SignalWatch</div>
       <nav aria-label="Resources">
-        <a href={maintainer ? "/" : "/?view=maintainer"}>{maintainer ? "Configuration" : "Maintainer settings"}</a>
         <a href="/docs">API docs</a>
       </nav>
     </header>
+  );
+}
+
+function Digest({ held }: { held: boolean }) {
+  const [entries, setEntries] = useState<DigestEntry[] | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    setError(false);
+    request<DigestEntry[]>(held ? "/api/digest?view=held" : "/api/digest", { signal })
+      .then((entries) => { if (!controller.signal.aborted) setEntries(entries); })
+      .catch(() => { if (!controller.signal.aborted) setError(true); });
+    return () => controller.abort();
+  }, [held, loadAttempt]);
+
+  return (
+    <main className="configuration">
+      {held && <a href="/?view=maintainer">← Maintainer settings</a>}
+      <h1>{held ? "Held items" : "Digest"}</h1>
+      {error ? (
+        <>
+          <p role="alert">{held ? "Could not load held items." : "Could not load the digest."}</p>
+          <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
+        </>
+      ) : entries === null ? (
+        <p role="status">{held ? "Loading held items…" : "Loading digest…"}</p>
+      ) : entries.length === 0 ? (
+        <p role="status">{held ? "No held items yet." : "No items match your team interests yet."}</p>
+      ) : (
+        <ol className="digest-feed">
+          {entries.map((entry) => {
+            const isArticle = entry.kind === "article";
+            const discoveryOnly = !isArticle && entry.hold_reason === "discovery_only";
+            const sourceUrl = isArticle ? entry.article_url : entry.page_url;
+            const destination = new URL(sourceUrl);
+            const sourceLocation = isArticle || destination.pathname === "/"
+              ? destination.host : `${destination.host}${destination.pathname}`;
+            const completed = entry.status === "completed";
+            const summary = completed ? entry.summary?.trim() : null;
+            const takeaway = summary ? changeHeadline(summary) : null;
+            const teams = completed ? analysisTeams.filter(([key]) => entry.relevant_teams.includes(key)) : [];
+            const historyPath = isArticle ? null :
+              `/?view=history&page=${entry.page_id}&version=${encodeURIComponent(entry.version)}${held ? "&from=held" : ""}`;
+            return (
+              <li key={isArticle ? `article:${sourceUrl}` : `edit:${entry.page_id}/${entry.version}`}>
+                <article className="digest-entry">
+                  <header>
+                    <div className="digest-entry-meta">
+                      <span>{isArticle ? `Via ${entry.source_name}` : entry.source_name}</span>
+                      <ChangeTime version={entry.version} />
+                    </div>
+                    <h2>{isArticle ? entry.title : takeaway ?? "Page changed"}</h2>
+                    {isArticle && takeaway && <p>{takeaway}</p>}
+                    {!takeaway && (
+                      <p className={entry.status === "failed" ? "digest-failed" : "muted"}>
+                        {digestAnalysisStatus[entry.status]}
+                      </p>
+                    )}
+                  </header>
+                  {discoveryOnly ? (
+                    <p className="muted">{discoveryOnlyReason}</p>
+                  ) : completed && (teams.length === 0 ? <p className="muted">Skipped. No team matched.</p> : (
+                    <div className="digest-relevance">
+                      <h3>Why it matters</h3>
+                      <ul className="digest-team-reasons">
+                        {teams.map(([key, name]) => (
+                          <li key={key}>
+                            <strong className="digest-team-label">{name}</strong>
+                            <span>{entry.team_reasons[key]?.trim() || "Reason unavailable."}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                  <footer className="digest-entry-links">
+                    {historyPath && (
+                      <a href={historyPath} aria-label={`View change history for ${sourceLocation}`}>View change history</a>
+                    )}
+                    <a href={sourceUrl}>
+                      {isArticle ? `Open article on ${sourceLocation}` : `Open source page · ${sourceLocation}`}
+                    </a>
+                  </footer>
+                </article>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </main>
+  );
+}
+
+function PageHistory({ pageId, requestedVersion, fromHeld }: {
+  pageId: string; requestedVersion: string | null; fromHeld: boolean;
+}) {
+  const [sources, setSources] = useState<Competitor[] | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [error, setError] = useState("");
+  const source = sources?.find((item) => item.pages.some((page) => String(page.id) === pageId));
+  const page = source?.pages.find((item) => String(item.id) === pageId);
+  const linked = source && page?.state === "linked";
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    setError("");
+    request<Competitor[]>("/api/competitors", { signal })
+      .then((sources) => { if (!controller.signal.aborted) setSources(sources); })
+      .catch(() => { if (!controller.signal.aborted) setError("Could not load the watched page."); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  return (
+    <main className="configuration history-page">
+      {fromHeld ? <a href="/?view=held">← Held items</a> : requestedVersion !== null ? <a href="/">← Digest</a> : (
+        <a href={source ? `${configurationPath}#competitor-${source.id}` : configurationPath}>← Configuration</a>
+      )}
+      <div className="history-heading">
+        <h1>{linked ? source.name : "Change history"}</h1>
+        {linked && <p className="page-url muted">{page.url}</p>}
+      </div>
+      {error ? (
+        <>
+          <p role="alert">{error}</p>
+          <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
+        </>
+      ) : sources === null ? <p role="status">Loading watched page…</p> : linked ? (
+        <ChangeHistory pageId={page.id} pageUrl={page.url} requestedVersion={requestedVersion} />
+      ) : <p role="status">This watched page is no longer available.</p>}
+    </main>
   );
 }
 
@@ -272,29 +580,158 @@ function MaintainerSettings() {
   }, [loadAttempt]);
 
   return (
-    <>
-      <SiteHeader maintainer />
-      <main className="configuration">
-        <h1>Maintainer settings</h1>
-        <section aria-labelledby="webhooks-title">
-          <h2 id="webhooks-title">changedetection webhooks</h2>
-          {status ? (
-            <>
-              <p role="status"><strong>{status.configured ? "Webhook settings configured" : "Setup required"}</strong></p>
-              <p className="muted">{status.configured
-                ? "SignalWatch checked the format of the webhook URL and shared secret set on the server."
-                : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
-            </>
-          ) : !error && <p role="status">Loading webhook status…</p>}
-          {error && <p role="alert">{error}</p>}
-          {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
-        </section>
-      </main>
-    </>
+    <main className="configuration">
+      <a href={configurationPath}>← Configuration</a>
+      <h1>Maintainer settings</h1>
+      <p><a href="/?view=held">Review held items</a></p>
+      <section aria-labelledby="webhooks-title">
+        <h2 id="webhooks-title">changedetection webhooks</h2>
+        {status ? (
+          <>
+            <p role="status"><strong>{status.configured ? "Webhook settings configured" : "Setup required"}</strong></p>
+            <p className="muted">{status.configured
+              ? "SignalWatch checked the format of the webhook URL and shared secret set on the server."
+              : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
+          </>
+        ) : !error && <p role="status">Loading webhook status…</p>}
+        {error && <p role="alert">{error}</p>}
+        {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
+      </section>
+      <AnalysisQualitySettings />
+    </main>
   );
 }
 
-function App() {
+function AnalysisQualitySettings() {
+  const settingsPath = "/api/maintainer/analysis";
+  const [settings, setSettings] = useState<AnalysisSettings | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    setError("");
+    request<AnalysisSettings>(settingsPath, { signal })
+      .then((settings) => { if (!controller.signal.aborted) setSettings(settings); })
+      .catch(() => { if (!controller.signal.aborted) setError("Could not load analysis quality."); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  async function saveQuality(quality: string) {
+    setSaving(true);
+    setError("");
+    try {
+      setSettings(await request<AnalysisSettings>(settingsPath, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ quality }),
+        signal: AbortSignal.timeout(8000),
+      }));
+    } catch {
+      setSettings(null);
+      setError("Could not confirm the save. Reload analysis quality to check the current setting.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section aria-labelledby="analysis-settings-title">
+      <h2 id="analysis-settings-title">Saved page analysis</h2>
+      {settings ? (
+        <label>
+          Analysis quality
+          <select value={settings.quality} disabled={saving} onChange={(event) => void saveQuality(event.target.value)}>
+            <option value="economy">Economy</option>
+            <option value="higher_quality">Higher quality</option>
+          </select>
+        </label>
+      ) : !error && <p role="status">Loading analysis quality…</p>}
+      <p className="muted">Applies to upcoming page analyses.</p>
+      {saving && <p role="status">Saving analysis quality…</p>}
+      {error && <p role="alert">{error}</p>}
+      {!settings && error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
+    </section>
+  );
+}
+
+function TeamInterestsSettings() {
+  const settingsPath = "/api/team-interests";
+  const [interests, setInterests] = useState<TeamInterests | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [saveState, setSaveState] = useState<"saving" | "saved" | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    setError("");
+    request<TeamInterests>(settingsPath, { signal })
+      .then((interests) => { if (!controller.signal.aborted) setInterests(interests); })
+      .catch(() => { if (!controller.signal.aborted) setError("Could not load team interests."); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  function updateInterest(key: keyof TeamInterests, value: string) {
+    setInterests((current) => current && { ...current, [key]: value });
+    setSaveState(null);
+    setError("");
+  }
+
+  async function saveInterests(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (interests === null || saveState === "saving") return;
+    setSaveState("saving");
+    setError("");
+    try {
+      setInterests(await request<TeamInterests>(settingsPath, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(interests),
+        signal: AbortSignal.timeout(8000),
+      }));
+      setSaveState("saved");
+    } catch (cause) {
+      setError(`Could not save team interests. ${message(cause)}`);
+      setSaveState(null);
+    }
+  }
+
+  return (
+    <section aria-labelledby="team-interests-title">
+      <h2 id="team-interests-title">Team interests</h2>
+      <p className="muted" id="team-interests-help">
+        Describe what each team wants to hear about. These interests apply across all watched pages and articles.
+        SignalWatch checks each team's interests separately.
+      </p>
+      {interests ? (
+        <form onSubmit={saveInterests} aria-describedby="team-interests-help">
+          <fieldset className="team-interests-fields" disabled={saveState === "saving"}>
+            <label>What matters to us (optional)
+              <textarea name="business_context" rows={3} maxLength={2000} aria-describedby="business-context-help"
+                value={interests.business_context} onChange={(event) => updateInterest("business_context", event.target.value)} />
+            </label>
+            <small className="muted" id="business-context-help">
+              Share what your business does or is focused on. For example, we help enterprises secure AI agents.
+            </small>
+            {analysisTeams.map(([key, name]) => (
+              <label key={key}>{name}
+                <textarea name={key} rows={3} maxLength={1000} value={interests[key]}
+                  onChange={(event) => updateInterest(key, event.target.value)} />
+              </label>
+            ))}
+            <button type="submit">{saveState === "saving" ? "Saving…" : "Save team interests"}</button>
+          </fieldset>
+          {saveState === "saved" && <p role="status">Team interests saved.</p>}
+        </form>
+      ) : !error && <p role="status">Loading team interests…</p>}
+      {error && <p role="alert">{error}</p>}
+      {!interests && error && <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
+        Retry loading team interests
+      </button>}
+    </section>
+  );
+}
+
+function Configuration() {
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -354,40 +791,39 @@ function App() {
   }
 
   return (
-    <>
-      <SiteHeader maintainer={false} />
-      <main className="configuration">
-        <h1>Configuration</h1>
-        <p className="muted">Add sources and choose which pages to monitor.</p>
-        <section aria-labelledby="add-competitor-title">
-          <h2 id="add-competitor-title">Add source</h2>
-          <form onSubmit={addCompetitor}>
-            <fieldset disabled={saving || loading || Boolean(loadError)}>
-              <label>Name<input name="name" required /></label>
-              <label>Website
-                <input name="website" type="url" placeholder="https://example.com" required />
-              </label>
-              <button type="submit">{saving ? "Saving…" : "Add source"}</button>
-            </fieldset>
-            {saveError && <p role="alert">{saveError}</p>}
-            {saved && <p role="status">Source saved, including its homepage.</p>}
-          </form>
-        </section>
-        <section aria-labelledby="competitors-title">
-          <h2 id="competitors-title">Sources</h2>
-          {loading ? <p role="status">Loading sources…</p> : loadError ? (
-            <div>
-              <p role="alert">{loadError}</p>
-              <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
-            </div>
-          ) : competitors.length === 0 ? <p>No sources saved.</p> : competitors.map((competitor) => (
-            <CompetitorSection key={competitor.id} competitor={competitor}
-              onPage={updatePage} onDelete={deletePage}
-              onRemove={(id) => setCompetitors((current) => current.filter((item) => item.id !== id))} />
-          ))}
-        </section>
-      </main>
-    </>
+    <main className="configuration">
+      <h1>Configuration</h1>
+      <p className="muted">Add sources and choose which pages to monitor.</p>
+      <a href="/?view=maintainer">Maintainer settings</a>
+      <TeamInterestsSettings />
+      <section aria-labelledby="add-competitor-title">
+        <h2 id="add-competitor-title">Add source</h2>
+        <form onSubmit={addCompetitor}>
+          <fieldset disabled={saving || loading || Boolean(loadError)}>
+            <label>Source name<input name="name" required /></label>
+            <label>First page to watch
+              <input name="website" type="url" placeholder="https://example.com" required />
+            </label>
+            <button type="submit">{saving ? "Saving…" : "Add source"}</button>
+          </fieldset>
+          {saveError && <p role="alert">{saveError}</p>}
+          {saved && <p role="status">Source and first page saved.</p>}
+        </form>
+      </section>
+      <section aria-labelledby="competitors-title">
+        <h2 id="competitors-title">Sources</h2>
+        {loading ? <p role="status">Loading sources…</p> : loadError ? (
+          <div>
+            <p role="alert">{loadError}</p>
+            <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
+          </div>
+        ) : competitors.length === 0 ? <p>No sources saved.</p> : competitors.map((competitor) => (
+          <CompetitorSection key={competitor.id} competitor={competitor}
+            onPage={updatePage} onDelete={deletePage}
+            onRemove={(id) => setCompetitors((current) => current.filter((item) => item.id !== id))} />
+        ))}
+      </section>
+    </main>
   );
 }
 
@@ -397,8 +833,25 @@ if (!root) {
   throw new Error("The page is missing its root element.");
 }
 
+const search = new URLSearchParams(window.location.search);
+const view = search.get("view");
+const requestedVersion = search.get("version");
+const held = view === "held";
+const fromHeld = view === "history" && search.get("from") === "held";
+const configurationActive = view === "configuration" || view === "maintainer" || held ||
+  (view === "history" && (requestedVersion === null || fromHeld));
+const current = view === "history" || view === "maintainer" || held ? "true" : "page";
 createRoot(root).render(
   <StrictMode>
-    {new URLSearchParams(window.location.search).get("view") === "maintainer" ? <MaintainerSettings /> : <App />}
+    <SiteHeader />
+    <div className="app-layout">
+      <nav className="app-nav" aria-label="Main navigation">
+        <a href="/" aria-current={configurationActive ? undefined : current}>Digest</a>
+        <a href={configurationPath} aria-current={configurationActive ? current : undefined}>Configuration</a>
+      </nav>
+      {view === "maintainer" ? <MaintainerSettings /> : view === "history" ? (
+        <PageHistory pageId={search.get("page") ?? ""} requestedVersion={requestedVersion} fromHeld={fromHeld} />
+      ) : view === "configuration" ? <Configuration /> : <Digest held={held} />}
+    </div>
   </StrictMode>,
 );

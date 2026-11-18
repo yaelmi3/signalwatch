@@ -6,8 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from time import time
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from signalwatch.analysis_models import AnalysisQuality, ChangeAnalysisResult, PageChangeAnalysis, TeamInterests
 
 _COMPETITORS_SCHEMA = "(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, website TEXT NOT NULL)"
 _PAGES_SCHEMA = """(
@@ -25,6 +29,30 @@ _HISTORY_GAPS_SCHEMA = """(
     watch_id TEXT NOT NULL,
     PRIMARY KEY (page_id, watch_id)
 )"""
+_CHANGE_ANALYSES_SCHEMA = """(
+    page_id INTEGER NOT NULL, version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'completed', 'failed')), result TEXT,
+    PRIMARY KEY (page_id, version),
+    FOREIGN KEY (page_id, version) REFERENCES page_changes(page_id, version) ON DELETE CASCADE
+)"""
+_ANALYSIS_SETTINGS_SCHEMA = """(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    quality TEXT NOT NULL CHECK (quality IN ('economy', 'higher_quality'))
+)"""
+_TEAM_INTERESTS_SCHEMA = """(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    marketing TEXT NOT NULL, product TEXT NOT NULL, research_and_development TEXT NOT NULL,
+    business_context TEXT NOT NULL DEFAULT ''
+)"""
+_HACKER_NEWS_ARTICLES_SCHEMA = """(
+    article_url TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, discovered_at INTEGER
+)"""
+_ARTICLE_ANALYSES_SCHEMA = """(
+    article_url TEXT NOT NULL PRIMARY KEY REFERENCES hacker_news_articles(article_url) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'completed', 'failed')), result TEXT
+)"""
+_HACKER_NEWS_WEBSITES = ("https://news.ycombinator.com/", "http://news.ycombinator.com/")
+_DIGEST_LIMIT = 50
 
 
 class PageState(StrEnum):
@@ -49,9 +77,54 @@ class PageChange(BaseModel):
     after: str
 
 
+class DigestTeam(StrEnum):
+    MARKETING = "marketing"
+    PRODUCT = "product"
+    RESEARCH_AND_DEVELOPMENT = "research_and_development"
+
+
+class DigestView(StrEnum):
+    RELEVANT = "relevant"
+    HELD = "held"
+
+
+class _DigestAnalysis(BaseModel):
+    version: str
+    status: Literal["pending", "queued", "completed", "failed"]
+    summary: str | None
+    relevant_teams: list[DigestTeam]
+    team_reasons: dict[DigestTeam, str]
+
+
+class DigestEntry(_DigestAnalysis):
+    page_id: int
+    source_name: str
+    page_url: str
+    hold_reason: Literal["discovery_only"] | None = Field(default=None, exclude_if=lambda reason: reason is None)
+
+
+class DigestArticle(_DigestAnalysis):
+    kind: Literal["article"] = "article"
+    source_name: Literal["Hacker News"] = "Hacker News"
+    title: str
+    article_url: str
+
+
+@dataclass(frozen=True)
+class HackerNewsArticle:
+    title: str
+    article_url: str
+
+
 @dataclass(frozen=True)
 class PageSnapshot:
     version: int
+    after: str
+
+
+@dataclass(frozen=True)
+class ChangeToAnalyze:
+    before: str
     after: str
 
 
@@ -132,6 +205,242 @@ def list_page_changes(page_id: int) -> list[PageChange]:
             (page_id,),
         ).fetchall()
     return [PageChange.model_validate(dict(row)) for row in rows]
+
+
+def is_hacker_news_front_page(url: str) -> bool:
+    return url in _HACKER_NEWS_WEBSITES
+
+
+def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | DigestArticle]:
+    with _database() as database:
+        rows = database.execute(
+            """WITH items AS (
+                SELECT changes.page_id, changes.version, competitors.name AS source_name, pages.url AS page_url,
+                       NULL AS title, NULL AS article_url, analyses.status, analyses.result,
+                       CASE WHEN pages.url IN (?, ?) THEN 'discovery_only' END AS hold_reason
+                FROM page_changes AS changes
+                JOIN pages ON pages.id = changes.page_id
+                JOIN competitors ON competitors.id = pages.competitor_id
+                LEFT JOIN change_analyses AS analyses
+                    ON analyses.page_id = changes.page_id AND analyses.version = changes.version
+                WHERE changes.before IS NOT NULL AND pages.state = ? AND pages.watch_id IS NOT NULL
+                UNION ALL
+                SELECT NULL, articles.discovered_at, 'Hacker News', NULL, articles.title, articles.article_url,
+                       analyses.status, analyses.result, NULL
+                FROM hacker_news_articles AS articles
+                LEFT JOIN article_analyses AS analyses ON analyses.article_url = articles.article_url
+                WHERE articles.discovered_at IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM competitors WHERE website IN (?, ?))
+            ), projected AS (
+                SELECT page_id, version, source_name, page_url, title, article_url, hold_reason,
+                       COALESCE(status, 'pending') AS status,
+                       json_extract(result, '$.summary') AS summary,
+                       CASE WHEN status = 'completed' AND json_extract(result, '$.marketing.relevant')
+                            THEN json_extract(result, '$.marketing.reason') END AS marketing,
+                       CASE WHEN status = 'completed' AND json_extract(result, '$.product.relevant')
+                            THEN json_extract(result, '$.product.reason') END AS product,
+                       CASE WHEN status = 'completed' AND json_extract(result, '$.research_and_development.relevant')
+                            THEN json_extract(result, '$.research_and_development.reason')
+                       END AS research_and_development
+                FROM items
+            )
+            SELECT page_id, CAST(version AS TEXT) AS version, source_name, page_url, title, article_url,
+                   status, summary, marketing, product, research_and_development, hold_reason
+            FROM projected
+            WHERE (hold_reason IS NULL AND
+                (marketing IS NOT NULL OR product IS NOT NULL OR research_and_development IS NOT NULL)) = ?
+            ORDER BY projected.version DESC, article_url IS NOT NULL, page_id, article_url LIMIT ?""",
+            (
+                *_HACKER_NEWS_WEBSITES,
+                PageState.LINKED,
+                *_HACKER_NEWS_WEBSITES,
+                view == DigestView.RELEVANT,
+                _DIGEST_LIMIT,
+            ),
+        ).fetchall()
+    entries: list[DigestEntry | DigestArticle] = []
+    for row in rows:
+        team_reasons = (
+            {} if row["hold_reason"] is not None else {team: row[team] for team in DigestTeam if row[team] is not None}
+        )
+        item = dict(row, relevant_teams=list(team_reasons), team_reasons=team_reasons)
+        model = DigestArticle if row["article_url"] is not None else DigestEntry
+        entries.append(model.model_validate(item))
+    return entries
+
+
+def has_hacker_news_source() -> bool:
+    with _database() as database:
+        return _has_hacker_news_source(database)
+
+
+def save_hacker_news_articles(articles: list[HackerNewsArticle]) -> None:
+    if not articles:
+        return
+    with _database() as database:
+        database.execute("BEGIN IMMEDIATE")
+        if not _has_hacker_news_source(database):
+            return
+        seeded = database.execute("SELECT 1 FROM hacker_news_articles LIMIT 1").fetchone() is not None
+        discovered_at = int(time()) if seeded else None
+        database.executemany(
+            """INSERT INTO hacker_news_articles (article_url, title, discovered_at) VALUES (?, ?, ?)
+            ON CONFLICT (article_url) DO NOTHING""",
+            [(article.article_url, article.title, discovered_at) for article in articles],
+        )
+
+
+def _has_hacker_news_source(database: sqlite3.Connection) -> bool:
+    return (
+        database.execute("SELECT 1 FROM competitors WHERE website IN (?, ?) LIMIT 1", _HACKER_NEWS_WEBSITES).fetchone()
+        is not None
+    )
+
+
+def list_unqueued_articles(limit: int = 100) -> list[str]:
+    with _database() as database:
+        rows = database.execute(
+            """SELECT articles.article_url FROM hacker_news_articles AS articles
+            WHERE articles.discovered_at IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM article_analyses AS analyses WHERE analyses.article_url = articles.article_url
+            ) AND EXISTS (SELECT 1 FROM competitors WHERE website IN (?, ?))
+            ORDER BY articles.discovered_at, articles.article_url LIMIT ?""",
+            (*_HACKER_NEWS_WEBSITES, max(0, limit)),
+        ).fetchall()
+    return [row["article_url"] for row in rows]
+
+
+def get_hacker_news_article(article_url: str) -> HackerNewsArticle | None:
+    with _database() as database:
+        row = database.execute(
+            """SELECT title, article_url FROM hacker_news_articles
+            WHERE article_url = ? AND discovered_at IS NOT NULL
+                AND EXISTS (SELECT 1 FROM competitors WHERE website IN (?, ?))""",
+            (article_url, *_HACKER_NEWS_WEBSITES),
+        ).fetchone()
+    return HackerNewsArticle(**dict(row)) if row is not None else None
+
+
+def mark_article_analysis_queued(article_url: str) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO article_analyses (article_url, status)
+            SELECT article_url, 'queued' FROM hacker_news_articles
+            WHERE article_url = ? AND discovered_at IS NOT NULL
+            ON CONFLICT (article_url) DO NOTHING""",
+            (article_url,),
+        )
+
+
+def save_article_analysis(article_url: str, result: ChangeAnalysisResult | None) -> None:
+    status = "completed" if result is not None else "failed"
+    result_json = result.model_dump_json() if result is not None else None
+    with _database() as database:
+        database.execute(
+            """INSERT INTO article_analyses (article_url, status, result)
+            SELECT article_url, ?, ? FROM hacker_news_articles
+            WHERE article_url = ? AND discovered_at IS NOT NULL
+            ON CONFLICT (article_url) DO UPDATE SET status = excluded.status, result = excluded.result
+            WHERE article_analyses.status != 'completed'""",
+            (status, result_json, article_url),
+        )
+
+
+def list_unqueued_changes(limit: int = 100) -> list[tuple[int, int]]:
+    with _database() as database:
+        rows = database.execute(
+            """SELECT changes.page_id, changes.version FROM page_changes AS changes
+            WHERE changes.before IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM change_analyses AS analyses
+                WHERE analyses.page_id = changes.page_id AND analyses.version = changes.version
+            )
+            ORDER BY changes.version, changes.page_id LIMIT ?""",
+            (max(0, limit),),
+        ).fetchall()
+    return [(row["page_id"], row["version"]) for row in rows]
+
+
+def get_change_for_analysis(page_id: int, version: int) -> ChangeToAnalyze | None:
+    with _database() as database:
+        row = database.execute(
+            "SELECT before, after FROM page_changes WHERE page_id = ? AND version = ? AND before IS NOT NULL",
+            (page_id, version),
+        ).fetchone()
+    return ChangeToAnalyze(before=row["before"], after=row["after"]) if row is not None else None
+
+
+def mark_analysis_queued(page_id: int, version: int) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO change_analyses (page_id, version, status)
+            SELECT page_id, version, 'queued' FROM page_changes
+            WHERE page_id = ? AND version = ? AND before IS NOT NULL
+            ON CONFLICT (page_id, version) DO NOTHING""",
+            (page_id, version),
+        )
+
+
+def save_change_analysis(page_id: int, version: int, result: ChangeAnalysisResult | None) -> None:
+    status = "completed" if result is not None else "failed"
+    result_json = result.model_dump_json() if result is not None else None
+    with _database() as database:
+        database.execute(
+            """INSERT INTO change_analyses (page_id, version, status, result)
+            SELECT page_id, version, ?, ? FROM page_changes
+            WHERE page_id = ? AND version = ? AND before IS NOT NULL
+            ON CONFLICT (page_id, version) DO UPDATE SET status = excluded.status, result = excluded.result
+            WHERE change_analyses.status != 'completed'""",
+            (status, result_json, page_id, version),
+        )
+
+
+def list_page_analyses(page_id: int) -> dict[str, PageChangeAnalysis]:
+    with _database() as database:
+        rows = database.execute(
+            "SELECT version, status, result FROM change_analyses WHERE page_id = ?", (page_id,)
+        ).fetchall()
+    return {
+        str(row["version"]): PageChangeAnalysis(
+            status=row["status"],
+            result=ChangeAnalysisResult.model_validate_json(row["result"]) if row["result"] is not None else None,
+        )
+        for row in rows
+    }
+
+
+def get_analysis_quality() -> AnalysisQuality:
+    with _database() as database:
+        row = database.execute("SELECT quality FROM analysis_settings WHERE id = 1").fetchone()
+    return AnalysisQuality(row["quality"]) if row is not None else AnalysisQuality.ECONOMY
+
+
+def get_team_interests() -> TeamInterests:
+    with _database() as database:
+        row = database.execute(
+            "SELECT marketing, product, research_and_development, business_context FROM team_interests WHERE id = 1"
+        ).fetchone()
+    return TeamInterests.model_validate(dict(row)) if row is not None else TeamInterests()
+
+
+def save_team_interests(interests: TeamInterests) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO team_interests (id, marketing, product, research_and_development, business_context)
+            VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT (id) DO UPDATE SET marketing = excluded.marketing, product = excluded.product,
+                research_and_development = excluded.research_and_development,
+                business_context = excluded.business_context""",
+            (interests.marketing, interests.product, interests.research_and_development, interests.business_context),
+        )
+
+
+def save_analysis_quality(quality: AnalysisQuality) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO analysis_settings (id, quality) VALUES (1, ?)
+            ON CONFLICT (id) DO UPDATE SET quality = excluded.quality""",
+            (quality,),
+        )
 
 
 def latest_page_snapshot(page_id: int) -> PageSnapshot | None:
@@ -292,4 +601,15 @@ def _database() -> Iterator[sqlite3.Connection]:
                 database.execute("ALTER TABLE page_changes_upgraded RENAME TO page_changes")
             database.commit()
         database.execute(f"CREATE TABLE IF NOT EXISTS history_gaps {_HISTORY_GAPS_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS change_analyses {_CHANGE_ANALYSES_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS analysis_settings {_ANALYSIS_SETTINGS_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS team_interests {_TEAM_INTERESTS_SCHEMA}")
+        schema_query = "SELECT 1 FROM pragma_table_info('team_interests') WHERE name = 'business_context'"
+        if database.execute(schema_query).fetchone() is None:
+            database.execute("BEGIN IMMEDIATE")
+            if database.execute(schema_query).fetchone() is None:
+                database.execute("ALTER TABLE team_interests ADD COLUMN business_context TEXT NOT NULL DEFAULT ''")
+            database.commit()
+        database.execute(f"CREATE TABLE IF NOT EXISTS hacker_news_articles {_HACKER_NEWS_ARTICLES_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS article_analyses {_ARTICLE_ANALYSES_SCHEMA}")
         yield database

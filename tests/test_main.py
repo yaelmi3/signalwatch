@@ -14,7 +14,8 @@ import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
-from signalwatch import storage
+from signalwatch import hacker_news, storage
+from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
 from signalwatch.catchup import catchup_lifespan
 from signalwatch.main import app
 
@@ -47,6 +48,299 @@ def test_serves_frontend_and_api_docs() -> None:
         docs = client.get("/docs")
         assert docs.status_code == HTTPStatus.OK
         assert "Swagger UI" in docs.text
+
+
+def test_maintainer_analysis_quality_persists_and_rejects_unknown_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    storage.save_competitor("Example", "https://example.com/")
+    settings_url = "/api/maintainer/analysis"
+    higher_quality = {"quality": "higher_quality"}
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == {"quality": "economy"}
+        saved = client.put(settings_url, json=higher_quality)
+        assert saved.status_code == HTTPStatus.OK
+        assert saved.json() == higher_quality
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == higher_quality
+        rejected = client.put(settings_url, json={"quality": "unsupported"})
+        assert rejected.status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+        assert client.get(settings_url).json() == higher_quality
+
+
+def test_team_interests_default_trim_and_persist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(database_path))
+    settings_url = "/api/team-interests"
+    expected = {
+        "marketing": "Pricing",
+        "product": "",
+        "research_and_development": "x" * 1000,
+        "business_context": "b" * 2000,
+    }
+    with TestClient(app) as client:
+        defaults = client.get(settings_url)
+        assert defaults.status_code == HTTPStatus.OK
+        assert defaults.json() == dict.fromkeys(expected, "")
+
+        with sqlite3.connect(database_path) as database:
+            database.execute("ALTER TABLE team_interests DROP COLUMN business_context")
+            database.execute("INSERT INTO team_interests VALUES (1, 'Positioning', 'Pricing', 'APIs')")
+        assert client.get(settings_url).json() == {
+            "marketing": "Positioning",
+            "product": "Pricing",
+            "research_and_development": "APIs",
+            "business_context": "",
+        }
+
+        saved = client.put(settings_url, json={key: f"  {value}\n" for key, value in expected.items()})
+        assert saved.status_code == HTTPStatus.OK
+        assert saved.json() == expected
+
+        for field, maximum in (("marketing", 1000), ("business_context", 2000)):
+            rejected = client.put(settings_url, json={**expected, field: "y" * (maximum + 1)})
+            assert rejected.status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+    assert storage.get_team_interests().model_dump() == expected
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == expected
+
+
+def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    first = storage.save_competitor("First", "https://first.example/").pages[0]
+    second = storage.save_competitor("Second", "https://second.example/").pages[0]
+    unlinked = storage.save_competitor("Unlinked", "https://unlinked.example/").pages[0]
+    hn_front_page = storage.save_page(first.competitor_id, "https://news.ycombinator.com/")
+    for page in (first, second, unlinked, hn_front_page):
+        storage.link_watch(page.id, f"watch-{page.id}")
+    for page, version, before in (
+        (first, 9, "old snapshot"),
+        (second, 10, "old snapshot"),
+        (first, 10, "old snapshot"),
+        (second, 8, "old snapshot"),
+        (first, 99, None),
+        (unlinked, 100, "old snapshot"),
+        (hn_front_page, 11, "old snapshot"),
+    ):
+        assert storage.save_page_version(
+            page_id=page.id, watch_id=f"watch-{page.id}", version=version, before=before, after="new snapshot"
+        )
+    storage.record_watch_error(page_id=unlinked.id, state=storage.PageState.PENDING, error="Watch unavailable")
+    marketing = TeamDecision(relevant=True, reason="Pricing changed", quote="new snapshot")
+    product = TeamDecision(relevant=False, reason="No plan changes", quote=None)
+    research = TeamDecision(relevant=True, reason="API terms changed", quote=None)
+    storage.save_change_analysis(
+        first.id,
+        10,
+        ChangeAnalysisResult(
+            summary="Pricing changed.", marketing=marketing, product=product, research_and_development=research
+        ),
+    )
+    storage.mark_analysis_queued(second.id, 10)
+    storage.save_change_analysis(second.id, 8, None)
+    hn_analysis = ChangeAnalysisResult(
+        summary="Front-page rankings changed.", marketing=marketing, product=product, research_and_development=research
+    )
+    storage.save_change_analysis(hn_front_page.id, 11, hn_analysis)
+    storage.save_change_analysis(
+        first.id,
+        9,
+        ChangeAnalysisResult(
+            summary="Formatting changed.", marketing=product, product=product, research_and_development=product
+        ),
+    )
+    storage.save_team_interests(TeamInterests(product="New feature announcements"))
+
+    with TestClient(app) as client:
+        response = client.get("/api/digest")
+        held = client.get("/api/digest", params={"view": "held"})
+        hn_changes = client.get(f"/api/pages/{hn_front_page.id}/changes")
+        other_changes = client.get(f"/api/pages/{first.id}/changes")
+        history = client.get(f"/api/pages/{hn_front_page.id}/analysis")
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == [
+        {
+            "page_id": first.id,
+            "version": "10",
+            "source_name": "First",
+            "page_url": first.url,
+            "status": "completed",
+            "summary": "Pricing changed.",
+            "relevant_teams": ["marketing", "research_and_development"],
+            "team_reasons": {"marketing": "Pricing changed", "research_and_development": "API terms changed"},
+        },
+    ]
+    assert held.status_code == HTTPStatus.OK
+    assert held.json() == [
+        {
+            "page_id": hn_front_page.id,
+            "version": "11",
+            "source_name": "First",
+            "page_url": hn_front_page.url,
+            "status": "completed",
+            "summary": "Front-page rankings changed.",
+            "relevant_teams": [],
+            "team_reasons": {},
+            "hold_reason": "discovery_only",
+        },
+        {
+            "page_id": second.id,
+            "version": "10",
+            "source_name": "Second",
+            "page_url": second.url,
+            "status": "queued",
+            "summary": None,
+            "relevant_teams": [],
+            "team_reasons": {},
+        },
+        {
+            "page_id": first.id,
+            "version": "9",
+            "source_name": "First",
+            "page_url": first.url,
+            "status": "completed",
+            "summary": "Formatting changed.",
+            "relevant_teams": [],
+            "team_reasons": {},
+        },
+        {
+            "page_id": second.id,
+            "version": "8",
+            "source_name": "Second",
+            "page_url": second.url,
+            "status": "failed",
+            "summary": None,
+            "relevant_teams": [],
+            "team_reasons": {},
+        },
+    ]
+
+    assert hn_changes.status_code == other_changes.status_code == HTTPStatus.OK
+    assert hn_changes.headers["X-SignalWatch-Hold-Reason"] == "discovery_only"
+    assert "X-SignalWatch-Hold-Reason" not in other_changes.headers
+    assert hn_changes.json() == [{"version": "11", "before": "old snapshot", "after": "new snapshot"}]
+    assert history.json()["11"] == {"status": "completed", "result": hn_analysis.model_dump()}
+
+
+def test_hacker_news_sync_seeds_then_adds_each_publisher_link_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    source = storage.save_competitor("HN", "https://news.ycombinator.com/")
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    assert storage.save_page_version(
+        page_id=page.id, watch_id=_WATCH_ID, version=4, before="Old page text", after="New page text"
+    )
+    old_item = "<item><title>Already on HN</title><link>https://first.example/archive</link></item>"
+    new_item = (
+        "<item><title>New &amp; useful</title>"
+        "<link>https://publisher.example/article?ref=hn&amp;edition=2</link></item>"
+    )
+    failed_item = "<item><title>Publisher unavailable</title><link>https://publisher.example/failed</link></item>"
+    skipped_items = (
+        "<item><title>Discussion</title><link>https://news.ycombinator.com/item?id=123</link></item>"
+        "<item><title>Unsafe scheme</title><link>javascript:alert(1)</link></item>"
+        "<item><title>Private host</title><link>http://127.0.0.1/private</link></item>"
+        "<item><title>No article link</title></item>"
+    )
+    first_feed = f"<rss><channel>{old_item}</channel></rss>"
+    next_feed = f"<rss><channel>{old_item}{new_item}{new_item}{failed_item}{skipped_items}</channel></rss>"
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
+            httpx2.Response(HTTPStatus.OK, text="<rss><channel/></rss>"),
+            httpx2.Response(HTTPStatus.OK, text=first_feed),
+            httpx2.Response(HTTPStatus.OK, text=next_feed),
+            httpx2.Response(HTTPStatus.OK, text=next_feed),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    monkeypatch.setattr(storage, "time", lambda: 10)
+    article_url = "https://publisher.example/article?ref=hn&edition=2"
+    failed_url = "https://publisher.example/failed"
+    old_url = "https://first.example/archive"
+    with TestClient(app) as client:
+        for _ in range(3):
+            hacker_news.sync_feed()
+        baseline = client.get("/api/digest", params={"view": "held"})
+        assert baseline.status_code == HTTPStatus.OK
+        edits = baseline.json()
+        assert len(edits) == 1 and edits[0]["version"] == "4"
+        assert storage.list_unqueued_articles() == []
+        assert storage.get_hacker_news_article(old_url) is None
+
+        hacker_news.sync_feed()
+        monkeypatch.setattr(storage, "time", lambda: 20)
+        hacker_news.sync_feed()
+        assert storage.list_unqueued_articles(limit=1) == [article_url]
+        assert storage.list_unqueued_articles() == [article_url, failed_url]
+        assert storage.get_hacker_news_article(article_url) == storage.HackerNewsArticle("New & useful", article_url)
+        article = {
+            "kind": "article",
+            "source_name": "Hacker News",
+            "title": "New & useful",
+            "article_url": article_url,
+            "version": "10",
+            "status": "pending",
+            "summary": None,
+            "relevant_teams": [],
+            "team_reasons": {},
+        }
+        failed = {**article, "article_url": failed_url, "title": "Publisher unavailable", "status": "failed"}
+        storage.save_article_analysis(failed_url, None)
+        assert client.get("/api/digest", params={"view": "held"}).json() == [article, failed, *edits]
+        assert client.get("/api/digest").json() == []
+        storage.mark_article_analysis_queued(article_url)
+        assert storage.list_unqueued_articles() == []
+        assert client.get("/api/digest", params={"view": "held"}).json() == [
+            {**article, "status": "queued"},
+            failed,
+            *edits,
+        ]
+        held = TeamDecision(relevant=False, reason="No match", quote=None)
+        relevant = TeamDecision(relevant=True, reason="Matches Product's interests", quote="Publisher evidence")
+        storage.save_article_analysis(
+            article_url,
+            ChangeAnalysisResult(
+                summary="A new release.", marketing=held, product=relevant, research_and_development=held
+            ),
+        )
+        storage.save_article_analysis(article_url, None)
+        assert client.get("/api/digest").json() == [
+            {
+                **article,
+                "status": "completed",
+                "summary": "A new release.",
+                "relevant_teams": ["product"],
+                "team_reasons": {"product": relevant.reason},
+            },
+        ]
+        assert client.get("/api/digest", params={"view": "held"}).json() == [failed, *edits]
+        storage.save_article_analysis(
+            failed_url,
+            ChangeAnalysisResult(
+                summary="No relevant changes.", marketing=held, product=held, research_and_development=held
+            ),
+        )
+        assert [entry["article_url"] for entry in client.get("/api/digest").json()] == [article_url]
+        assert client.get("/api/digest", params={"view": "held"}).json() == [
+            {**failed, "status": "completed", "summary": "No relevant changes."},
+            *edits,
+        ]
+
+        assert client.delete(f"/api/competitors/{source.id}").status_code == HTTPStatus.NO_CONTENT
+        hacker_news.sync_feed()
+        assert client.get("/api/digest").json() == []
+        assert client.get("/api/digest", params={"view": "held"}).json() == edits
+
+    assert handler.call_count == 5
+    for call in handler.call_args_list:
+        request = call.args[0]
+        assert request.method == HTTPMethod.GET
+        assert str(request.url) == "https://news.ycombinator.com/rss"
+        assert "authorization" not in request.headers and "x-api-key" not in request.headers
 
 
 def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
