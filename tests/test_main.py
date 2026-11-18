@@ -1,8 +1,10 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from http import HTTPMethod, HTTPStatus
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import Mock
 
 import httpx2
@@ -11,6 +13,20 @@ from fastapi.testclient import TestClient
 
 from signalwatch import storage
 from signalwatch.main import app
+
+_WEBHOOK = "/api/webhooks/changedetection"
+_WEBHOOK_HEADERS = {"X-SignalWatch-Webhook-Secret": "test-webhook-secret"}
+_WEBHOOK_SETUP_URL = "https://hooks.example.com/api/webhooks/changedetection"
+_WEBHOOK_SETUP_SECRET = "test-webhook+secret"
+_WATCH_NOTIFICATIONS = {
+    "notification_muted": False,
+    "notification_urls": [
+        "jsons://hooks.example.com/api/webhooks/changedetection?%2BX-SignalWatch-Webhook-Secret=test-webhook%2Bsecret"
+    ],
+    "notification_format": "text",
+    "notification_body": "{{watch_uuid}}",
+}
+_WATCH_ID = "520e831c-6d74-4c6d-96c6-c782061b0249"
 
 
 def test_serves_frontend_and_api_docs() -> None:
@@ -25,16 +41,182 @@ def test_serves_frontend_and_api_docs() -> None:
         assert "Swagger UI" in docs.text
 
 
+def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    engine_path = f"/api/v1/watch/{_WATCH_ID}"
+    history = {"10": "previous.txt"}
+    storage_race = Barrier(2, timeout=5)
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        assert request.headers["x-api-key"] == "test-api-key"
+        if request.method == HTTPMethod.DELETE and request.url.path == engine_path:
+            return httpx2.Response(HTTPStatus.NO_CONTENT)
+        assert request.method == HTTPMethod.GET
+        match request.url.path:
+            case path if path == f"{engine_path}/history":
+                return httpx2.Response(HTTPStatus.OK, json=history)
+            case path if path == f"{engine_path}/history/10":
+                return httpx2.Response(HTTPStatus.OK, text="Price: $10")
+            case path if path == f"{engine_path}/history/11":
+                storage_race.wait()
+                return httpx2.Response(HTTPStatus.OK, text="Price: $15")
+        raise AssertionError(f"Unexpected snapshot request: {request.url.path}")
+
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handle)))
+    payload = {"title": "Watch changed", "message": _WATCH_ID, "version": "1.1"}
+    changes_url = f"/api/pages/{page.id}/changes"
+    with TestClient(app) as client:
+        baseline = client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS)
+        assert baseline.status_code == HTTPStatus.NO_CONTENT
+        assert client.get(changes_url).json() == []
+
+        history["11"] = "latest.txt"
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            calls = [executor.submit(client.post, _WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS) for _ in range(2)]
+            assert [call.result().status_code for call in calls] == [HTTPStatus.NO_CONTENT, HTTPStatus.NO_CONTENT]
+        assert client.get(changes_url).json() == [{"version": "11", "before": "Price: $10", "after": "Price: $15"}]
+
+        assert client.delete(f"/api/pages/{page.id}").status_code == HTTPStatus.NO_CONTENT
+        assert client.get(changes_url).status_code == HTTPStatus.NOT_FOUND
+    with sqlite3.connect(db_path) as database:
+        assert database.execute("SELECT COUNT(*) FROM page_changes").fetchone() == (0,)
+
+
+def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    retained_history = {"11": "e.txt", "10": "d.txt", "3": "c.txt"}
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.OK, json={"2": "b.txt", "1": "a.txt"}),
+            httpx2.Response(HTTPStatus.OK, text="A"),
+            httpx2.Response(HTTPStatus.OK, text="B"),
+            httpx2.Response(HTTPStatus.OK, json={"10": "d.txt", "3": "c.txt"}),
+            httpx2.Response(HTTPStatus.OK, text="C"),
+            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
+            httpx2.Response(HTTPStatus.OK, json=retained_history),
+            httpx2.Response(HTTPStatus.OK, text="D"),
+            httpx2.Response(HTTPStatus.OK, text="E"),
+            httpx2.Response(HTTPStatus.OK, json=retained_history),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    payload = {"message": _WATCH_ID}
+    changes_url = f"/api/pages/{page.id}/changes"
+    with TestClient(app) as client:
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.BAD_GATEWAY
+        completed = [{"version": "3", "before": "B", "after": "C"}, {"version": "2", "before": "A", "after": "B"}]
+        assert client.get(changes_url).json() == completed
+
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        expected = [{"version": "11", "before": "D", "after": "E"}, {"version": "10", "before": "C", "after": "D"}]
+        assert client.get(changes_url).json() == expected + completed
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        assert client.get(changes_url).json() == expected + completed
+
+    history_path = f"/api/v1/watch/{_WATCH_ID}/history"
+    assert [call.args[0].url.path.removeprefix(history_path) for call in handler.call_args_list] == [
+        "",
+        "/1",
+        "/2",
+        "",
+        "/3",
+        "/10",
+        "",
+        "/10",
+        "/11",
+        "",
+    ]
+
+
+def test_changedetection_webhook_rejects_invalid_access_before_engine_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.delenv("CHANGEDETECTION_WEBHOOK_SECRET", raising=False)
+    handler = Mock()
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    payload = {"message": _WATCH_ID}
+    with TestClient(app) as client:
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NOT_FOUND
+        monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
+        assert client.post(_WEBHOOK, json=payload).status_code == HTTPStatus.UNAUTHORIZED
+        unknown_watch = client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS)
+        assert unknown_watch.status_code == HTTPStatus.NOT_FOUND
+    handler.assert_not_called()
+
+
+def test_watch_creation_requires_webhook_setup_and_can_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.delenv("SIGNALWATCH_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
+    source = storage.save_competitor("Example", "https://example.com/")
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.CREATED, json={"uuid": _WATCH_ID}),
+            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/news", **_WATCH_NOTIFICATIONS}),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    settings_url = "/api/maintainer/webhooks"
+    pages_url = f"/api/competitors/{source.id}/pages"
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == {"configured": False}
+        assert client.put(settings_url, json={"enabled": True}).status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        added = client.post(pages_url, json={"url": "https://example.com/news"})
+        assert added.status_code == HTTPStatus.CREATED
+        pending = added.json()
+        assert pending["state"] == "pending" and pending["watch_id"] is None
+        assert "webhook URL and secret" in pending["error"]
+        handler.assert_not_called()
+
+        monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+        assert client.get(settings_url).json() == {"configured": True}
+        retried = client.post(f"/api/pages/{pending['id']}/connect")
+        assert retried.status_code == HTTPStatus.OK and retried.json()["watch_id"] == _WATCH_ID
+        assert _WEBHOOK_SETUP_SECRET not in retried.text and _WEBHOOK_SETUP_URL not in retried.text
+
+    calls = [call.args[0] for call in handler.call_args_list]
+    assert [request.method for request in calls] == [HTTPMethod.POST, HTTPMethod.GET]
+    assert json.loads(calls[0].content) == {
+        "url": "https://example.com/news",
+        "title": "Example",
+        "fetch_backend": "html_requests",
+        **_WATCH_NOTIFICATIONS,
+    }
+
+
 def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
     monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
     monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
     watch_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
     extra_watch_id = "a655d37b-0928-4a73-aa9f-031411c407bc"
     handler = Mock(
         side_effect=[
             httpx2.Response(HTTPStatus.CREATED, json={"uuid": watch_id}),
-            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/"}),
+            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/", **_WATCH_NOTIFICATIONS}),
             httpx2.Response(
                 HTTPStatus.OK, json={"paused": False, "last_checked": 0, "check_count": 0, "last_error": False}
             ),
@@ -49,7 +231,7 @@ def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pyt
                 },
             ),
             httpx2.Response(HTTPStatus.CREATED, json={"uuid": extra_watch_id}),
-            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/pricing"}),
+            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/pricing", **_WATCH_NOTIFICATIONS}),
         ]
     )
     monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
@@ -93,13 +275,13 @@ def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pyt
         "url": "https://example.com/",
         "title": "Example",
         "fetch_backend": "html_requests",
-        "notification_muted": True,
+        **_WATCH_NOTIFICATIONS,
     }
     assert json.loads(handler.call_args_list[4].args[0].content) == {
         "url": "https://example.com/pricing",
         "title": "Example",
         "fetch_backend": "html_requests",
-        "notification_muted": True,
+        **_WATCH_NOTIFICATIONS,
     }
 
 
@@ -122,6 +304,8 @@ def test_creation_retry_stops_after_uncertain_outcome(tmp_path: Path, monkeypatc
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
     monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
     monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
     handler = Mock(
         side_effect=[
             httpx2.ConnectError("The engine connection failed."),

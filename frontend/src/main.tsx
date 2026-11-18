@@ -11,6 +11,8 @@ type Page = {
   error: string | null;
 };
 type Competitor = { id: number; name: string; website: string; pages: Page[] };
+type PageChange = { version: string; before: string; after: string };
+type WebhookStatus = { configured: boolean };
 type WatchStatus = {
   available: boolean;
   paused: boolean | null;
@@ -46,12 +48,61 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : "The request could not be completed. Please try again.";
 }
 
+function ChangeHistory({ pageId }: { pageId: number }) {
+  const [changes, setChanges] = useState<PageChange[] | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: number | undefined;
+
+    async function refresh() {
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+      try {
+        const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal });
+        if (controller.signal.aborted) return;
+        setChanges(changes);
+        setError("");
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(message(cause));
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(refresh, 3000);
+      }
+    }
+
+    void refresh();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [pageId]);
+
+  return (
+    <>
+      {error && <p role="alert">{error}</p>}
+      {!error && changes === null && <p role="status">Loading changes…</p>}
+      {!error && changes?.length === 0 && <p role="status">No changes recorded yet.</p>}
+      {changes && changes.length > 0 && (
+        <ul className="change-entries">{changes.map((change) => (
+          <li key={change.version}>
+            <dl>
+              <dt>Before</dt><dd><pre>{change.before}</pre></dd>
+              <dt>After</dt><dd><pre>{change.after}</pre></dd>
+            </dl>
+          </li>
+        ))}</ul>
+      )}
+    </>
+  );
+}
+
 function PageItem({ page, onChange, onDelete, disabled }: {
   page: Page; onChange: (page: Page) => void; onDelete: (page: Page) => void; disabled: boolean;
 }) {
   const [busy, setBusy] = useState<"connect" | "status" | "delete" | null>(null);
   const [error, setError] = useState("");
   const [status, setStatus] = useState<WatchStatus | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   async function run(action: "connect" | "status" | "delete") {
     if (action === "delete" && !window.confirm(
@@ -104,6 +155,12 @@ function PageItem({ page, onChange, onDelete, disabled }: {
         <p>Check count: {status.check_count ?? "Unknown"}</p>
         {status.error && <p>{status.error}</p>}
       </div>}
+      {page.state === "linked" && (
+        <details className="change-history" onToggle={(event) => setHistoryOpen(event.currentTarget.open)}>
+          <summary>Change history</summary>
+          {historyOpen && <ChangeHistory pageId={page.id} />}
+        </details>
+      )}
     </li>
   );
 }
@@ -179,6 +236,55 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
   );
 }
 
+function SiteHeader({ maintainer }: { maintainer: boolean }) {
+  return (
+    <header className="site-header">
+      <div className="brand">SignalWatch</div>
+      <nav aria-label="Resources">
+        <a href={maintainer ? "/" : "/?view=maintainer"}>{maintainer ? "Configuration" : "Maintainer settings"}</a>
+        <a href="/docs">API docs</a>
+      </nav>
+    </header>
+  );
+}
+
+function MaintainerSettings() {
+  const [status, setStatus] = useState<WebhookStatus | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setError("");
+    request<WebhookStatus>("/api/maintainer/webhooks", { signal: controller.signal })
+      .then((status) => { if (!controller.signal.aborted) setStatus(status); })
+      .catch(() => { if (!controller.signal.aborted) setError("Could not load webhook status."); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  return (
+    <>
+      <SiteHeader maintainer />
+      <main className="configuration">
+        <h1>Maintainer settings</h1>
+        <section aria-labelledby="webhooks-title">
+          <h2 id="webhooks-title">changedetection webhooks</h2>
+          {status ? (
+            <>
+              <p role="status"><strong>{status.configured ? "Ready" : "Setup required"}</strong></p>
+              <p className="muted">{status.configured
+                ? "New pages will record changes automatically."
+                : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
+            </>
+          ) : !error && <p role="status">Loading webhook status…</p>}
+          {error && <p role="alert">{error}</p>}
+          {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
+        </section>
+      </main>
+    </>
+  );
+}
+
 function App() {
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -240,12 +346,7 @@ function App() {
 
   return (
     <>
-      <header className="site-header">
-        <div className="brand">SignalWatch</div>
-        <nav aria-label="Resources">
-          <a href="/docs">API docs</a>
-        </nav>
-      </header>
+      <SiteHeader maintainer={false} />
       <main className="configuration">
         <h1>Configuration</h1>
         <p className="muted">Add sources and choose which pages to monitor.</p>
@@ -289,6 +390,6 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    {new URLSearchParams(window.location.search).get("view") === "maintainer" ? <MaintainerSettings /> : <App />}
   </StrictMode>,
 );

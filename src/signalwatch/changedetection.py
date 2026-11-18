@@ -1,12 +1,20 @@
 import os
 from http import HTTPMethod, HTTPStatus
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx2
-from pydantic import BaseModel, HttpUrl, ValidationError
+from pydantic import BaseModel, HttpUrl, TypeAdapter, ValidationError
 
 from signalwatch.network import send_request
+
+WEBHOOK_PATH = "/api/webhooks/changedetection"
+WEBHOOK_SECRET_ENV = "CHANGEDETECTION_WEBHOOK_SECRET"
+WEBHOOK_SECRET_HEADER = "X-SignalWatch-Webhook-Secret"
+WEBHOOK_CONFIGURATION_ERROR = "Configure the SignalWatch webhook URL and secret on the server."
+_HISTORY = TypeAdapter(dict[int, str])
+
+type EnginePayload = dict[str, str | bool | list[str]]
 
 
 class EngineError(Exception):
@@ -24,6 +32,13 @@ class WatchTarget(BaseModel):
     url: str
 
 
+class WatchNotifications(BaseModel):
+    notification_muted: bool
+    notification_urls: list[str]
+    notification_format: str
+    notification_body: str
+
+
 class EngineWatch(BaseModel):
     paused: bool
     last_checked: float | None
@@ -39,20 +54,54 @@ class WatchStatus(BaseModel):
     error: str | None = None
 
 
-def create_watch(url: str, title: str) -> str:
-    data = _request(
-        method=HTTPMethod.POST,
-        path="watch",
-        payload={"url": url, "title": title, "fetch_backend": "html_requests", "notification_muted": True},
+def webhook_notification_url() -> str | None:
+    address, secret = os.getenv("SIGNALWATCH_WEBHOOK_URL"), os.getenv(WEBHOOK_SECRET_ENV)
+    if not address or not secret or not secret.isascii() or not secret.isprintable() or secret != secret.strip():
+        return None
+    try:
+        target = HttpUrl(address)
+    except ValidationError:
+        return None
+    if target.username or target.password or target.query is not None or target.fragment is not None:
+        return None
+    if target.path != WEBHOOK_PATH:
+        return None
+    scheme = "jsons" if target.scheme == "https" else "json"
+    return urlunsplit(
+        (scheme, urlsplit(str(target)).netloc, WEBHOOK_PATH, urlencode({f"+{WEBHOOK_SECRET_HEADER}": secret}), "")
     )
+
+
+def create_watch(url: str, title: str) -> str:
+    notification_url = webhook_notification_url()
+    if notification_url is None:
+        raise EngineError(WEBHOOK_CONFIGURATION_ERROR)
+    notifications = WatchNotifications(
+        notification_muted=False,
+        notification_urls=[notification_url],
+        notification_format="text",
+        notification_body="{{watch_uuid}}",
+    )
+    payload: EnginePayload = {
+        "url": url,
+        "title": title,
+        "fetch_backend": "html_requests",
+        **notifications.model_dump(),
+    }
+    data = _request(method=HTTPMethod.POST, path="watch", payload=payload)
     try:
         watch_id = str(CreatedWatch.model_validate(data).uuid)
         data = _request(method=HTTPMethod.GET, path=f"watch/{quote(watch_id, safe='')}")
         target = WatchTarget.model_validate(data)
+        configured_notifications = WatchNotifications.model_validate(data)
     except (ValidationError, EngineError):
         raise EngineError("Watch creation could not be confirmed; maintainer attention is required.", True) from None
     if target.url != url:
         raise EngineError("The engine created a watch for a different URL; maintainer attention is required.", True)
+    if configured_notifications != notifications:
+        raise EngineError(
+            "The engine's webhook settings could not be confirmed; maintainer attention is required.", True
+        )
     return watch_id
 
 
@@ -71,6 +120,21 @@ def read_watch(watch_id: str) -> WatchStatus:
     )
 
 
+def read_history(watch_id: str) -> list[int]:
+    data = _request(method=HTTPMethod.GET, path=f"watch/{quote(watch_id, safe='')}/history")
+    try:
+        return sorted(_HISTORY.validate_python(data))
+    except ValidationError:
+        raise EngineError("The engine returned an invalid watch history.") from None
+
+
+def read_snapshot(watch_id: str, version: int) -> str:
+    response = _engine_response(method=HTTPMethod.GET, path=f"watch/{quote(watch_id, safe='')}/history/{version}")
+    if response.headers.get("content-type", "").partition(";")[0] != "text/plain":
+        raise EngineError("The engine returned an invalid watch snapshot.")
+    return response.text
+
+
 def delete_watch(watch_id: str) -> None:
     try:
         _request(method=HTTPMethod.DELETE, path=f"watch/{quote(watch_id, safe='')}")
@@ -85,7 +149,19 @@ def delete_watch(watch_id: str) -> None:
             raise
 
 
-def _request(*, method: HTTPMethod, path: str, payload: dict[str, str | bool] | None = None) -> object:
+def _request(*, method: HTTPMethod, path: str, payload: EnginePayload | None = None) -> object:
+    response = _engine_response(method=method, path=path, payload=payload)
+    if method == HTTPMethod.DELETE:
+        if response.status_code != HTTPStatus.NO_CONTENT:
+            raise EngineError("The engine returned an invalid deletion response.")
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        raise EngineError("The engine returned an invalid response.", method == HTTPMethod.POST) from None
+
+
+def _engine_response(*, method: HTTPMethod, path: str, payload: EnginePayload | None = None) -> httpx2.Response:
     address, key = os.getenv("CHANGEDETECTION_URL"), os.getenv("CHANGEDETECTION_API_KEY")
     if not address or not key:
         raise EngineError("Configure the changedetection URL and API key on the server.")
@@ -98,7 +174,7 @@ def _request(*, method: HTTPMethod, path: str, payload: dict[str, str | bool] | 
     if base.username or base.password or base.query or base.fragment:
         raise EngineError("The server's changedetection connection settings are invalid.")
     try:
-        response = send_request(
+        return send_request(
             method=method, url=f"{str(base).rstrip('/')}/api/v1/{path}", headers={"x-api-key": key}, payload=payload
         )
     except (httpx2.ConnectError, httpx2.ConnectTimeout):
@@ -114,11 +190,3 @@ def _request(*, method: HTTPMethod, path: str, payload: dict[str, str | bool] | 
             method == HTTPMethod.POST and not HTTPStatus.BAD_REQUEST <= code < HTTPStatus.INTERNAL_SERVER_ERROR,
             response=error.response,
         ) from None
-    if method == HTTPMethod.DELETE:
-        if response.status_code != HTTPStatus.NO_CONTENT:
-            raise EngineError("The engine returned an invalid deletion response.")
-        return None
-    try:
-        return response.json()
-    except ValueError:
-        raise EngineError("The engine returned an invalid response.", method == HTTPMethod.POST) from None

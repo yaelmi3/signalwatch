@@ -131,3 +131,9 @@ def page_status(page_id: int) -> changedetection.WatchStatus:
         return changedetection.read_watch(page.watch_id)
     except changedetection.EngineError as error:
         return changedetection.WatchStatus(error=str(error))
+
+
+@router.get("/pages/{page_id}/changes")
+def page_changes(page_id: int) -> list[storage.PageChange]:
+    _page(page_id)
+    return storage.list_page_changes(page_id)
