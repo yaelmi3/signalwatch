@@ -70,11 +70,33 @@ Open **Digest** for updates that match at least one team. Each match includes a 
 Select an edit to open its saved details. **Maintainer settings** links to **Held items** for skipped updates and
 analysis status.
 
-For a source configured with the Hacker News homepage, the worker checks its RSS feed at startup and every five
-minutes. The first feed establishes which URLs are already seen. The worker evaluates new articles from the original
-publisher page once per URL. Relevant articles appear in **Digest** with a direct **Open article** link.
+### Article discovery
 
-Back up the app database and the DBOS database together to preserve both the results and unfinished jobs.
+Open **Maintainer settings → Article discovery** and give a source a public RSS 2.0 feed URL. The worker checks the feed
+at startup and every five minutes. The first successful poll with articles records which links are already present.
+Later discoveries are analyzed from the original publisher page. Relevant articles link directly to the publisher,
+and Held shows why each team passed on an analyzed article.
+
+Select **Use the first page for discovery only** if that page serves as an article listing. Other watched pages under
+the source are still analyzed. Clearing the feed URL stops discovery and preserves the source's article history.
+
+### Worker upgrades and retention
+
+Before changing DBOS or workflow code, stop the worker and check its system database for unfinished jobs. Replace the
+example path with the absolute path to your app database with `.analysis.sqlite3` appended.
+
+```sh
+uv run dbos workflow list \
+  --sys-db-url 'sqlite:///file:/absolute/path/configuration.sqlite3.analysis.sqlite3?uri=true' \
+  --status ENQUEUED --status PENDING --status DELAYED --status SUSPENDED
+```
+
+If the list contains jobs, use the previous release to finish or recover them, then stop the worker and check again.
+Back up both SQLite databases before starting the new release. The app can keep saving page changes while the worker
+is stopped.
+
+Deleting a page or source removes its history from the app and its watches from changedetection. Saved excerpts can
+remain in DBOS checkpoints. Manage retention for the worker database and its backups separately from app deletion.
 
 ## Checks
 

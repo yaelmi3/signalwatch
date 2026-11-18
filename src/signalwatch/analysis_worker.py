@@ -4,8 +4,10 @@ import json
 import os
 import signal
 import sqlite3
+from collections.abc import Iterator
+from difflib import SequenceMatcher
 from hashlib import sha256
-from itertools import takewhile
+from itertools import accumulate, batched, groupby, takewhile
 from pathlib import Path
 from threading import Event
 from time import monotonic
@@ -18,14 +20,15 @@ from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 from structlog.typing import FilteringBoundLogger
 
-from signalwatch import article_content, hacker_news, storage
+from signalwatch import article_content, article_feeds, storage
 from signalwatch.analysis_models import AnalysisQuality, ChangeAnalysisResult, TeamInterests
 
 _QUEUE_NAME = "page-analysis"
 _SCAN_INTERVAL_SECONDS = 2
-_HACKER_NEWS_INTERVAL_SECONDS = 300
+_FEED_INTERVAL_SECONDS = 300
 _MAX_CHARS_PER_SNAPSHOT = 12_000
 _CHANGE_CONTEXT_CHARS = 400
+_MAX_DIFF_BLOCKS = 1024
 _MODEL_ENV_BY_QUALITY = {
     AnalysisQuality.ECONOMY: "SIGNALWATCH_ANALYSIS_MODEL",
     AnalysisQuality.HIGHER_QUALITY: "SIGNALWATCH_ANALYSIS_HIGHER_QUALITY_MODEL",
@@ -58,7 +61,7 @@ so avoid claims about omitted content.
 _ARTICLE_INSTRUCTIONS = (
     _TEAM_INSTRUCTIONS
     + """
-Evaluate a Hacker News discovery using only publisher_text as evidence. The headline is a hint about the topic.
+Evaluate a discovered article using only publisher_text as evidence. The headline is a hint about the topic.
 Summarize what the excerpt reports without assuming that a competitor made a change. Use a short, exact quote
 from publisher_text for each relevant team. Use null when no useful quote exists for a held team.
 Return an empty summary if the excerpt lacks substantive article text, such as a login screen or unrelated content.
@@ -72,31 +75,95 @@ class _TransientModelError(Exception):
 
 
 def _retry_analysis(error: BaseException) -> bool:
-    return isinstance(error, (_TransientModelError, sqlite3.OperationalError))
+    return isinstance(error, (_TransientModelError, article_content.TransientFetchError, sqlite3.OperationalError))
 
 
-def _snapshot_excerpt(text: str, common_prefix: int, common_suffix: int) -> list[str]:
+def _changed_passages(text: str, hunks: list[range]) -> list[str]:
     if len(text) <= _MAX_CHARS_PER_SNAPSHOT:
         return [text]
-    start = max(0, common_prefix - _CHANGE_CONTEXT_CHARS)
-    end = min(len(text), len(text) - common_suffix + _CHANGE_CONTEXT_CHARS)
-    if end - start <= _MAX_CHARS_PER_SNAPSHOT:
-        return [text[start:end]]
-    half_budget = _MAX_CHARS_PER_SNAPSHOT // 2
-    return [text[start : start + half_budget], text[end - half_budget : end]]
+    context = (_MAX_CHARS_PER_SNAPSHOT - sum(map(len, hunks))) // (2 * len(hunks))
+    context = max(0, min(context, _CHANGE_CONTEXT_CHARS))
+    windows: list[range] = []
+    for hunk in hunks:
+        start, end = max(0, hunk.start - context), min(len(text), hunk.stop + context)
+        if windows and start <= windows[-1].stop:
+            start = windows.pop().start
+        windows.append(range(start, end))
+    if sum(map(len, windows)) <= _MAX_CHARS_PER_SNAPSHOT:
+        return [text[window.start : window.stop] for window in windows]
+
+    passages = []
+    remaining = _MAX_CHARS_PER_SNAPSHOT
+    for index, window in enumerate(windows):
+        budget = remaining // (len(windows) - index)
+        if len(window) <= budget:
+            passages.append(text[window.start : window.stop])
+            remaining -= len(window)
+        else:
+            head = budget // 2
+            passages.extend((text[window.start : window.start + head], text[window.stop - budget + head : window.stop]))
+            remaining -= budget
+    return passages
+
+
+def _replacement_regions(old: str, new: str) -> Iterator[tuple[range, range]]:
+    old_start = new_start = 0
+    longest = max(len(old), len(new))
+    if longest > _MAX_CHARS_PER_SNAPSHOT:
+        # Split large replacements around nearby exact matches, including pages stored as one long line.
+        step = max(_CHANGE_CONTEXT_CHARS, (longest + _MAX_DIFF_BLOCKS - 1) // _MAX_DIFF_BLOCKS)
+        for old_end in range(step, len(old) - step, step):
+            anchor = old[old_end : old_end + _CHANGE_CONTEXT_CHARS]
+            expected = min(len(new), new_start + old_end - old_start)
+            left = new.rfind(anchor, max(new_start, expected - step), expected + len(anchor))
+            right = new.find(anchor, expected, expected + step + len(anchor))
+            new_end = min((pos for pos in (left, right) if pos >= 0), key=lambda pos: abs(pos - expected), default=-1)
+            if new_end < 0:
+                continue
+            if old[old_start:old_end] != new[new_start:new_end]:
+                yield range(old_start, old_end), range(new_start, new_end)
+            old_start, new_start = old_end + len(anchor), new_end + len(anchor)
+    if old[old_start:] != new[new_start:]:
+        yield range(old_start, len(old)), range(new_start, len(new))
 
 
 def _change_evidence(change: storage.ChangeToAnalyze) -> dict[str, list[str]]:
     before, after = change.before, change.after
-    prefix = suffix = 0
-    if max(len(before), len(after)) > _MAX_CHARS_PER_SNAPSHOT:
-        prefix = sum(1 for _ in takewhile(lambda pair: pair[0] == pair[1], zip(before, after, strict=False)))
-        remaining = min(len(before), len(after)) - prefix
-        for old, new in zip(reversed(before), reversed(after), strict=False):
-            if suffix == remaining or old != new:
-                break
-            suffix += 1
-    return {"before": _snapshot_excerpt(before, prefix, suffix), "after": _snapshot_excerpt(after, prefix, suffix)}
+    longest = max(len(before), len(after))
+    if longest <= _MAX_CHARS_PER_SNAPSHOT:
+        return {"before": [before], "after": [after]}
+    if before == after:
+        return {"before": [before[:_MAX_CHARS_PER_SNAPSHOT]], "after": [after[:_MAX_CHARS_PER_SNAPSHOT]]}
+
+    old_blocks = ["".join(run) for _, run in groupby(before.splitlines(keepends=True))]
+    new_blocks = ["".join(run) for _, run in groupby(after.splitlines(keepends=True))]
+    # shortcut: Group dense snapshots to bound matching work. Refine groups if they hide edits.
+    group_size = (max(len(old_blocks), len(new_blocks)) + _MAX_DIFF_BLOCKS - 1) // _MAX_DIFF_BLOCKS
+    if group_size > 1:
+        old_blocks = ["".join(group) for group in batched(old_blocks, group_size, strict=False)]
+        new_blocks = ["".join(group) for group in batched(new_blocks, group_size, strict=False)]
+    old_offsets = list(accumulate(map(len, old_blocks), initial=0))
+    new_offsets = list(accumulate(map(len, new_blocks), initial=0))
+    old_hunks, new_hunks = [], []
+    for tag, i, j, k, m in SequenceMatcher(None, old_blocks, new_blocks, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        old_start, new_start = old_offsets[i], new_offsets[k]
+        old, new = before[old_start : old_offsets[j]], after[new_start : new_offsets[m]]
+        for old_region, new_region in _replacement_regions(old, new):
+            old_text = old[old_region.start : old_region.stop]
+            new_text = new[new_region.start : new_region.stop]
+            prefix = sum(1 for _ in takewhile(lambda pair: pair[0] == pair[1], zip(old_text, new_text, strict=False)))
+            suffix = sum(
+                1
+                for _ in takewhile(
+                    lambda pair: pair[0] == pair[1], zip(reversed(old_text), reversed(new_text), strict=False)
+                )
+            )
+            suffix = min(suffix, min(len(old_text), len(new_text)) - prefix)
+            old_hunks.append(range(old_start + old_region.start + prefix, old_start + old_region.stop - suffix))
+            new_hunks.append(range(new_start + new_region.start + prefix, new_start + new_region.stop - suffix))
+    return {"before": _changed_passages(before, old_hunks), "after": _changed_passages(after, new_hunks)}
 
 
 @DBOS.step(name="request-page-analysis", retries_allowed=True, should_retry=_retry_analysis)
@@ -114,13 +181,13 @@ def _request_analysis(page_id: int, version: int) -> ChangeAnalysisResult | None
     )
 
 
-def _article_workflow_id(article_url: str) -> str:
-    return f"article-analysis:{sha256(article_url.encode('utf-8')).hexdigest()}"
+def _article_workflow_id(source_id: int, article_url: str) -> str:
+    return f"article-analysis:{source_id}:{sha256(article_url.encode('utf-8')).hexdigest()}"
 
 
 @DBOS.step(name="request-article-analysis", retries_allowed=True, should_retry=_retry_analysis)
-def _request_article_analysis(article_url: str) -> ChangeAnalysisResult | None:
-    article = storage.get_hacker_news_article(article_url)
+def _request_article_analysis(source_id: int, article_url: str) -> ChangeAnalysisResult | None:
+    article = storage.get_discovered_article(source_id, article_url)
     if article is None:
         return None
     publisher_text = article_content.read_publisher_text(article.article_url)
@@ -130,7 +197,7 @@ def _request_article_analysis(article_url: str) -> ChangeAnalysisResult | None:
         evidence={"headline": article.title, "publisher_text": publisher_text},
         passages=[publisher_text],
         instructions=_ARTICLE_INSTRUCTIONS,
-        logger=analysis_logger.bind(article_id=_article_workflow_id(article_url)),
+        logger=analysis_logger.bind(article_id=_article_workflow_id(source_id, article_url)),
         require_quote=True,
     )
     return result if result is not None and result.summary.strip() else None
@@ -221,24 +288,25 @@ def analyze_page_change(page_id: int, version: int) -> None:
 
 
 @DBOS.step(name="persist-article-analysis", retries_allowed=True, should_retry=_retry_analysis)
-def _persist_article_analysis(article_url: str, result: ChangeAnalysisResult | None) -> None:
-    storage.save_article_analysis(article_url, result)
+def _persist_article_analysis(*, source_id: int, article_url: str, result: ChangeAnalysisResult | None) -> None:
+    storage.save_article_analysis(source_id, article_url, result)
 
 
-@DBOS.workflow(name="analyze-hacker-news-article")
-def analyze_hacker_news_article(article_url: str) -> None:
+@DBOS.workflow(name="analyze-discovered-article")
+def analyze_discovered_article(source_id: int, article_url: str) -> None:
+    article_id = _article_workflow_id(source_id, article_url)
     try:
-        result = _request_article_analysis(article_url)
+        result = _request_article_analysis(source_id, article_url)
     except dbos_error.DBOSMaxStepRetriesExceeded:
-        analysis_logger.warning("Article analysis retries exhausted", article_id=_article_workflow_id(article_url))
+        analysis_logger.warning("Article analysis retries exhausted", article_id=article_id)
         result = None
 
     while True:
         try:
-            _persist_article_analysis(article_url, result)
+            _persist_article_analysis(source_id=source_id, article_url=article_url, result=result)
             return
         except dbos_error.DBOSMaxStepRetriesExceeded:
-            analysis_logger.warning("Could not persist article analysis", article_id=_article_workflow_id(article_url))
+            analysis_logger.warning("Could not persist article analysis", article_id=article_id)
             DBOS.sleep(_SCAN_INTERVAL_SECONDS)
 
 
@@ -263,10 +331,10 @@ def _enqueue_saved_changes(queue: Queue) -> None:
 
 
 def _enqueue_articles(queue: Queue) -> None:
-    for article_url in storage.list_unqueued_articles():
-        with SetWorkflowID(_article_workflow_id(article_url)):
-            queue.enqueue(analyze_hacker_news_article, article_url)
-        storage.mark_article_analysis_queued(article_url)
+    for source_id, article_url in storage.list_unqueued_articles():
+        with SetWorkflowID(_article_workflow_id(source_id, article_url)):
+            queue.enqueue(analyze_discovered_article, source_id, article_url)
+        storage.mark_article_analysis_queued(source_id, article_url)
 
 
 def run_worker(stop: Event) -> None:
@@ -283,8 +351,8 @@ def run_worker(stop: Event) -> None:
             except (sqlite3.OperationalError, OperationalError, OSError) as error:
                 analysis_logger.warning("Could not hand off discovered articles", error_type=type(error).__name__)
             if not stop.is_set() and monotonic() >= next_feed_poll:
-                hacker_news.sync_feed()
-                next_feed_poll = monotonic() + _HACKER_NEWS_INTERVAL_SECONDS
+                article_feeds.sync_feeds()
+                next_feed_poll = monotonic() + _FEED_INTERVAL_SECONDS
             stop.wait(_SCAN_INTERVAL_SECONDS)
     finally:
         DBOS.destroy(workflow_completion_timeout_sec=30)

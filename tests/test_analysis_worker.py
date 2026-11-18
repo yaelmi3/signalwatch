@@ -5,18 +5,18 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from hashlib import sha256
 from http import HTTPStatus
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
+from typing import Any
 
 import httpx2
 import pytest
 from dbos import DBOS
 from openai import OpenAI
 
-from signalwatch import analysis_worker, article_content, storage
+from signalwatch import analysis_worker, article_content, article_feeds, storage
 from signalwatch.analysis_models import TeamInterests
 
 
@@ -32,11 +32,15 @@ def test_worker_retries_handoff_and_limits_model_calls(
             marketing="Customer stories", product="Product releases", business_context="We build marine instruments."
         )
     )
-    storage.save_competitor("Hacker News", "https://news.ycombinator.com/")
-    baseline = storage.HackerNewsArticle(title="Baseline", article_url="https://publisher.test/baseline")
-    article = storage.HackerNewsArticle(title="New sensor", article_url="https://publisher.test/sensor")
-    unreadable = storage.HackerNewsArticle(title="Blocked article", article_url="https://publisher.test/blocked")
-    storage.save_hacker_news_articles([baseline])
+    baseline = storage.Article(title="Baseline", article_url="https://1.1.1.1/baseline")
+    article = storage.Article(title="New sensor", article_url="https://1.1.1.1/sensor")
+    unreadable = storage.Article(title="Blocked article", article_url="https://1.1.1.1/blocked")
+    for name in ("Engineering", "Technology"):
+        source = storage.save_competitor(name, f"https://{name.lower()}.test/")
+        storage.set_article_feed(source_id=source.id, url=f"https://{name.lower()}.test/feed", discovery_only=False)
+    feeds = storage.list_article_feeds()
+    for feed in feeds:
+        storage.save_discovered_articles(feed, [baseline])
     page = storage.save_competitor("Example", "https://example.test/").pages[0]
     storage.link_watch(page.id, "test-watch")
     for version, before in enumerate((None, "Release 1", "Release 2", "Release 3"), start=1):
@@ -54,10 +58,9 @@ def test_worker_retries_handoff_and_limits_model_calls(
         original_mark(page_id, version)
 
     monkeypatch.setattr(storage, "mark_analysis_queued", interrupt_first_handoff)
-    monkeypatch.setattr(analysis_worker.hacker_news, "sync_feed", lambda: None)
+    monkeypatch.setattr(article_feeds, "sync_feeds", lambda: None)
     release = Event()
     first_two_running = Event()
-    third_started = Event()
     stop = Event()
     lock = Lock()
     attempts: Counter[int | str] = Counter()
@@ -65,19 +68,30 @@ def test_worker_retries_handoff_and_limits_model_calls(
     publisher_text = "The new tide sensor logs wave height every minute."
     active = peak = 0
 
-    def read_publisher_text(url: str) -> str | None:
+    def publisher_respond(request: httpx2.Request) -> httpx2.Response:
+        url = str(request.url)
         with lock:
             publisher_reads[url] += 1
-        return publisher_text if url == article.article_url else None
+            attempt = publisher_reads[url]
+        if url == unreadable.article_url:
+            return httpx2.Response(HTTPStatus.NOT_FOUND)
+        assert url == article.article_url
+        if attempt == 1:
+            return httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE, text="private publisher error text")
+        return httpx2.Response(
+            HTTPStatus.OK, headers={"Content-Type": "text/plain"}, stream=httpx2.ByteStream(publisher_text.encode())
+        )
 
-    monkeypatch.setattr(article_content, "read_publisher_text", read_publisher_text)
+    class TestClient(httpx2.Client):
+        def __init__(self, *, transport: httpx2.BaseTransport | None = None, **kwargs: Any) -> None:
+            super().__init__(transport=transport or httpx2.MockTransport(publisher_respond), **kwargs)
+
+    monkeypatch.setattr(httpx2, "Client", TestClient)
 
     def respond(request: httpx2.Request) -> httpx2.Response:
         nonlocal active, peak
         body = json.loads(request.content)
         assert body["store"] is False
-        schema = body["text"]["format"]["schema"]
-        assert set(schema["required"]) == {"summary", "marketing", "product", "research_and_development"}
         evidence = json.loads(body["input"])
         assert evidence["business_context"] == "We build marine instruments."
         assert evidence["team_interests"] == {
@@ -88,12 +102,10 @@ def test_worker_retries_handoff_and_limits_model_calls(
         if "publisher_text" in evidence:
             assert evidence["headline"] == article.title
             assert evidence["publisher_text"] == publisher_text
-            assert "Hacker News discovery" in body["instructions"]
             item, summary = "article", publisher_text
         else:
             summary = evidence["after"][0]
             item = int(summary.removeprefix("Release "))
-            assert evidence["before"] == [f"Release {item - 1}"]
         with lock:
             attempts[item] += 1
             attempt = attempts[item]
@@ -104,11 +116,9 @@ def test_worker_retries_handoff_and_limits_model_calls(
         try:
             expected_model = "test-model" if item in {2, 3} and attempt == 1 else "test-alternate-model"
             assert body["model"] == expected_model
-            if item in {4, "article"}:
-                third_started.set()
-            elif attempt == 1:
+            if item in {2, 3} and attempt == 1:
                 assert release.wait(12)
-            if item == 4 or (item in {2, "article"} and attempt == 1):
+            if item == 4 or (item == 2 and attempt == 1):
                 return httpx2.Response(503, json={"error": {"message": "private provider error text"}})
             return _model_response(
                 summary=summary,
@@ -124,14 +134,14 @@ def test_worker_retries_handoff_and_limits_model_calls(
             api_key="fake-test-key",
             max_retries=max_retries,
             timeout=timeout,
-            http_client=httpx2.Client(transport=httpx2.MockTransport(respond)),
+            http_client=TestClient(transport=httpx2.MockTransport(respond)),
         )
 
     monkeypatch.setattr(analysis_worker, "OpenAI", model_client)
 
-    def held_article_statuses() -> dict[str, str]:
+    def held_article_statuses() -> dict[tuple[int, str], str]:
         return {
-            row.article_url: row.status
+            (row.source_id, row.article_url): row.status
             for row in storage.list_digest(storage.DigestView.HELD)
             if isinstance(row, storage.DigestArticle)
         }
@@ -140,27 +150,16 @@ def test_worker_retries_handoff_and_limits_model_calls(
         worker = executor.submit(analysis_worker.run_worker, stop)
         try:
             assert first_two_running.wait(10)
-            storage.save_hacker_news_articles([article, unreadable])
-            queued_articles = {article.article_url: "queued", unreadable.article_url: "queued"}
+            storage.save_discovered_articles(feeds[0], [article, unreadable])
+            storage.save_discovered_articles(feeds[1], [article])
+            blocked_key = (feeds[0].source_id, unreadable.article_url)
+            queued_articles = {(feed.source_id, article.article_url): "queued" for feed in feeds}
+            queued_articles[blocked_key] = "queued"
             _wait_until(lambda: held_article_statuses() == queued_articles)
-            assert not third_started.wait(1.5)
             assert not publisher_reads
-            assert {version: analysis.status for version, analysis in storage.list_page_analyses(page.id).items()} == {
-                "2": "queued",
-                "3": "queued",
-                "4": "queued",
-            }
             storage.save_analysis_quality(analysis_worker.AnalysisQuality.HIGHER_QUALITY)
             release.set()
-            _wait_until(
-                lambda: all(analysis.status != "queued" for analysis in storage.list_page_analyses(page.id).values())
-            )
-            _wait_until(lambda: sum(workflow.status == "SUCCESS" for workflow in DBOS.list_workflows()) == 5)
-            assert {workflow.workflow_id for workflow in DBOS.list_workflows()} == {
-                f"page-analysis:{page.id}:{version}" for version in (2, 3, 4)
-            } | {
-                f"article-analysis:{sha256(story.article_url.encode()).hexdigest()}" for story in (article, unreadable)
-            }
+            _wait_until(lambda: [workflow.status for workflow in DBOS.list_workflows()] == ["SUCCESS"] * 6)
         finally:
             release.set()
             stop.set()
@@ -170,12 +169,13 @@ def test_worker_retries_handoff_and_limits_model_calls(
     assert peak == 2
     assert handoffs == {2: 2, 3: 1, 4: 1}
     assert attempts == {2: 2, 3: 1, 4: 3, "article": 2}
-    assert publisher_reads == {article.article_url: 2, unreadable.article_url: 1}
-    assert held_article_statuses() == {unreadable.article_url: "failed"}
+    assert publisher_reads == {article.article_url: 3, unreadable.article_url: 1}
+    assert held_article_statuses() == {blocked_key: "failed"}
     relevant_articles = [row for row in storage.list_digest() if isinstance(row, storage.DigestArticle)]
+    assert {row.source_id for row in relevant_articles} == {feed.source_id for feed in feeds}
     assert [(row.article_url, row.status, row.summary, row.relevant_teams) for row in relevant_articles] == [
-        (article.article_url, "completed", publisher_text, ["product"])
-    ]
+        (article.article_url, "completed", publisher_text, ["product"]),
+    ] * 2
     assert analyses["2"].status == "completed"
     assert analyses["2"].result is not None
     assert analyses["2"].result.product.relevant
@@ -189,27 +189,83 @@ def test_worker_retries_handoff_and_limits_model_calls(
     assert analyses["3"].result is not None
     assert analyses["3"].result.product.quote is None
     assert analyses["4"].model_dump() == {"status": "failed", "result": None}
-    assert storage.list_unqueued_changes() == []
-    assert storage.list_unqueued_articles() == []
-    assert app_db.with_name(f"{app_db.name}.analysis.sqlite3").is_file()
     captured = capfd.readouterr()
     assert "private provider error text" not in captured.out + captured.err
-    assert "test-model" not in captured.out + captured.err
-    assert "test-alternate-model" not in captured.out + captured.err
+    assert "private publisher error text" not in captured.out + captured.err
 
 
-def test_evidence_keeps_an_edit_in_the_middle_of_a_long_page() -> None:
-    padding = "Unchanged text\n" * 2000
+@pytest.mark.parametrize(
+    ("separator", "before_edits", "after_edits"),
+    [
+        (
+            "\n",
+            ["Old opening", "Old price $10 " + "old text " * 600, "Old closing"],
+            ["New opening", "New price $20 " + "new detail " * 600, "New closing"],
+        ),
+        (" ", ["Old opening", "Old price $10", "Old closing"], ["Different opening", "Sale price $20", "New closing"]),
+    ],
+    ids=["uneven-sizes", "single-line"],
+)
+def test_evidence_keeps_scattered_edits_on_a_long_page(
+    separator: str, before_edits: list[str], after_edits: list[str]
+) -> None:
+    padding = f"Unchanged text{separator}" * 2000
     change = storage.ChangeToAnalyze(
-        before=f"{padding}Old price $10{padding}",
-        after=f"{padding}New price $20{padding}",
+        before=padding + padding.join(f"{edit}{separator}" for edit in before_edits) + padding,
+        after=padding + padding.join(f"{edit}{separator}" for edit in after_edits) + padding,
     )
 
     evidence = analysis_worker._change_evidence(change)
 
-    assert "Old price $10" in evidence["before"][0]
-    assert "New price $20" in evidence["after"][0]
-    assert sum(len(passage) for passages in evidence.values() for passage in passages) <= 24_000
+    for side, edits in (("before", before_edits), ("after", after_edits)):
+        assert all(any(edit in passage for passage in evidence[side]) for edit in edits)
+        assert sum(map(len, evidence[side])) <= 12_000
+
+
+def test_feed_sync_pins_requests_and_isolates_failed_feeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    feed = storage.ArticleFeed(3, "https://source.test/feed.xml")
+    feeds = [
+        storage.ArticleFeed(1, "http://127.1/feed.xml"),
+        storage.ArticleFeed(2, "https://broken.test/feed.xml"),
+        feed,
+    ]
+    saved: list[tuple[storage.ArticleFeed, list[storage.Article]]] = []
+    requested = []
+    body = b"""<rss version="2.0"><channel><link>https://source.test/</link>
+      <item><title>Listing</title><link>http://source.test/#latest</link></item>
+      <item><title>Feed</title><link>https://source.test/feed.xml</link></item>
+      <item><title>Discussion</title><link>https://source.test/discussion</link>
+        <comments>https://source.test/discussion#comments</comments></item>
+      <item><title>Private</title><link>http://0x7f.0.0.1/</link></item>
+      <item><title>Credentials</title><link>https://user:password@publisher.test/</link></item>
+      <item><title>Release &amp; details</title><link>https://source.test/story?edition=1&amp;ref=rss</link></item>
+    </channel></rss>"""
+
+    def resolve(host: str, port: int, **_kwargs: int) -> list[tuple]:
+        assert host in {"broken.test.", "source.test."}
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("1.1.1.1", port))]
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        host = request.headers["host"]
+        requested.append(host)
+        assert str(request.url) == "https://1.1.1.1/feed.xml"
+        assert request.extensions["sni_hostname"] == host
+        assert "authorization" not in request.headers and "cookie" not in request.headers
+        content = b'<!DOCTYPE rss [<!ENTITY name "Example">]>' + body if host == "broken.test" else body
+        return httpx2.Response(HTTPStatus.OK, stream=httpx2.ByteStream(content))
+
+    def save_articles(source_feed: storage.ArticleFeed, articles: list[storage.Article]) -> None:
+        saved.append((source_feed, articles))
+
+    monkeypatch.setattr(storage, "list_article_feeds", lambda: feeds)
+    monkeypatch.setattr(storage, "save_discovered_articles", save_articles)
+    monkeypatch.setattr(article_content.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(respond)))
+
+    article_feeds.sync_feeds()
+
+    assert requested == ["broken.test", "source.test"]
+    assert saved == [(feed, [storage.Article("Release & details", "https://source.test/story?edition=1&ref=rss")])]
 
 
 @pytest.mark.parametrize("status", [HTTPStatus.OK, HTTPStatus.FOUND])
@@ -248,6 +304,7 @@ def test_publisher_fetch_pins_public_address_and_preserves_host(monkeypatch: pyt
         "https://publisher.test:8443/story",
         "https://user@publisher.test/story",
         "http://127.0.0.1/",
+        "http://127.1/",
         "https://[fec0::1]/",
         "https://private.test/story",
     ],

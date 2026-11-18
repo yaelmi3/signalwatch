@@ -14,7 +14,7 @@ import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
-from signalwatch import hacker_news, storage
+from signalwatch import storage
 from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
 from signalwatch.catchup import catchup_lifespan
 from signalwatch.main import app
@@ -22,6 +22,7 @@ from signalwatch.main import app
 _WEBHOOK = "/api/webhooks/changedetection"
 _WEBHOOK_HEADERS = {"Authorization": "Basic " + b64encode(b"signalwatch:test-webhook-secret").decode("ascii")}
 _HISTORY_GAP_HEADER = "X-SignalWatch-History-Gap"
+_ARTICLE_FEEDS = "/api/maintainer/article-feeds"
 _WEBHOOK_SETUP_URL = "https://hooks.example.com/api/webhooks/changedetection"
 _WEBHOOK_SETUP_SECRET = "test-webhook-secret"
 _WATCH_NOTIFICATIONS = {
@@ -108,11 +109,11 @@ def test_team_interests_default_trim_and_persist(tmp_path: Path, monkeypatch: py
 
 def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
-    first = storage.save_competitor("First", "https://first.example/").pages[0]
+    discovery_home = storage.save_competitor("First", "https://first.example/").pages[0]
+    first = storage.save_page(discovery_home.competitor_id, "https://first.example/updates")
     second = storage.save_competitor("Second", "https://second.example/").pages[0]
     unlinked = storage.save_competitor("Unlinked", "https://unlinked.example/").pages[0]
-    hn_front_page = storage.save_page(first.competitor_id, "https://news.ycombinator.com/")
-    for page in (first, second, unlinked, hn_front_page):
+    for page in (first, second, unlinked, discovery_home):
         storage.link_watch(page.id, f"watch-{page.id}")
     for page, version, before in (
         (first, 9, "old snapshot"),
@@ -121,7 +122,7 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
         (second, 8, "old snapshot"),
         (first, 99, None),
         (unlinked, 100, "old snapshot"),
-        (hn_front_page, 11, "old snapshot"),
+        (discovery_home, 11, "old snapshot"),
     ):
         assert storage.save_page_version(
             page_id=page.id, watch_id=f"watch-{page.id}", version=version, before=before, after="new snapshot"
@@ -139,10 +140,9 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
     )
     storage.mark_analysis_queued(second.id, 10)
     storage.save_change_analysis(second.id, 8, None)
-    hn_analysis = ChangeAnalysisResult(
+    homepage_analysis = ChangeAnalysisResult(
         summary="Front-page rankings changed.", marketing=marketing, product=product, research_and_development=research
     )
-    storage.save_change_analysis(hn_front_page.id, 11, hn_analysis)
     storage.save_change_analysis(
         first.id,
         9,
@@ -151,13 +151,18 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
         ),
     )
     storage.save_team_interests(TeamInterests(product="New feature announcements"))
+    storage.set_article_feed(source_id=first.competitor_id, url="https://first.example/feed.xml", discovery_only=True)
+    assert (discovery_home.id, 11) not in storage.list_unqueued_changes()
+    assert storage.get_change_for_analysis(discovery_home.id, 11) is None
+    assert storage.get_change_for_analysis(first.id, 10) is not None
+    storage.save_change_analysis(discovery_home.id, 11, homepage_analysis)
 
     with TestClient(app) as client:
         response = client.get("/api/digest")
         held = client.get("/api/digest", params={"view": "held"})
-        hn_changes = client.get(f"/api/pages/{hn_front_page.id}/changes")
+        homepage_changes = client.get(f"/api/pages/{discovery_home.id}/changes")
         other_changes = client.get(f"/api/pages/{first.id}/changes")
-        history = client.get(f"/api/pages/{hn_front_page.id}/analysis")
+        history = client.get(f"/api/pages/{discovery_home.id}/analysis")
     assert response.status_code == HTTPStatus.OK
     assert response.json() == [
         {
@@ -174,10 +179,10 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
     assert held.status_code == HTTPStatus.OK
     assert held.json() == [
         {
-            "page_id": hn_front_page.id,
+            "page_id": discovery_home.id,
             "version": "11",
             "source_name": "First",
-            "page_url": hn_front_page.url,
+            "page_url": discovery_home.url,
             "status": "completed",
             "summary": "Front-page rankings changed.",
             "relevant_teams": [],
@@ -216,131 +221,106 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
         },
     ]
 
-    assert hn_changes.status_code == other_changes.status_code == HTTPStatus.OK
-    assert hn_changes.headers["X-SignalWatch-Hold-Reason"] == "discovery_only"
+    assert homepage_changes.status_code == other_changes.status_code == HTTPStatus.OK
+    assert homepage_changes.headers["X-SignalWatch-Hold-Reason"] == "discovery_only"
     assert "X-SignalWatch-Hold-Reason" not in other_changes.headers
-    assert hn_changes.json() == [{"version": "11", "before": "old snapshot", "after": "new snapshot"}]
-    assert history.json()["11"] == {"status": "completed", "result": hn_analysis.model_dump()}
+    assert homepage_changes.json() == [{"version": "11", "before": "old snapshot", "after": "new snapshot"}]
+    assert history.json()["11"] == {"status": "completed", "result": homepage_analysis.model_dump()}
 
 
-def test_hacker_news_sync_seeds_then_adds_each_publisher_link_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
-    source = storage.save_competitor("HN", "https://news.ycombinator.com/")
-    page = storage.save_competitor("Example", "https://example.com/").pages[0]
-    storage.link_watch(page.id, _WATCH_ID)
-    assert storage.save_page_version(
-        page_id=page.id, watch_id=_WATCH_ID, version=4, before="Old page text", after="New page text"
-    )
-    old_item = "<item><title>Already on HN</title><link>https://first.example/archive</link></item>"
-    new_item = (
-        "<item><title>New &amp; useful</title>"
-        "<link>https://publisher.example/article?ref=hn&amp;edition=2</link></item>"
-    )
-    failed_item = "<item><title>Publisher unavailable</title><link>https://publisher.example/failed</link></item>"
-    skipped_items = (
-        "<item><title>Discussion</title><link>https://news.ycombinator.com/item?id=123</link></item>"
-        "<item><title>Unsafe scheme</title><link>javascript:alert(1)</link></item>"
-        "<item><title>Private host</title><link>http://127.0.0.1/private</link></item>"
-        "<item><title>No article link</title></item>"
-    )
-    first_feed = f"<rss><channel>{old_item}</channel></rss>"
-    next_feed = f"<rss><channel>{old_item}{new_item}{new_item}{failed_item}{skipped_items}</channel></rss>"
-    handler = Mock(
-        side_effect=[
-            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
-            httpx2.Response(HTTPStatus.OK, text="<rss><channel/></rss>"),
-            httpx2.Response(HTTPStatus.OK, text=first_feed),
-            httpx2.Response(HTTPStatus.OK, text=next_feed),
-            httpx2.Response(HTTPStatus.OK, text=next_feed),
-        ]
-    )
-    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
-    monkeypatch.setattr(storage, "time", lambda: 10)
-    article_url = "https://publisher.example/article?ref=hn&edition=2"
-    failed_url = "https://publisher.example/failed"
-    old_url = "https://first.example/archive"
-    with TestClient(app) as client:
-        for _ in range(3):
-            hacker_news.sync_feed()
-        baseline = client.get("/api/digest", params={"view": "held"})
-        assert baseline.status_code == HTTPStatus.OK
-        edits = baseline.json()
-        assert len(edits) == 1 and edits[0]["version"] == "4"
-        assert storage.list_unqueued_articles() == []
-        assert storage.get_hacker_news_article(old_url) is None
+    source = storage.save_competitor("Releases", "https://releases.example/")
+    settings_url = f"{_ARTICLE_FEEDS}/{source.id}"
+    first_feed = storage.ArticleFeed(source.id, "https://releases.example/feed.xml")
+    next_feed = storage.ArticleFeed(source.id, "https://releases.example/new-feed.xml")
+    entry = {"source_id": source.id, "source_name": source.name, "website": source.website}
+    baseline = storage.Article("Already published", "https://publisher.example/baseline")
+    new_article = storage.Article("New release", "https://publisher.example/release")
+    next_baseline = storage.Article("Already in the new feed", "https://publisher.example/previous")
+    stale = storage.Article("From the previous feed", "https://publisher.example/stale")
 
-        hacker_news.sync_feed()
-        monkeypatch.setattr(storage, "time", lambda: 20)
-        hacker_news.sync_feed()
-        assert storage.list_unqueued_articles(limit=1) == [article_url]
-        assert storage.list_unqueued_articles() == [article_url, failed_url]
-        assert storage.get_hacker_news_article(article_url) == storage.HackerNewsArticle("New & useful", article_url)
-        article = {
-            "kind": "article",
-            "source_name": "Hacker News",
-            "title": "New & useful",
-            "article_url": article_url,
-            "version": "10",
-            "status": "pending",
-            "summary": None,
-            "relevant_teams": [],
-            "team_reasons": {},
-        }
-        failed = {**article, "article_url": failed_url, "title": "Publisher unavailable", "status": "failed"}
-        storage.save_article_analysis(failed_url, None)
-        assert client.get("/api/digest", params={"view": "held"}).json() == [article, failed, *edits]
-        assert client.get("/api/digest").json() == []
-        storage.mark_article_analysis_queued(article_url)
-        assert storage.list_unqueued_articles() == []
-        assert client.get("/api/digest", params={"view": "held"}).json() == [
-            {**article, "status": "queued"},
-            failed,
-            *edits,
-        ]
-        held = TeamDecision(relevant=False, reason="No match", quote=None)
-        relevant = TeamDecision(relevant=True, reason="Matches Product's interests", quote="Publisher evidence")
-        storage.save_article_analysis(
-            article_url,
-            ChangeAnalysisResult(
-                summary="A new release.", marketing=held, product=relevant, research_and_development=held
-            ),
-        )
-        storage.save_article_analysis(article_url, None)
+    with TestClient(app) as client:
+        disabled = {**entry, "url": None, "discovery_only": False}
+        assert client.get(_ARTICLE_FEEDS).json() == [disabled]
+        response = client.put(settings_url, json={"url": "http://127.0.0.1/rss", "discovery_only": False})
+        assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+        response = client.put(f"{_ARTICLE_FEEDS}/{source.id + 1}", json={"url": None, "discovery_only": False})
+        assert response.status_code == HTTPStatus.NOT_FOUND
+        enabled = {"url": first_feed.url, "discovery_only": True}
+        response = client.put(settings_url, json=enabled)
+        assert response.status_code == HTTPStatus.OK
+        assert response.json() == entry | enabled
+        assert client.get(_ARTICLE_FEEDS).json() == [entry | enabled]
+        assert storage.list_article_feeds() == [first_feed]
+
+        storage.save_discovered_articles(first_feed, [])
+        storage.save_discovered_articles(first_feed, [baseline])
+        assert client.get("/api/digest", params={"view": "held"}).json() == []
+        storage.save_discovered_articles(first_feed, [baseline, new_article])
+
+        assert client.put(settings_url, json={**enabled, "url": next_feed.url}).status_code == HTTPStatus.OK
+        storage.save_discovered_articles(next_feed, [next_baseline])
+        storage.save_discovered_articles(first_feed, [stale])
+        assert client.put(settings_url, json={"url": None, "discovery_only": True}).json() == disabled
+        storage.save_discovered_articles(next_feed, [stale])
+        assert storage.list_article_feeds() == []
+        assert storage.list_unqueued_articles() == [(source.id, new_article.article_url)]
+        held = client.get("/api/digest", params={"view": "held"}).json()
+        assert [(item["article_url"], item["status"]) for item in held] == [(new_article.article_url, "pending")]
+
+
+def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setattr(storage, "time", lambda: 10)
+    first = storage.save_competitor("First feed", "https://first.example/")
+    second = storage.save_competitor("Second feed", "https://second.example/")
+    baseline = storage.Article("Baseline", "https://publisher.example/first")
+    article = storage.Article("A new release", "https://publisher.example/release?ref=feed")
+    for source in (first, second):
+        feed = storage.ArticleFeed(source.id, f"{source.website}feed.xml")
+        storage.set_article_feed(source_id=feed.source_id, url=feed.url, discovery_only=False)
+        storage.save_discovered_articles(feed, [baseline])
+        storage.save_discovered_articles(feed, [baseline, article, article])
+    assert storage.list_unqueued_articles() == [(first.id, article.article_url), (second.id, article.article_url)]
+
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+    product = TeamDecision(relevant=True, reason="Review the rollout options", quote="Publisher evidence")
+    result = ChangeAnalysisResult(summary=article.title, marketing=held, product=product, research_and_development=held)
+    storage.save_article_analysis(first.id, article.article_url, result)
+    storage.save_article_analysis(second.id, article.article_url, result.model_copy(update={"product": held}))
+    expected = {
+        "kind": "article",
+        "title": article.title,
+        "article_url": article.article_url,
+        "version": "10",
+        "status": "completed",
+        "summary": article.title,
+    }
+    held_article = {
+        **expected,
+        "source_id": second.id,
+        "source_name": second.name,
+        "relevant_teams": [],
+        "team_reasons": {"marketing": held.reason, "product": held.reason, "research_and_development": held.reason},
+    }
+
+    with TestClient(app) as client:
         assert client.get("/api/digest").json() == [
             {
-                **article,
-                "status": "completed",
-                "summary": "A new release.",
+                **expected,
+                "source_id": first.id,
+                "source_name": first.name,
                 "relevant_teams": ["product"],
-                "team_reasons": {"product": relevant.reason},
-            },
+                "team_reasons": {"product": product.reason},
+            }
         ]
-        assert client.get("/api/digest", params={"view": "held"}).json() == [failed, *edits]
-        storage.save_article_analysis(
-            failed_url,
-            ChangeAnalysisResult(
-                summary="No relevant changes.", marketing=held, product=held, research_and_development=held
-            ),
-        )
-        assert [entry["article_url"] for entry in client.get("/api/digest").json()] == [article_url]
-        assert client.get("/api/digest", params={"view": "held"}).json() == [
-            {**failed, "status": "completed", "summary": "No relevant changes."},
-            *edits,
-        ]
-
-        assert client.delete(f"/api/competitors/{source.id}").status_code == HTTPStatus.NO_CONTENT
-        hacker_news.sync_feed()
+        assert client.get("/api/digest", params={"view": "held"}).json() == [held_article]
+        assert client.delete(f"/api/competitors/{first.id}").status_code == HTTPStatus.NO_CONTENT
         assert client.get("/api/digest").json() == []
-        assert client.get("/api/digest", params={"view": "held"}).json() == edits
-
-    assert handler.call_count == 5
-    for call in handler.call_args_list:
-        request = call.args[0]
-        assert request.method == HTTPMethod.GET
-        assert str(request.url) == "https://news.ycombinator.com/rss"
-        assert "authorization" not in request.headers and "x-api-key" not in request.headers
+        assert client.get("/api/digest", params={"view": "held"}).json() == [held_article]
+    assert storage.get_discovered_article(first.id, article.article_url) is None
+    assert storage.list_article_feeds() == [storage.ArticleFeed(second.id, f"{second.website}feed.xml")]
 
 
 def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,8 +1,10 @@
-"""Read bounded evidence from public publisher URLs."""
+"""Fetch bounded public content and extract publisher evidence."""
 
 import socket
+from dataclasses import dataclass
 from html.parser import HTMLParser
-from ipaddress import IPv6Address, ip_address
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from ssl import SSLCertVerificationError
 from time import monotonic
 
 import httpx2
@@ -13,77 +15,133 @@ _TIMEOUT_SECONDS = 5.0
 _MAX_BYTES = 512 * 1024
 _MAX_EVIDENCE_CHARS = 12_000
 _SKIP_TAGS = {"head", "header", "nav", "aside", "footer", "script", "style", "template", "noscript"}
+_PUBLISHER_TYPES = frozenset({"text/html", "application/xhtml+xml", "text/plain"})
 article_logger = structlog.get_logger()
 
 
-def read_publisher_text(article_url: str) -> str | None:
-    try:
-        url = httpx2.URL(article_url)
-        port = _DEFAULT_PORT.get(url.scheme)
-        if port is None or url.port not in (None, port) or not url.raw_host or url.userinfo:
-            return None
-        hostname = url.raw_host.decode("ascii")
-        address = _public_address(hostname, port)
-        if address is None:
-            return None
+class TransientFetchError(Exception):
+    """A temporary fetch failure with a message safe for workflow logs."""
 
-        evidence = _read_text(url, address, hostname)
-        return evidence or None
-    except (httpx2.HTTPError, httpx2.InvalidURL, OSError, ValueError, LookupError) as error:
-        article_logger.warning("Could not read publisher text", error_type=type(error).__name__)
+
+@dataclass(frozen=True)
+class PublicContent:
+    body: bytes
+    content_type: str
+    encoding: str
+
+
+def read_publisher_text(article_url: str) -> str | None:
+    content = read_public_content(article_url, _PUBLISHER_TYPES)
+    if content is None:
         return None
+    try:
+        text = content.body.decode(content.encoding, errors="replace")
+        if content.content_type == "text/plain":
+            return text.strip()[:_MAX_EVIDENCE_CHARS] or None
+        parser = _PublisherParagraphs()
+        parser.feed(text)
+    except (LookupError, ValueError) as error:
+        article_logger.warning("Could not extract publisher text", error_type=type(error).__name__)
+        return None
+    paragraphs = (" ".join("".join(parts).split()) for parts in parser.paragraphs)
+    return "\n\n".join(filter(None, paragraphs))[:_MAX_EVIDENCE_CHARS] or None
+
+
+def public_http_url(value: str) -> httpx2.URL | None:
+    if not value.lower().startswith(("https://", "http://")) or "\\" in value:
+        return None
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    try:
+        url = httpx2.URL(value)
+    except (httpx2.InvalidURL, ValueError):
+        return None
+    if url.port not in (None, _DEFAULT_PORT[url.scheme]) or not url.raw_host or url.userinfo:
+        return None
+    host = url.raw_host.decode("ascii").rstrip(".")
+    try:
+        address = ip_address(host)
+    except ValueError:
+        if "." not in host or "" in host.split(".") or host.endswith((".localhost", ".local")):
+            return None
+        try:
+            socket.inet_aton(host)
+        except OSError:
+            return url
+        return None
+    return url if _is_public_address(address) else None
+
+
+def read_public_content(url: str, content_types: frozenset[str] | None = None) -> PublicContent | None:
+    parsed = public_http_url(url)
+    if parsed is None:
+        return None
+    try:
+        address = _public_address(parsed.raw_host.decode("ascii"), _DEFAULT_PORT[parsed.scheme])
+        if address is not None:
+            return _read_content(url=parsed, address=address, content_types=content_types)
+    except (httpx2.TimeoutException, httpx2.NetworkError, httpx2.RemoteProtocolError, TimeoutError) as error:
+        # The sync HTTP transport wraps the SSL error twice.
+        cause = error.__cause__
+        if cause is None or not isinstance(cause.__cause__, SSLCertVerificationError):
+            raise TransientFetchError(type(error).__name__) from None
+        article_logger.warning("Public content TLS certificate rejected")
+    except httpx2.HTTPStatusError as error:
+        status = error.response.status_code
+        if status in {408, 429} or 500 <= status < 600:
+            raise TransientFetchError(f"HTTP {status}") from None
+        article_logger.warning("Public content request failed", status=status)
+    except socket.gaierror as error:
+        if error.errno == socket.EAI_AGAIN:
+            raise TransientFetchError("Temporary DNS failure") from None
+        article_logger.warning("Public content DNS lookup failed", error_type=type(error).__name__)
+    except (httpx2.HTTPError, httpx2.InvalidURL, OSError, ValueError) as error:
+        article_logger.warning("Could not read public content", error_type=type(error).__name__)
+    return None
+
+
+def _is_public_address(address: IPv4Address | IPv6Address) -> bool:
+    if not address.is_global or address.is_multicast or address.is_reserved:
+        return False
+    return not isinstance(address, IPv6Address) or (not address.is_site_local and address.scope_id is None)
 
 
 def _public_address(hostname: str, port: int) -> str | None:
     try:
-        addresses = [ip_address(hostname)]
+        return str(ip_address(hostname))
     except ValueError:
-        dns_name = hostname.rstrip(".")
-        if "." not in dns_name or dns_name.endswith((".localhost", ".local")):
-            return None
-        addresses = [
-            ip_address(endpoint[0])
-            for *_, endpoint in socket.getaddrinfo(
-                f"{dns_name}.", port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
-            )
-        ]
-    for address in addresses:
-        if not address.is_global or address.is_multicast or address.is_reserved:
-            continue
-        if isinstance(address, IPv6Address) and (address.is_site_local or address.scope_id is not None):
-            continue
-        return str(address)
-    return None
+        endpoints = socket.getaddrinfo(
+            f"{hostname.rstrip('.')}.", port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
+        )
+    addresses = (ip_address(endpoint[0]) for *_, endpoint in endpoints)
+    return next((str(address) for address in addresses if _is_public_address(address)), None)
 
 
-def _read_text(url: httpx2.URL, address: str, hostname: str) -> str:
+def _read_content(*, url: httpx2.URL, address: str, content_types: frozenset[str] | None) -> PublicContent | None:
     headers = {"Host": url.netloc.decode("ascii"), "Accept-Encoding": "identity"}
     deadline = monotonic() + _TIMEOUT_SECONDS
     with httpx2.Client(timeout=_TIMEOUT_SECONDS, follow_redirects=False, trust_env=False) as client:
-        # Use the validated numeric destination while keeping the publisher's Host and TLS identity.
+        # Connect to the validated address while keeping the original Host and TLS identity.
         with client.stream(
-            "GET", url.copy_with(host=address, fragment=None), headers=headers, extensions={"sni_hostname": hostname}
+            "GET",
+            url.copy_with(host=address, fragment=None),
+            headers=headers,
+            extensions={"sni_hostname": url.raw_host.decode("ascii")},
         ) as response:
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
-            if content_type not in {"text/html", "application/xhtml+xml", "text/plain"}:
-                return ""
+            if content_types is not None and content_type not in content_types:
+                return None
             if response.headers.get("content-encoding", "identity").lower() != "identity":
-                return ""
+                return None
             content = bytearray()
             for chunk in response.iter_raw():
                 if monotonic() >= deadline:
-                    raise TimeoutError("Publisher body read timed out")
+                    raise TimeoutError("Public content body read timed out")
                 content.extend(chunk[: _MAX_BYTES - len(content)])
                 if len(content) == _MAX_BYTES:
                     break
-            text = content.decode(response.encoding or "utf-8", errors="replace")
-    if content_type == "text/plain":
-        return text.strip()[:_MAX_EVIDENCE_CHARS]
-    parser = _PublisherParagraphs()
-    parser.feed(text)
-    paragraphs = (" ".join("".join(parts).split()) for parts in parser.paragraphs)
-    return "\n\n".join(filter(None, paragraphs))[:_MAX_EVIDENCE_CHARS]
+            return PublicContent(bytes(content), content_type, response.encoding or "utf-8")
 
 
 class _PublisherParagraphs(HTMLParser):

@@ -104,6 +104,24 @@ body {
 .configuration .team-interests-fields { display: grid; align-items: start; max-width: 34rem; }
 .team-interests-fields textarea { resize: vertical; }
 .team-interests-fields button { justify-self: start; }
+.article-feed-form {
+  max-width: 34rem;
+  padding-block: 0.75rem;
+  border-top: 1px solid var(--rule);
+  overflow-wrap: anywhere;
+}
+.article-feed-form fieldset { display: grid; }
+.article-feed-form legend { padding: 0 0 0.5rem; font-weight: 650; }
+.configuration .article-feed-discovery { display: flex; align-items: start; }
+.article-feed-discovery input[type="checkbox"] {
+  flex: none;
+  width: 1rem;
+  min-height: 1rem;
+  margin: 0.125rem 0 0;
+  padding: 0;
+}
+.article-feed-discovery small { display: block; }
+.article-feed-form button { justify-self: start; }
 .configuration .competitor { padding-top: 1rem; border-top: 1px solid var(--rule); }
 .page-list { margin: 0.75rem 0 1rem; padding: 0; list-style: none; }
 .page-item { padding-block: 0.75rem; border-bottom: 1px solid var(--rule); }

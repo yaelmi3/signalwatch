@@ -25,6 +25,13 @@ type PageChangeAnalysis = {
 };
 type WebhookStatus = { configured: boolean };
 type AnalysisSettings = { quality: "economy" | "higher_quality" };
+type ArticleFeedSettings = {
+  source_id: number;
+  source_name: string;
+  website: string;
+  url: string | null;
+  discovery_only: boolean;
+};
 type WatchStatus = {
   available: boolean;
   paused: boolean | null;
@@ -52,7 +59,7 @@ type DigestEntry = {
   team_reasons: Partial<Record<TeamKey, string>>;
 } & (
   | { kind?: never; page_id: number; page_url: string; hold_reason?: "discovery_only" }
-  | { kind: "article"; title: string; article_url: string }
+  | { kind: "article"; title: string; article_url: string; source_id: number }
 );
 const digestAnalysisStatus = {
   pending: "Analysis pending.",
@@ -60,8 +67,9 @@ const digestAnalysisStatus = {
   completed: "Analysis summary unavailable.",
   failed: "Analysis failed.",
 } satisfies Record<DigestEntry["status"], string>;
-const discoveryOnlyReason = "Held because Hacker News is used to discover articles.";
+const discoveryOnlyReason = "Held because this page is set to discovery only.";
 const configurationPath = "/?view=configuration";
+const articleFeedsPath = "/api/maintainer/article-feeds";
 const summarySentences = new Intl.Segmenter(undefined, { granularity: "sentence" });
 
 function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
@@ -237,13 +245,15 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
             <ChangeTime version={selected.version} />
             <a href={pageUrl}>Open source page</a>
           </div>
-          {analysisError && <p role="alert">Could not load change analysis. Use Refresh changes to try again.</p>}
+          {analysisError && !discoveryOnly && (
+            <p role="alert">Could not load change analysis. Use Refresh changes to try again.</p>
+          )}
           {result ? (
             <>
               <h2 className="change-summary-title">Summary</h2>
               <p className="change-summary">{result.summary}</p>
             </>
-          ) : !analysisError && (
+          ) : !analysisError && !discoveryOnly && (
             <p role="status">
               {analyses === null ? "Loading analysis…" : analysis?.status === "failed"
                 ? "Analysis failed for this edit." : "Analysis pending."}
@@ -280,10 +290,10 @@ function DeleteConfirmation({ kind, target, disabled, deleting, onConfirm }: {
         <div id={detailsId}>
           <p><strong>{target}</strong></p>
           <p>{kind === "page"
-            ? "This removes the page, its linked changedetection watch, and its saved history."
-            : "This removes the source, all its pages, their linked changedetection watches, and saved history."}
+            ? "This permanently removes the page, its linked changedetection watch, and its history in SignalWatch."
+            : "This permanently removes the source, its pages and linked changedetection watches, and its history in SignalWatch."}
           </p>
-          <p>This cannot be undone.</p>
+          <p>Analysis excerpts can remain in the worker database to recover unfinished jobs.</p>
         </div>
         <div className="delete-dialog-actions">
           <button type="button" ref={cancel} onClick={() => dialog.current?.close()}>Cancel</button>
@@ -472,11 +482,13 @@ function Digest({ held }: { held: boolean }) {
             const completed = entry.status === "completed";
             const summary = completed ? entry.summary?.trim() : null;
             const takeaway = summary ? changeHeadline(summary) : null;
-            const teams = completed ? analysisTeams.filter(([key]) => entry.relevant_teams.includes(key)) : [];
+            const showAllReasons = held && isArticle;
+            const teams = completed ? analysisTeams.filter(([key]) => showAllReasons
+              ? entry.team_reasons[key] !== undefined : entry.relevant_teams.includes(key)) : [];
             const historyPath = isArticle ? null :
               `/?view=history&page=${entry.page_id}&version=${encodeURIComponent(entry.version)}${held ? "&from=held" : ""}`;
             return (
-              <li key={isArticle ? `article:${sourceUrl}` : `edit:${entry.page_id}/${entry.version}`}>
+              <li key={isArticle ? `article:${entry.source_id}:${sourceUrl}` : `edit:${entry.page_id}/${entry.version}`}>
                 <article className="digest-entry">
                   <header>
                     <div className="digest-entry-meta">
@@ -485,7 +497,7 @@ function Digest({ held }: { held: boolean }) {
                     </div>
                     <h2>{isArticle ? entry.title : takeaway ?? "Page changed"}</h2>
                     {isArticle && takeaway && <p>{takeaway}</p>}
-                    {!takeaway && (
+                    {!takeaway && !discoveryOnly && (
                       <p className={entry.status === "failed" ? "digest-failed" : "muted"}>
                         {digestAnalysisStatus[entry.status]}
                       </p>
@@ -495,7 +507,7 @@ function Digest({ held }: { held: boolean }) {
                     <p className="muted">{discoveryOnlyReason}</p>
                   ) : completed && (teams.length === 0 ? <p className="muted">Skipped. No team matched.</p> : (
                     <div className="digest-relevance">
-                      <h3>Why it matters</h3>
+                      <h3>{showAllReasons ? "Team reasons" : "Why it matters"}</h3>
                       <ul className="digest-team-reasons">
                         {teams.map(([key, name]) => (
                           <li key={key}>
@@ -598,6 +610,7 @@ function MaintainerSettings() {
         {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
       </section>
       <AnalysisQualitySettings />
+      <ArticleDiscoverySettings />
     </main>
   );
 }
@@ -652,6 +665,92 @@ function AnalysisQualitySettings() {
       {error && <p role="alert">{error}</p>}
       {!settings && error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
     </section>
+  );
+}
+
+function ArticleDiscoverySettings() {
+  const [feeds, setFeeds] = useState<ArticleFeedSettings[] | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    setError(false);
+    request<ArticleFeedSettings[]>(articleFeedsPath, { signal })
+      .then((feeds) => { if (!controller.signal.aborted) setFeeds(feeds); })
+      .catch(() => { if (!controller.signal.aborted) setError(true); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  return (
+    <section aria-labelledby="article-discovery-title">
+      <h2 id="article-discovery-title">Article discovery</h2>
+      {error ? (
+        <>
+          <p role="alert">Could not load article feeds.</p>
+          <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading feeds</button>
+        </>
+      ) : feeds === null ? <p role="status">Loading article feeds…</p> : feeds.length === 0 ? (
+        <p>No sources saved.</p>
+      ) : (
+        <>
+          <p className="muted" id="article-feed-help">Leave the RSS URL blank to turn off discovery.</p>
+          {feeds.map((feed) => <ArticleFeedForm key={feed.source_id} feed={feed} />)}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
+  const [settings, setSettings] = useState(feed);
+  const [saveState, setSaveState] = useState<"saving" | "saved" | null>(null);
+  const [error, setError] = useState("");
+  const url = settings.url?.trim() || null;
+
+  async function saveFeed(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (saveState === "saving") return;
+    setSaveState("saving");
+    setError("");
+    try {
+      setSettings(await request<ArticleFeedSettings>(`${articleFeedsPath}/${feed.source_id}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, discovery_only: url !== null && settings.discovery_only }),
+        signal: AbortSignal.timeout(8000),
+      }));
+      setSaveState("saved");
+    } catch (cause) {
+      setError(`Could not save feed settings. ${message(cause)}`);
+      setSaveState(null);
+    }
+  }
+
+  return (
+    <form className="article-feed-form" onSubmit={saveFeed} onChange={() => {
+      setSaveState(null);
+      setError("");
+    }}>
+      <fieldset disabled={saveState === "saving"}>
+        <legend>{feed.source_name}</legend>
+        <label>RSS 2.0 URL
+          <input type="url" name="url" value={settings.url ?? ""} aria-describedby="article-feed-help"
+            onChange={(event) => {
+              const value = event.target.value;
+              setSettings({ ...settings, url: value, discovery_only: value.trim() !== "" && settings.discovery_only });
+            }} />
+        </label>
+        <label className="article-feed-discovery">
+          <input type="checkbox" name="discovery_only" checked={settings.discovery_only} disabled={url === null}
+            onChange={(event) => setSettings({ ...settings, discovery_only: event.target.checked })} />
+          <span>Use the first page for discovery only<small className="muted">{feed.website}</small></span>
+        </label>
+        <button type="submit">{saveState === "saving" ? "Saving…" : "Save feed"}</button>
+      </fieldset>
+      {saveState === "saved" && <p role="status">Feed settings saved.</p>}
+      {error && <p role="alert">{error}</p>}
+    </form>
   );
 }
 
