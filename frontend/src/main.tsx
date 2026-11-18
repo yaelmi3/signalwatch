@@ -11,6 +11,8 @@ type Page = {
   error: string | null;
 };
 type Competitor = { id: number; name: string; website: string; pages: Page[] };
+type PageChange = { version: string; before: string; after: string };
+type WebhookStatus = { configured: boolean };
 type WatchStatus = {
   available: boolean;
   paused: boolean | null;
@@ -23,8 +25,8 @@ const pageStates = {
   linked: "Watch connected", attention: "Needs attention",
 };
 
-function request<T>(path: string, options?: RequestInit): Promise<T>;
-async function request(path: string, options?: RequestInit): Promise<unknown> {
+function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
+async function request(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<unknown> {
   const response = await fetch(path, options);
   if (!response.ok) {
     const body: unknown = await response.json().catch(() => null);
@@ -33,7 +35,9 @@ async function request(path: string, options?: RequestInit): Promise<unknown> {
   }
   if (response.status === 204) return;
   if (options?.method === "DELETE") throw new Error(`Unexpected deletion response (${response.status}).`);
-  return response.json();
+  const body: unknown = await response.json();
+  readHeaders?.(response.headers);
+  return body;
 }
 
 function post<T>(path: string, body?: object) {
@@ -46,12 +50,68 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : "The request could not be completed. Please try again.";
 }
 
+function ChangeHistory({ pageId }: { pageId: number }) {
+  const [changes, setChanges] = useState<PageChange[] | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [historyGap, setHistoryGap] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setError("");
+
+    async function refresh() {
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+      try {
+        const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal }, (headers) => {
+          if (!controller.signal.aborted) setHistoryGap(headers.get("X-SignalWatch-History-Gap") === "true");
+        });
+        if (!controller.signal.aborted) setChanges(changes);
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(message(cause));
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }
+
+    void refresh();
+    return () => controller.abort();
+  }, [pageId, loadAttempt]);
+
+  return (
+    <>
+      <div className="page-actions">
+        <button type="button" disabled={loading} onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
+          Refresh changes
+        </button>
+      </div>
+      {error && <p role="alert">{error}</p>}
+      {historyGap && <p role="status">Possible history gap</p>}
+      {loading && <p role="status">{changes === null ? "Loading changes…" : "Refreshing changes…"}</p>}
+      {!loading && !error && changes?.length === 0 && <p role="status">No changes recorded yet.</p>}
+      {changes && changes.length > 0 && (
+        <ul className="change-entries">{changes.map((change) => (
+          <li key={change.version}>
+            <dl>
+              <dt>Before</dt><dd><pre>{change.before}</pre></dd>
+              <dt>After</dt><dd><pre>{change.after}</pre></dd>
+            </dl>
+          </li>
+        ))}</ul>
+      )}
+    </>
+  );
+}
+
 function PageItem({ page, onChange, onDelete, disabled }: {
   page: Page; onChange: (page: Page) => void; onDelete: (page: Page) => void; disabled: boolean;
 }) {
   const [busy, setBusy] = useState<"connect" | "status" | "delete" | null>(null);
   const [error, setError] = useState("");
   const [status, setStatus] = useState<WatchStatus | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   async function run(action: "connect" | "status" | "delete") {
     if (action === "delete" && !window.confirm(
@@ -104,6 +164,12 @@ function PageItem({ page, onChange, onDelete, disabled }: {
         <p>Check count: {status.check_count ?? "Unknown"}</p>
         {status.error && <p>{status.error}</p>}
       </div>}
+      {page.state === "linked" && (
+        <details className="change-history" onToggle={(event) => setHistoryOpen(event.currentTarget.open)}>
+          <summary>Change history</summary>
+          {historyOpen && <ChangeHistory pageId={page.id} />}
+        </details>
+      )}
     </li>
   );
 }
@@ -179,6 +245,55 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
   );
 }
 
+function SiteHeader({ maintainer }: { maintainer: boolean }) {
+  return (
+    <header className="site-header">
+      <div className="brand">SignalWatch</div>
+      <nav aria-label="Resources">
+        <a href={maintainer ? "/" : "/?view=maintainer"}>{maintainer ? "Configuration" : "Maintainer settings"}</a>
+        <a href="/docs">API docs</a>
+      </nav>
+    </header>
+  );
+}
+
+function MaintainerSettings() {
+  const [status, setStatus] = useState<WebhookStatus | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setError("");
+    request<WebhookStatus>("/api/maintainer/webhooks", { signal: controller.signal })
+      .then((status) => { if (!controller.signal.aborted) setStatus(status); })
+      .catch(() => { if (!controller.signal.aborted) setError("Could not load webhook status."); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  return (
+    <>
+      <SiteHeader maintainer />
+      <main className="configuration">
+        <h1>Maintainer settings</h1>
+        <section aria-labelledby="webhooks-title">
+          <h2 id="webhooks-title">changedetection webhooks</h2>
+          {status ? (
+            <>
+              <p role="status"><strong>{status.configured ? "Webhook settings configured" : "Setup required"}</strong></p>
+              <p className="muted">{status.configured
+                ? "SignalWatch checked the format of the webhook URL and shared secret set on the server."
+                : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
+            </>
+          ) : !error && <p role="status">Loading webhook status…</p>}
+          {error && <p role="alert">{error}</p>}
+          {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
+        </section>
+      </main>
+    </>
+  );
+}
+
 function App() {
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -240,12 +355,7 @@ function App() {
 
   return (
     <>
-      <header className="site-header">
-        <div className="brand">SignalWatch</div>
-        <nav aria-label="Resources">
-          <a href="/docs">API docs</a>
-        </nav>
-      </header>
+      <SiteHeader maintainer={false} />
       <main className="configuration">
         <h1>Configuration</h1>
         <p className="muted">Add sources and choose which pages to monitor.</p>
@@ -289,6 +399,6 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    {new URLSearchParams(window.location.search).get("view") === "maintainer" ? <MaintainerSettings /> : <App />}
   </StrictMode>,
 );

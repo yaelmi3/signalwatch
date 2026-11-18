@@ -15,6 +15,16 @@ _PAGES_SCHEMA = """(
     watch_id TEXT, state TEXT NOT NULL DEFAULT 'pending', error TEXT, attempted_at TEXT,
     UNIQUE (competitor_id, url)
 )"""
+_PAGE_CHANGES_SCHEMA = """(
+    page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL CHECK (typeof(version) = 'integer'), before TEXT, after TEXT NOT NULL,
+    PRIMARY KEY (page_id, version)
+)"""
+_HISTORY_GAPS_SCHEMA = """(
+    page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+    watch_id TEXT NOT NULL,
+    PRIMARY KEY (page_id, watch_id)
+)"""
 
 
 class PageState(StrEnum):
@@ -31,6 +41,24 @@ class Page(BaseModel):
     watch_id: str | None
     state: PageState
     error: str | None
+
+
+class PageChange(BaseModel):
+    version: str
+    before: str
+    after: str
+
+
+@dataclass(frozen=True)
+class PageSnapshot:
+    version: int
+    after: str
+
+
+@dataclass(frozen=True)
+class LinkedWatch:
+    page_id: int
+    watch_id: str
 
 
 class Competitor(BaseModel):
@@ -78,6 +106,69 @@ def get_page(page_id: int) -> Page | None:
     with _database() as database:
         row = database.execute("SELECT * FROM pages WHERE id = ?", (page_id,)).fetchone()
     return Page.model_validate(dict(row)) if row is not None else None
+
+
+def get_linked_page_id(watch_id: str) -> int | None:
+    with _database() as database:
+        row = database.execute(
+            "SELECT id FROM pages WHERE watch_id = ? AND state = ?", (watch_id, PageState.LINKED)
+        ).fetchone()
+    return row["id"] if row is not None else None
+
+
+def list_linked_watches() -> list[LinkedWatch]:
+    with _database() as database:
+        rows = database.execute(
+            "SELECT id, watch_id FROM pages WHERE state = ? AND watch_id IS NOT NULL ORDER BY id", (PageState.LINKED,)
+        ).fetchall()
+    return [LinkedWatch(page_id=row["id"], watch_id=row["watch_id"]) for row in rows]
+
+
+def list_page_changes(page_id: int) -> list[PageChange]:
+    with _database() as database:
+        rows = database.execute(
+            """SELECT CAST(version AS TEXT) AS version, before, after FROM page_changes
+            WHERE page_id = ? AND before IS NOT NULL ORDER BY page_changes.version DESC""",
+            (page_id,),
+        ).fetchall()
+    return [PageChange.model_validate(dict(row)) for row in rows]
+
+
+def latest_page_snapshot(page_id: int) -> PageSnapshot | None:
+    with _database() as database:
+        row = database.execute(
+            "SELECT version, after FROM page_changes WHERE page_id = ? ORDER BY version DESC LIMIT 1", (page_id,)
+        ).fetchone()
+    return PageSnapshot(version=row["version"], after=row["after"]) if row is not None else None
+
+
+def has_history_gap(page_id: int, watch_id: str) -> bool:
+    with _database() as database:
+        gap = database.execute(
+            "SELECT 1 FROM history_gaps WHERE page_id = ? AND watch_id = ?", (page_id, watch_id)
+        ).fetchone()
+    return gap is not None
+
+
+def record_history_gap(page_id: int, watch_id: str) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO history_gaps (page_id, watch_id)
+            SELECT id, watch_id FROM pages WHERE id = ? AND watch_id = ? AND state = ?
+            ON CONFLICT (page_id, watch_id) DO NOTHING""",
+            (page_id, watch_id, PageState.LINKED),
+        )
+
+
+def save_page_version(*, page_id: int, watch_id: str, version: int, before: str | None, after: str) -> bool:
+    with _database() as database:
+        inserted = database.execute(
+            """INSERT INTO page_changes (page_id, version, before, after)
+            SELECT id, ?, ?, ? FROM pages WHERE id = ? AND watch_id = ? AND state = ?
+            ON CONFLICT (page_id, version) DO NOTHING""",
+            (version, before, after, page_id, watch_id, PageState.LINKED),
+        ).rowcount
+    return bool(inserted)
 
 
 def list_competitors() -> list[Competitor]:
@@ -190,4 +281,15 @@ def _database() -> Iterator[sqlite3.Connection]:
                     raise sqlite3.IntegrityError("Competitor upgrade failed its foreign-key check.")
             database.commit()
             database.execute("PRAGMA foreign_keys = ON")
+        database.execute(f"CREATE TABLE IF NOT EXISTS page_changes {_PAGE_CHANGES_SCHEMA}")
+        schema_query = "SELECT type FROM pragma_table_info('page_changes') WHERE name = 'version'"
+        if database.execute(schema_query).fetchone()["type"].upper() == "TEXT":
+            database.execute("BEGIN IMMEDIATE")
+            if database.execute(schema_query).fetchone()["type"].upper() == "TEXT":
+                database.execute(f"CREATE TABLE page_changes_upgraded {_PAGE_CHANGES_SCHEMA}")
+                database.execute("INSERT INTO page_changes_upgraded SELECT * FROM page_changes")
+                database.execute("DROP TABLE page_changes")
+                database.execute("ALTER TABLE page_changes_upgraded RENAME TO page_changes")
+            database.commit()
+        database.execute(f"CREATE TABLE IF NOT EXISTS history_gaps {_HISTORY_GAPS_SCHEMA}")
         yield database

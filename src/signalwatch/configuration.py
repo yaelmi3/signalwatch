@@ -131,3 +131,12 @@ def page_status(page_id: int) -> changedetection.WatchStatus:
         return changedetection.read_watch(page.watch_id)
     except changedetection.EngineError as error:
         return changedetection.WatchStatus(error=str(error))
+
+
+@router.get("/pages/{page_id}/changes")
+def page_changes(page_id: int, response: Response) -> list[storage.PageChange]:
+    page = _page(page_id)
+    changes = storage.list_page_changes(page_id)
+    if page.watch_id is not None and storage.has_history_gap(page_id, page.watch_id):
+        response.headers["X-SignalWatch-History-Gap"] = "true"
+    return changes

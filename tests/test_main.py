@@ -1,8 +1,13 @@
+import asyncio
 import json
 import sqlite3
+from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from http import HTTPMethod, HTTPStatus
 from pathlib import Path
+from threading import Barrier, Event
+from time import monotonic, sleep
 from unittest.mock import Mock
 
 import httpx2
@@ -10,7 +15,26 @@ import pytest
 from fastapi.testclient import TestClient
 
 from signalwatch import storage
+from signalwatch.catchup import catchup_lifespan
 from signalwatch.main import app
+
+_WEBHOOK = "/api/webhooks/changedetection"
+_WEBHOOK_HEADERS = {"Authorization": "Basic " + b64encode(b"signalwatch:test-webhook-secret").decode("ascii")}
+_HISTORY_GAP_HEADER = "X-SignalWatch-History-Gap"
+_WEBHOOK_SETUP_URL = "https://hooks.example.com/api/webhooks/changedetection"
+_WEBHOOK_SETUP_SECRET = "test-webhook-secret"
+_WATCH_NOTIFICATIONS = {
+    "notification_muted": False,
+    "notification_urls": ["jsons://hooks.example.com/api/webhooks/changedetection"],
+    "notification_format": "text",
+    "notification_body": "{{watch_uuid}}",
+}
+_WATCH_ID = "520e831c-6d74-4c6d-96c6-c782061b0249"
+
+
+@pytest.fixture(autouse=True)
+def disable_scheduled_catchup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "0")
 
 
 def test_serves_frontend_and_api_docs() -> None:
@@ -25,16 +49,299 @@ def test_serves_frontend_and_api_docs() -> None:
         assert "Swagger UI" in docs.text
 
 
+def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "60")
+    source = storage.save_competitor("Example", "https://example.com/")
+    failed_page = source.pages[0]
+    page = storage.save_page(source.id, "https://example.com/watched")
+    storage.link_watch(failed_page.id, "a655d37b-0928-4a73-aa9f-031411c407bc")
+    storage.link_watch(page.id, _WATCH_ID)
+    history_path = f"/api/v1/watch/{_WATCH_ID}/history"
+    first_change_read = Event()
+    complete_first_change = Event()
+    new_version = Event()
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        path = request.url.path
+        if path == history_path:
+            versions = {"1": "a.txt", "2": "b.txt", "3": "c.txt"}
+            if new_version.is_set():
+                versions["4"] = "d.txt"
+            return httpx2.Response(HTTPStatus.OK, json=versions)
+        if path.startswith(f"{history_path}/"):
+            version = path.rsplit("/", 1)[1]
+            if version == "2":
+                first_change_read.set()
+                assert complete_first_change.wait(5)
+            return httpx2.Response(HTTPStatus.OK, text={"1": "A", "2": "B", "3": "C", "4": "D"}[version])
+        assert path == "/api/v1/watch/a655d37b-0928-4a73-aa9f-031411c407bc/history"
+        return httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE)
+
+    async def interrupt_startup() -> None:
+        async with catchup_lifespan(app):
+            try:
+                assert await asyncio.to_thread(first_change_read.wait, 5)
+            finally:
+                asyncio.get_running_loop().call_soon(complete_first_change.set)
+
+    def wait_for_changes(client: TestClient, expected: list[dict[str, str]]) -> None:
+        deadline = monotonic() + 5
+        while (actual := client.get(f"/api/pages/{page.id}/changes").json()) != expected and monotonic() < deadline:
+            sleep(0.02)
+        assert actual == expected
+
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handle)))
+    baseline = {"version": "2", "before": "A", "after": "B"}
+    asyncio.run(interrupt_startup())
+    assert [change.model_dump() for change in storage.list_page_changes(page.id)] == [baseline]
+
+    monkeypatch.setenv("SIGNALWATCH_CATCHUP_INTERVAL_SECONDS", "1")
+    with TestClient(app) as client:
+        recovered = {"version": "3", "before": "B", "after": "C"}
+        wait_for_changes(client, [recovered, baseline])
+        new_version.set()
+        wait_for_changes(client, [{"version": "4", "before": "C", "after": "D"}, recovered, baseline])
+
+
+def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    engine_path = f"/api/v1/watch/{_WATCH_ID}"
+    history = {"10": "previous.txt"}
+    deliver_together = Barrier(2, timeout=5)
+    reading_snapshot = Event()
+    overlapping_history = Event()
+    snapshot_reads: list[str] = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        assert request.headers["x-api-key"] == "test-api-key"
+        if request.method == HTTPMethod.DELETE and request.url.path == engine_path:
+            return httpx2.Response(HTTPStatus.NO_CONTENT)
+        assert request.method == HTTPMethod.GET
+        match request.url.path:
+            case path if path == f"{engine_path}/history":
+                if reading_snapshot.is_set():
+                    overlapping_history.set()
+                return httpx2.Response(HTTPStatus.OK, json=history)
+            case path if path == f"{engine_path}/history/10":
+                snapshot_reads.append("10")
+                return httpx2.Response(HTTPStatus.OK, text="Price: $10")
+            case path if path == f"{engine_path}/history/11":
+                snapshot_reads.append("11")
+                reading_snapshot.set()
+                assert not overlapping_history.wait(0.25)
+                reading_snapshot.clear()
+                return httpx2.Response(HTTPStatus.OK, text="Price: $15")
+        raise AssertionError(f"Unexpected snapshot request: {request.url.path}")
+
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handle)))
+    payload = {"title": "Watch changed", "message": _WATCH_ID, "version": "1.1"}
+    changes_url = f"/api/pages/{page.id}/changes"
+
+    def deliver(client: TestClient) -> int:
+        deliver_together.wait()
+        return client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code
+
+    with TestClient(app) as client:
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        first_import = client.get(changes_url)
+        assert first_import.json() == []
+        assert _HISTORY_GAP_HEADER not in first_import.headers
+
+    history = {"11": "latest.txt"}
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            calls = [executor.submit(deliver, client) for _ in range(2)]
+            assert [call.result() for call in calls] == [HTTPStatus.NO_CONTENT, HTTPStatus.NO_CONTENT]
+        assert snapshot_reads == ["10", "11"]
+        recovered = client.get(changes_url)
+        assert recovered.json() == [{"version": "11", "before": "Price: $10", "after": "Price: $15"}]
+        assert recovered.headers[_HISTORY_GAP_HEADER] == "true"
+
+        assert client.delete(f"/api/pages/{page.id}").status_code == HTTPStatus.NO_CONTENT
+        assert client.get(changes_url).status_code == HTTPStatus.NOT_FOUND
+    with sqlite3.connect(db_path) as database:
+        assert database.execute("SELECT COUNT(*) FROM page_changes").fetchone() == (0,)
+        assert database.execute("SELECT COUNT(*) FROM history_gaps").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("empty_history", [False, True])
+def test_changedetection_webhook_catches_up_in_order_and_resumes_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_history: bool
+) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    with sqlite3.connect(db_path) as database:
+        database.execute("DROP TABLE page_changes")
+        database.execute("""CREATE TABLE page_changes (
+            page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+            version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, PRIMARY KEY (page_id, version))""")
+        database.execute("INSERT INTO page_changes VALUES (?, '2', 'A', 'B')", (page.id,))
+    retained_history = {"11": "e.txt", "10": "d.txt"}
+    empty_listing = [httpx2.Response(HTTPStatus.OK, json={})] if empty_history else []
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
+            httpx2.Response(HTTPStatus.OK, json=[]),
+            httpx2.Response(HTTPStatus.OK, json={"10": "d.txt", "3": "c.txt", "2": "b.txt"}),
+            httpx2.Response(HTTPStatus.OK, text="C"),
+            httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE),
+            *empty_listing,
+            httpx2.Response(HTTPStatus.OK, json=retained_history),
+            httpx2.Response(HTTPStatus.OK, text="D"),
+            httpx2.Response(HTTPStatus.OK, text="E"),
+            httpx2.Response(HTTPStatus.OK, json=retained_history),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    payload = {"message": _WATCH_ID}
+    changes_url = f"/api/pages/{page.id}/changes"
+    with TestClient(app) as client:
+        first_import = client.get(changes_url)
+        assert first_import.json() == [{"version": "2", "before": "A", "after": "B"}]
+        assert _HISTORY_GAP_HEADER not in first_import.headers
+        for _ in range(2):
+            assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.BAD_GATEWAY
+            unchanged = client.get(changes_url)
+            assert unchanged.json() == first_import.json()
+            assert _HISTORY_GAP_HEADER not in unchanged.headers
+
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.BAD_GATEWAY
+        completed = [{"version": "3", "before": "B", "after": "C"}, {"version": "2", "before": "A", "after": "B"}]
+        partial_import = client.get(changes_url)
+        assert partial_import.json() == completed
+        assert _HISTORY_GAP_HEADER not in partial_import.headers
+
+        if empty_history:
+            assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+            no_new_changes = client.get(changes_url)
+            assert no_new_changes.json() == completed
+            assert no_new_changes.headers[_HISTORY_GAP_HEADER] == "true"
+
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        expected = [{"version": "11", "before": "D", "after": "E"}, {"version": "10", "before": "C", "after": "D"}]
+        recovered = client.get(changes_url)
+        assert recovered.json() == expected + completed
+        assert recovered.headers[_HISTORY_GAP_HEADER] == "true"
+
+    with TestClient(app) as client:
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NO_CONTENT
+        repeated = client.get(changes_url)
+        assert repeated.json() == expected + completed
+        assert repeated.headers[_HISTORY_GAP_HEADER] == "true"
+
+    history_path = f"/api/v1/watch/{_WATCH_ID}/history"
+    assert [call.args[0].url.path.removeprefix(history_path) for call in handler.call_args_list] == [
+        "",
+        "",
+        "",
+        "/3",
+        "/10",
+        *([""] if empty_history else []),
+        "",
+        "/10",
+        "/11",
+        "",
+    ]
+    with sqlite3.connect(db_path) as database:
+        rows = database.execute("SELECT version FROM page_changes WHERE page_id = ? ORDER BY version", (page.id,))
+        assert rows.fetchall() == [(2,), (3,), (10,), (11,)]
+
+
+def test_changedetection_webhook_rejects_invalid_access_before_engine_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.delenv("CHANGEDETECTION_WEBHOOK_SECRET", raising=False)
+    handler = Mock()
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    payload = {"message": _WATCH_ID}
+    with TestClient(app) as client:
+        assert client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS).status_code == HTTPStatus.NOT_FOUND
+        monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "test-webhook-secret")
+        assert client.post(_WEBHOOK, json=payload).status_code == HTTPStatus.UNAUTHORIZED
+        assert client.post(_WEBHOOK, json=payload, auth=("signalwatch", "wrong-secret")).status_code == (
+            HTTPStatus.UNAUTHORIZED
+        )
+        unknown_watch = client.post(_WEBHOOK, json=payload, headers=_WEBHOOK_HEADERS)
+        assert unknown_watch.status_code == HTTPStatus.NOT_FOUND
+    handler.assert_not_called()
+
+
+def test_watch_creation_requires_webhook_setup_and_can_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
+    monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.delenv("SIGNALWATCH_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
+    source = storage.save_competitor("Example", "https://example.com/")
+    handler = Mock(
+        side_effect=[
+            httpx2.Response(HTTPStatus.CREATED, json={"uuid": _WATCH_ID}),
+            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/news", **_WATCH_NOTIFICATIONS}),
+        ]
+    )
+    monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
+    settings_url = "/api/maintainer/webhooks"
+    pages_url = f"/api/competitors/{source.id}/pages"
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == {"configured": False}
+        assert client.put(settings_url, json={"enabled": True}).status_code == HTTPStatus.METHOD_NOT_ALLOWED
+        added = client.post(pages_url, json={"url": "https://example.com/news"})
+        assert added.status_code == HTTPStatus.CREATED
+        pending = added.json()
+        assert pending["state"] == "pending" and pending["watch_id"] is None
+        assert "webhook URL and secret" in pending["error"]
+        handler.assert_not_called()
+
+        monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+        monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", "bad secret%20")
+        assert client.get(settings_url).json() == {"configured": False}
+        monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
+        assert client.get(settings_url).json() == {"configured": True}
+        retried = client.post(f"/api/pages/{pending['id']}/connect")
+        assert retried.status_code == HTTPStatus.OK and retried.json()["watch_id"] == _WATCH_ID
+        assert _WEBHOOK_SETUP_SECRET not in retried.text and _WEBHOOK_SETUP_URL not in retried.text
+
+    calls = [call.args[0] for call in handler.call_args_list]
+    assert [request.method for request in calls] == [HTTPMethod.POST, HTTPMethod.GET]
+    assert json.loads(calls[0].content) == {
+        "url": "https://example.com/news",
+        "title": "Example",
+        "fetch_backend": "html_requests",
+        **_WATCH_NOTIFICATIONS,
+    }
+
+
 def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
     monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
     monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
     watch_id = "520e831c-6d74-4c6d-96c6-c782061b0249"
     extra_watch_id = "a655d37b-0928-4a73-aa9f-031411c407bc"
     handler = Mock(
         side_effect=[
             httpx2.Response(HTTPStatus.CREATED, json={"uuid": watch_id}),
-            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/"}),
+            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/", **_WATCH_NOTIFICATIONS}),
             httpx2.Response(
                 HTTPStatus.OK, json={"paused": False, "last_checked": 0, "check_count": 0, "last_error": False}
             ),
@@ -49,7 +356,7 @@ def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pyt
                 },
             ),
             httpx2.Response(HTTPStatus.CREATED, json={"uuid": extra_watch_id}),
-            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/pricing"}),
+            httpx2.Response(HTTPStatus.OK, json={"url": "https://example.com/pricing", **_WATCH_NOTIFICATIONS}),
         ]
     )
     monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
@@ -93,13 +400,13 @@ def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pyt
         "url": "https://example.com/",
         "title": "Example",
         "fetch_backend": "html_requests",
-        "notification_muted": True,
+        **_WATCH_NOTIFICATIONS,
     }
     assert json.loads(handler.call_args_list[4].args[0].content) == {
         "url": "https://example.com/pricing",
         "title": "Example",
         "fetch_backend": "html_requests",
-        "notification_muted": True,
+        **_WATCH_NOTIFICATIONS,
     }
 
 
@@ -122,6 +429,8 @@ def test_creation_retry_stops_after_uncertain_outcome(tmp_path: Path, monkeypatc
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
     monkeypatch.setenv("CHANGEDETECTION_URL", "http://engine.test")
     monkeypatch.setenv("CHANGEDETECTION_API_KEY", "test-api-key")
+    monkeypatch.setenv("SIGNALWATCH_WEBHOOK_URL", _WEBHOOK_SETUP_URL)
+    monkeypatch.setenv("CHANGEDETECTION_WEBHOOK_SECRET", _WEBHOOK_SETUP_SECRET)
     handler = Mock(
         side_effect=[
             httpx2.ConnectError("The engine connection failed."),
