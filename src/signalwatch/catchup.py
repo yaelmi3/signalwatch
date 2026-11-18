@@ -1,11 +1,11 @@
 import asyncio
-import logging
 import os
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from threading import Event
 
+import structlog
 from fastapi import FastAPI
 
 from signalwatch import changedetection, storage
@@ -13,7 +13,7 @@ from signalwatch.changes import save_new_changes
 
 _INTERVAL_ENV = "SIGNALWATCH_CATCHUP_INTERVAL_SECONDS"
 _DEFAULT_INTERVAL_SECONDS = 60
-_LOGGER = logging.getLogger(__name__)
+catchup_logger = structlog.get_logger()
 
 
 @asynccontextmanager
@@ -56,7 +56,7 @@ async def _catch_up_once(stop: Event) -> None:
     try:
         watches = await asyncio.to_thread(storage.list_linked_watches)
     except (sqlite3.OperationalError, OSError) as error:
-        _LOGGER.warning("Could not list watches for page change catch-up.", extra={"error_type": type(error).__name__})
+        catchup_logger.warning("Could not list watches for page change catch-up.", error_type=type(error).__name__)
         return
 
     for watch in watches:
@@ -65,6 +65,6 @@ async def _catch_up_once(stop: Event) -> None:
         try:
             await asyncio.to_thread(save_new_changes, watch.page_id, watch.watch_id, stop=stop)
         except (changedetection.EngineError, sqlite3.OperationalError, OSError) as error:
-            _LOGGER.warning(
-                "Could not catch up page changes.", extra={"page_id": watch.page_id, "error_type": type(error).__name__}
+            catchup_logger.warning(
+                "Could not catch up page changes.", page_id=watch.page_id, error_type=type(error).__name__
             )
