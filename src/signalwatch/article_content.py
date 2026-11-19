@@ -2,19 +2,18 @@
 
 import socket
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from ssl import SSLCertVerificationError
 from time import monotonic
 
 import httpx2
 import structlog
+from trafilatura import extract
 
 _DEFAULT_PORT = {"http": 80, "https": 443}
 _TIMEOUT_SECONDS = 5.0
 _MAX_BYTES = 512 * 1024
 _MAX_EVIDENCE_CHARS = 12_000
-_SKIP_TAGS = {"head", "header", "nav", "aside", "footer", "script", "style", "template", "noscript"}
 _PUBLISHER_TYPES = frozenset({"text/html", "application/xhtml+xml", "text/plain"})
 article_logger = structlog.get_logger()
 
@@ -36,15 +35,12 @@ def read_publisher_text(article_url: str) -> str | None:
         return None
     try:
         text = content.body.decode(content.encoding, errors="replace")
-        if content.content_type == "text/plain":
-            return text.strip()[:_MAX_EVIDENCE_CHARS] or None
-        parser = _PublisherParagraphs()
-        parser.feed(text)
+        if content.content_type != "text/plain":
+            text = extract(text, url=article_url, include_comments=False) or ""
     except (LookupError, ValueError) as error:
         article_logger.warning("Could not extract publisher text", error_type=type(error).__name__)
         return None
-    paragraphs = (" ".join("".join(parts).split()) for parts in parser.paragraphs)
-    return "\n\n".join(filter(None, paragraphs))[:_MAX_EVIDENCE_CHARS] or None
+    return text.strip()[:_MAX_EVIDENCE_CHARS] or None
 
 
 def public_http_url(value: str) -> httpx2.URL | None:
@@ -142,31 +138,3 @@ def _read_content(*, url: httpx2.URL, address: str, content_types: frozenset[str
                 if len(content) == _MAX_BYTES:
                     break
             return PublicContent(bytes(content), content_type, response.encoding or "utf-8")
-
-
-class _PublisherParagraphs(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.paragraphs: list[list[str]] = []
-        self._skipping: list[str] = []
-        self._in_paragraph = False
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in _SKIP_TAGS:
-            self._skipping.append(tag)
-        elif not self._skipping and tag == "p":
-            self._in_paragraph = True
-            self.paragraphs.append([])
-        elif self._in_paragraph and not self._skipping and tag == "br":
-            self.paragraphs[-1].append(" ")
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._skipping:
-            if tag == self._skipping[-1]:
-                self._skipping.pop()
-        elif tag == "p":
-            self._in_paragraph = False
-
-    def handle_data(self, data: str) -> None:
-        if self._in_paragraph and not self._skipping:
-            self.paragraphs[-1].append(data)

@@ -122,6 +122,9 @@ class DigestArticle(_DigestAnalysis):
     source_name: str
     title: str
     article_url: str
+    hold_reason: Literal["business_fit_unverified"] | None = Field(
+        default=None, exclude_if=lambda reason: reason is None
+    )
 
 
 @dataclass(frozen=True)
@@ -250,7 +253,8 @@ def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | Di
                 SELECT changes.page_id, changes.version, competitors.id AS source_id, competitors.name AS source_name,
                        pages.url AS page_url,
                        NULL AS title, NULL AS article_url, analyses.status, analyses.result,
-                       CASE WHEN {_DISCOVERY_ONLY_PAGE_SQL} THEN 'discovery_only' END AS hold_reason
+                       CASE WHEN {_DISCOVERY_ONLY_PAGE_SQL} THEN 'discovery_only' END AS hold_reason,
+                       1 AS business_fit
                 FROM page_changes AS changes
                 JOIN pages ON pages.id = changes.page_id
                 JOIN competitors ON competitors.id = pages.competitor_id
@@ -259,14 +263,17 @@ def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | Di
                 WHERE changes.before IS NOT NULL AND pages.state = ? AND pages.watch_id IS NOT NULL
                 UNION ALL
                 SELECT NULL, articles.discovered_at, articles.source_id, competitors.name, NULL, articles.title,
-                       articles.article_url, analyses.status, analyses.result, NULL
+                       articles.article_url, analyses.status, analyses.result, NULL,
+                       COALESCE(json_type(analyses.result, '$.change_quote') = 'text'
+                           AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
+                           AND EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> ''), 0)
                 FROM discovered_articles AS articles
                 JOIN competitors ON competitors.id = articles.source_id
                 LEFT JOIN discovered_article_analyses AS analyses USING (source_id, article_url)
                 WHERE articles.discovered_at IS NOT NULL
             )
             SELECT * FROM items
-            WHERE COALESCE(hold_reason IS NULL AND status = 'completed' AND (
+            WHERE COALESCE(hold_reason IS NULL AND business_fit AND status = 'completed' AND (
                 json_extract(result, '$.marketing.relevant') OR json_extract(result, '$.product.relevant')
                 OR json_extract(result, '$.research_and_development.relevant')
             ), 0) = ?
@@ -281,7 +288,10 @@ def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | Di
             if row["status"] == "completed" and row["result"] is not None
             else None
         )
-        decisions = analysis.model_dump(exclude={"summary"}) if analysis and row["hold_reason"] is None else {}
+        hold_reason = row["hold_reason"]
+        if is_article and analysis is not None and not row["business_fit"]:
+            hold_reason = "business_fit_unverified"
+        decisions = analysis.model_dump(exclude={"summary"}) if analysis and hold_reason is None else {}
         relevant_teams = [team for team in DigestTeam if team in decisions and decisions[team]["relevant"]]
         reason_teams = list(decisions) if is_article and view == DigestView.HELD else relevant_teams
         item = dict(
@@ -289,6 +299,7 @@ def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | Di
             version=str(row["version"]),
             status=row["status"] or "pending",
             summary=analysis.summary if analysis else None,
+            hold_reason=hold_reason,
             relevant_teams=relevant_teams,
             team_reasons={team: decisions[team]["reason"] for team in reason_teams},
         )
