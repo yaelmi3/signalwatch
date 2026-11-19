@@ -60,6 +60,18 @@ _DISCOVERED_ARTICLE_ANALYSES_SCHEMA = """(
     PRIMARY KEY (source_id, article_url),
     FOREIGN KEY (source_id, article_url) REFERENCES discovered_articles(source_id, article_url) ON DELETE CASCADE
 )"""
+_SLACK_DELIVERIES_SCHEMA = """(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL,
+    page_id INTEGER, version INTEGER, source_id INTEGER, article_url TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'uncertain', 'skipped')),
+    error TEXT,
+    CHECK ((page_id IS NOT NULL AND version IS NOT NULL AND source_id IS NULL AND article_url IS NULL)
+        OR (source_id IS NOT NULL AND article_url IS NOT NULL AND page_id IS NULL AND version IS NULL)),
+    UNIQUE (page_id, version), UNIQUE (source_id, article_url),
+    FOREIGN KEY (page_id, version) REFERENCES change_analyses(page_id, version) ON DELETE CASCADE,
+    FOREIGN KEY (source_id, article_url)
+        REFERENCES discovered_article_analyses(source_id, article_url) ON DELETE CASCADE
+)"""
 _DISCOVERY_ONLY_PAGE_SQL = """EXISTS (
     SELECT 1 FROM article_feeds JOIN competitors ON competitors.id = article_feeds.source_id
     WHERE article_feeds.source_id = pages.competitor_id AND article_feeds.discovery_only
@@ -137,6 +149,12 @@ class Article:
 class ArticleFeed:
     source_id: int
     url: str
+
+
+@dataclass(frozen=True)
+class SlackDelivery:
+    id: int
+    item: DigestEntry | DigestArticle
 
 
 class ArticleFeedSettings(BaseModel):
@@ -246,66 +264,146 @@ def is_discovery_only_page(page_id: int) -> bool:
     return row is not None
 
 
+_DIGEST_ITEMS_SQL = f"""WITH items AS (
+    SELECT changes.page_id, changes.version, competitors.id AS source_id, competitors.name AS source_name,
+           pages.url AS page_url,
+           NULL AS title, NULL AS article_url, analyses.status, analyses.result,
+           CASE WHEN {_DISCOVERY_ONLY_PAGE_SQL} THEN 'discovery_only' END AS hold_reason,
+           1 AS business_fit
+    FROM page_changes AS changes
+    JOIN pages ON pages.id = changes.page_id
+    JOIN competitors ON competitors.id = pages.competitor_id
+    LEFT JOIN change_analyses AS analyses
+        ON analyses.page_id = changes.page_id AND analyses.version = changes.version
+    WHERE changes.before IS NOT NULL AND pages.state = :linked AND pages.watch_id IS NOT NULL
+    UNION ALL
+    SELECT NULL, articles.discovered_at, articles.source_id, competitors.name, NULL, articles.title,
+           articles.article_url, analyses.status, analyses.result, NULL,
+           COALESCE(json_type(analyses.result, '$.change_quote') = 'text'
+               AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
+               AND EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> ''), 0)
+    FROM discovered_articles AS articles
+    JOIN competitors ON competitors.id = articles.source_id
+    LEFT JOIN discovered_article_analyses AS analyses USING (source_id, article_url)
+    WHERE articles.discovered_at IS NOT NULL
+)"""
+
+_DIGEST_RELEVANCE_SQL = """COALESCE(hold_reason IS NULL AND business_fit AND status = 'completed' AND (
+    json_extract(result, '$.marketing.relevant') OR json_extract(result, '$.product.relevant')
+    OR json_extract(result, '$.research_and_development.relevant')
+), 0)"""
+
+
 def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | DigestArticle]:
     with _database() as database:
         rows = database.execute(
-            f"""WITH items AS (
-                SELECT changes.page_id, changes.version, competitors.id AS source_id, competitors.name AS source_name,
-                       pages.url AS page_url,
-                       NULL AS title, NULL AS article_url, analyses.status, analyses.result,
-                       CASE WHEN {_DISCOVERY_ONLY_PAGE_SQL} THEN 'discovery_only' END AS hold_reason,
-                       1 AS business_fit
-                FROM page_changes AS changes
-                JOIN pages ON pages.id = changes.page_id
-                JOIN competitors ON competitors.id = pages.competitor_id
-                LEFT JOIN change_analyses AS analyses
-                    ON analyses.page_id = changes.page_id AND analyses.version = changes.version
-                WHERE changes.before IS NOT NULL AND pages.state = ? AND pages.watch_id IS NOT NULL
-                UNION ALL
-                SELECT NULL, articles.discovered_at, articles.source_id, competitors.name, NULL, articles.title,
-                       articles.article_url, analyses.status, analyses.result, NULL,
-                       COALESCE(json_type(analyses.result, '$.change_quote') = 'text'
-                           AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
-                           AND EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> ''), 0)
-                FROM discovered_articles AS articles
-                JOIN competitors ON competitors.id = articles.source_id
-                LEFT JOIN discovered_article_analyses AS analyses USING (source_id, article_url)
-                WHERE articles.discovered_at IS NOT NULL
-            )
-            SELECT * FROM items
-            WHERE COALESCE(hold_reason IS NULL AND business_fit AND status = 'completed' AND (
-                json_extract(result, '$.marketing.relevant') OR json_extract(result, '$.product.relevant')
-                OR json_extract(result, '$.research_and_development.relevant')
-            ), 0) = ?
-            ORDER BY version DESC, article_url IS NOT NULL, page_id, source_id, article_url LIMIT ?""",
-            (PageState.LINKED, view == DigestView.RELEVANT, _DIGEST_LIMIT),
+            f"""{_DIGEST_ITEMS_SQL} SELECT * FROM items
+            WHERE {_DIGEST_RELEVANCE_SQL} = :relevant
+            ORDER BY version DESC, article_url IS NOT NULL, page_id, source_id, article_url LIMIT :limit""",
+            {"linked": PageState.LINKED, "relevant": view == DigestView.RELEVANT, "limit": _DIGEST_LIMIT},
         ).fetchall()
-    entries: list[DigestEntry | DigestArticle] = []
-    for row in rows:
-        is_article = row["article_url"] is not None
-        analysis = (
-            ChangeAnalysisResult.model_validate_json(row["result"])
-            if row["status"] == "completed" and row["result"] is not None
-            else None
+    return [_digest_entry(row, view) for row in rows]
+
+
+def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArticle:
+    is_article = row["article_url"] is not None
+    analysis = (
+        ChangeAnalysisResult.model_validate_json(row["result"])
+        if row["status"] == "completed" and row["result"] is not None
+        else None
+    )
+    hold_reason = row["hold_reason"]
+    if is_article and analysis is not None and not row["business_fit"]:
+        hold_reason = "business_fit_unverified"
+    decisions = analysis.model_dump(exclude={"summary"}) if analysis and hold_reason is None else {}
+    relevant_teams = [team for team in DigestTeam if team in decisions and decisions[team]["relevant"]]
+    reason_teams = list(decisions) if is_article and view == DigestView.HELD else relevant_teams
+    item = dict(
+        row,
+        version=str(row["version"]),
+        status=row["status"] or "pending",
+        summary=analysis.summary if analysis else None,
+        hold_reason=hold_reason,
+        relevant_teams=relevant_teams,
+        team_reasons={team: decisions[team]["reason"] for team in reason_teams},
+    )
+    model = DigestArticle if is_article else DigestEntry
+    return model.model_validate(item)
+
+
+def claim_slack_delivery(channel_id: str) -> SlackDelivery | None:
+    with _database() as database:
+        # Persist an uncertain outcome before the request so a restart cannot repeat a possibly accepted post.
+        claim = database.execute(
+            """UPDATE slack_deliveries SET status = 'uncertain', error = 'result_not_recorded'
+            WHERE id = (SELECT id FROM slack_deliveries WHERE channel_id = ? AND status = 'pending' ORDER BY id LIMIT 1)
+            RETURNING id, page_id, version, source_id, article_url""",
+            (channel_id,),
+        ).fetchone()
+        if claim is None:
+            return None
+        target = _relevant_digest_item(
+            database,
+            page_id=claim["page_id"],
+            version=claim["version"],
+            source_id=claim["source_id"],
+            article_url=claim["article_url"],
         )
-        hold_reason = row["hold_reason"]
-        if is_article and analysis is not None and not row["business_fit"]:
-            hold_reason = "business_fit_unverified"
-        decisions = analysis.model_dump(exclude={"summary"}) if analysis and hold_reason is None else {}
-        relevant_teams = [team for team in DigestTeam if team in decisions and decisions[team]["relevant"]]
-        reason_teams = list(decisions) if is_article and view == DigestView.HELD else relevant_teams
-        item = dict(
-            row,
-            version=str(row["version"]),
-            status=row["status"] or "pending",
-            summary=analysis.summary if analysis else None,
-            hold_reason=hold_reason,
-            relevant_teams=relevant_teams,
-            team_reasons={team: decisions[team]["reason"] for team in reason_teams},
+        if target is None:
+            database.execute(
+                "UPDATE slack_deliveries SET status = 'skipped', error = 'no_longer_eligible' WHERE id = ?",
+                (claim["id"],),
+            )
+            return None
+        return SlackDelivery(claim["id"], _digest_entry(target, DigestView.RELEVANT))
+
+
+def finish_slack_delivery(
+    delivery_id: int, status: Literal["sent", "failed", "uncertain"], error: str | None = None
+) -> None:
+    with _database() as database:
+        database.execute("UPDATE slack_deliveries SET status = ?, error = ? WHERE id = ?", (status, error, delivery_id))
+
+
+def _relevant_digest_item(
+    database: sqlite3.Connection,
+    *,
+    page_id: int | None = None,
+    version: int | None = None,
+    source_id: int | None = None,
+    article_url: str | None = None,
+) -> sqlite3.Row | None:
+    return database.execute(
+        f"""{_DIGEST_ITEMS_SQL} SELECT * FROM items WHERE {_DIGEST_RELEVANCE_SQL}
+        AND ((page_id = :page_id AND version = :version) OR (source_id = :source_id AND article_url = :article_url))""",
+        {
+            "linked": PageState.LINKED,
+            "page_id": page_id,
+            "version": version,
+            "source_id": source_id,
+            "article_url": article_url,
+        },
+    ).fetchone()
+
+
+def _enqueue_slack_delivery(
+    database: sqlite3.Connection,
+    channel_id: str,
+    *,
+    page_id: int | None = None,
+    version: int | None = None,
+    source_id: int | None = None,
+    article_url: str | None = None,
+) -> None:
+    if (
+        _relevant_digest_item(database, page_id=page_id, version=version, source_id=source_id, article_url=article_url)
+        is not None
+    ):
+        database.execute(
+            """INSERT INTO slack_deliveries (channel_id, page_id, version, source_id, article_url)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+            (channel_id, page_id, version, source_id, article_url),
         )
-        model = DigestArticle if is_article else DigestEntry
-        entries.append(model.model_validate(item))
-    return entries
 
 
 def list_article_feed_settings() -> list[ArticleFeedSettings]:
@@ -403,11 +501,13 @@ def mark_article_analysis_queued(source_id: int, article_url: str) -> None:
         )
 
 
-def save_article_analysis(source_id: int, article_url: str, result: ChangeAnalysisResult | None) -> None:
+def save_article_analysis(
+    source_id: int, article_url: str, result: ChangeAnalysisResult | None, *, slack_channel: str | None = None
+) -> None:
     status = "completed" if result is not None else "failed"
     result_json = result.model_dump_json() if result is not None else None
     with _database() as database:
-        database.execute(
+        saved = database.execute(
             """INSERT INTO discovered_article_analyses (source_id, article_url, status, result)
             SELECT source_id, article_url, ?, ? FROM discovered_articles
             WHERE source_id = ? AND article_url = ? AND discovered_at IS NOT NULL
@@ -415,6 +515,8 @@ def save_article_analysis(source_id: int, article_url: str, result: ChangeAnalys
             WHERE discovered_article_analyses.status != 'completed'""",
             (status, result_json, source_id, article_url),
         )
+        if saved.rowcount and result is not None and slack_channel is not None:
+            _enqueue_slack_delivery(database, slack_channel, source_id=source_id, article_url=article_url)
 
 
 def list_unqueued_changes(limit: int = 100) -> list[tuple[int, int]]:
@@ -455,11 +557,13 @@ def mark_analysis_queued(page_id: int, version: int) -> None:
         )
 
 
-def save_change_analysis(page_id: int, version: int, result: ChangeAnalysisResult | None) -> None:
+def save_change_analysis(
+    page_id: int, version: int, result: ChangeAnalysisResult | None, *, slack_channel: str | None = None
+) -> None:
     status = "completed" if result is not None else "failed"
     result_json = result.model_dump_json() if result is not None else None
     with _database() as database:
-        database.execute(
+        saved = database.execute(
             """INSERT INTO change_analyses (page_id, version, status, result)
             SELECT page_id, version, ?, ? FROM page_changes
             WHERE page_id = ? AND version = ? AND before IS NOT NULL
@@ -467,6 +571,8 @@ def save_change_analysis(page_id: int, version: int, result: ChangeAnalysisResul
             WHERE change_analyses.status != 'completed'""",
             (status, result_json, page_id, version),
         )
+        if saved.rowcount and result is not None and slack_channel is not None:
+            _enqueue_slack_delivery(database, slack_channel, page_id=page_id, version=version)
 
 
 def list_page_analyses(page_id: int) -> dict[str, PageChangeAnalysis]:
@@ -698,4 +804,5 @@ def _database() -> Iterator[sqlite3.Connection]:
         database.execute(
             f"CREATE TABLE IF NOT EXISTS discovered_article_analyses {_DISCOVERED_ARTICLE_ANALYSES_SCHEMA}"
         )
+        database.execute(f"CREATE TABLE IF NOT EXISTS slack_deliveries {_SLACK_DELIVERIES_SCHEMA}")
         yield database

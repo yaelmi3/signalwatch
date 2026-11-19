@@ -5,7 +5,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from http import HTTPStatus
+from http import HTTPMethod, HTTPStatus
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
@@ -16,8 +16,8 @@ import pytest
 from dbos import DBOS
 from openai import OpenAI
 
-from signalwatch import analysis_worker, article_content, article_feeds, storage
-from signalwatch.analysis_models import TeamInterests
+from signalwatch import analysis_worker, article_content, article_feeds, slack_delivery, storage
+from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
 
 
 def test_worker_retries_handoff_and_limits_model_calls(
@@ -27,6 +27,8 @@ def test_worker_retries_handoff_and_limits_model_calls(
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(app_db))
     monkeypatch.setenv("SIGNALWATCH_ANALYSIS_MODEL", "test-model")
     monkeypatch.setenv("SIGNALWATCH_ANALYSIS_HIGHER_QUALITY_MODEL", "test-alternate-model")
+    monkeypatch.setenv("SIGNALWATCH_SLACK_BOT_TOKEN", "fake-slack-token")
+    monkeypatch.setenv("SIGNALWATCH_SLACK_CHANNEL_ID", "C_TEST")
     storage.save_team_interests(
         TeamInterests(
             marketing="Customer stories", product="Product releases", business_context="We build marine instruments."
@@ -41,12 +43,22 @@ def test_worker_retries_handoff_and_limits_model_calls(
     feeds = storage.list_article_feeds()
     for feed in feeds:
         storage.save_discovered_articles(feed, [baseline])
-    page = storage.save_competitor("Example", "https://example.test/").pages[0]
+    page = storage.save_competitor("Example <!here>", "https://example.test/").pages[0]
     storage.link_watch(page.id, "test-watch")
     for version, before in enumerate((None, "Release 1", "Release 2", "Release 3"), start=1):
         assert storage.save_page_version(
             page_id=page.id, watch_id="test-watch", version=version, before=before, after=f"Release {version}"
         )
+    assert storage.save_page_version(page_id=page.id, watch_id="test-watch", version=0, before="Old", after="Archived")
+    held = TeamDecision(relevant=False, reason="No match.", quote=None)
+    old_result = ChangeAnalysisResult(
+        summary="Archived",
+        marketing=held,
+        product=TeamDecision(relevant=True, reason="An old release.", quote="Archived"),
+        research_and_development=held,
+    )
+    storage.save_change_analysis(page.id, 0, old_result)
+    storage.save_change_analysis(page.id, 0, old_result, slack_channel="C_TEST")
 
     original_mark = storage.mark_analysis_queued
     handoffs: Counter[int] = Counter()
@@ -69,9 +81,23 @@ def test_worker_retries_handoff_and_limits_model_calls(
     other_change = "A customer described a previous sensor prototype."
     publisher_text = f"{change.removesuffix('.')}\n{change}\n{other_change}\nThe vendor redesigned the help page."
     active = peak = 0
+    slack_posts: list[str] = []
 
     def publisher_respond(request: httpx2.Request) -> httpx2.Response:
         url = str(request.url)
+        if url == "https://slack.com/api/chat.postMessage":
+            assert request.method == HTTPMethod.POST and request.headers["authorization"] == "Bearer fake-slack-token"
+            payload = json.loads(request.content)
+            assert payload == {
+                "channel": "C_TEST",
+                "text": payload["text"],
+                "mrkdwn": False,
+                "link_names": False,
+                "unfurl_links": False,
+                "unfurl_media": False,
+            }
+            slack_posts.append(payload["text"])
+            return httpx2.Response(HTTPStatus.OK, json={"ok": True})
         with lock:
             publisher_reads[url] += 1
             attempt = publisher_reads[url]
@@ -176,6 +202,7 @@ def test_worker_retries_handoff_and_limits_model_calls(
             storage.save_analysis_quality(analysis_worker.AnalysisQuality.HIGHER_QUALITY)
             release.set()
             _wait_until(lambda: [workflow.status for workflow in DBOS.list_workflows()] == ["SUCCESS"] * 6)
+            _wait_until(lambda: len(slack_posts) == 3)
         finally:
             release.set()
             stop.set()
@@ -205,9 +232,65 @@ def test_worker_retries_handoff_and_limits_model_calls(
     assert analyses["3"].result is not None
     assert analyses["3"].result.product.quote is None
     assert analyses["4"].model_dump() == {"status": "failed", "result": None}
+    assert Counter(post.splitlines()[0] for post in slack_posts) == Counter(
+        [
+            "Example &lt;!here&gt;",
+            "Example &lt;!here&gt;",
+            f"{relevant_articles[0].source_name} · New sensor",
+        ]
+    )
+    assert {post.splitlines()[-1] for post in slack_posts} == {page.url, article.article_url}
+    assert all("Product: An updated release is described." in post and "Archived" not in post for post in slack_posts)
     captured = capfd.readouterr()
     assert "private provider error text" not in captured.out + captured.err
     assert "private publisher error text" not in captured.out + captured.err
+
+
+def test_slack_rejections_and_ambiguous_outcomes_are_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    app_db = tmp_path / "app.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(app_db))
+    page = storage.save_competitor("Example", "https://example.test/").pages[0]
+    storage.link_watch(page.id, "test-watch")
+    held = TeamDecision(relevant=False, reason="No match.", quote=None)
+    result = ChangeAnalysisResult(
+        summary="New release",
+        marketing=held,
+        product=TeamDecision(relevant=True, reason="New release.", quote="New"),
+        research_and_development=held,
+    )
+    for version in (1, 2):
+        assert storage.save_page_version(
+            page_id=page.id, watch_id="test-watch", version=version, before="Old", after="New"
+        )
+        storage.save_change_analysis(page.id, version, result, slack_channel="C_TEST")
+
+    attempts = []
+
+    def respond(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(request)
+        if len(attempts) == 1:
+            body = {"ok": False, "error": "not_in_channel", "detail": "private-text"}
+            return httpx2.Response(HTTPStatus.OK, json=body)
+        raise httpx2.ReadTimeout("private-text", request=request)
+
+    class TestClient(httpx2.Client):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(transport=httpx2.MockTransport(respond), **kwargs)
+
+    monkeypatch.setattr(httpx2, "Client", TestClient)
+    settings = slack_delivery.SlackSettings("C_TEST", "fake-slack-token")
+    for _ in range(3):
+        slack_delivery.send_next(settings)
+    assert len(attempts) == 2
+    with sqlite3.connect(app_db) as db:
+        assert db.execute("SELECT status, error FROM slack_deliveries ORDER BY id").fetchall() == [
+            ("failed", "not_in_channel"),
+            ("uncertain", "transport_error"),
+        ]
+    logs = capfd.readouterr()
+    assert "private-text" not in logs.out + logs.err and "fake-slack-token" not in logs.out + logs.err
 
 
 @pytest.mark.parametrize(

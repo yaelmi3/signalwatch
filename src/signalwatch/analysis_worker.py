@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 from structlog.typing import FilteringBoundLogger
 
-from signalwatch import article_content, article_feeds, storage
+from signalwatch import article_content, article_feeds, slack_delivery, storage
 from signalwatch.analysis_models import AnalysisQuality, ArticleAnalysisResult, ChangeAnalysisResult, TeamInterests
 
 _QUEUE_NAME = "page-analysis"
@@ -321,7 +321,7 @@ def _normalize_decisions(*, interests: TeamInterests, result: ChangeAnalysisResu
 
 @DBOS.step(name="persist-page-analysis", retries_allowed=True, should_retry=_retry_analysis)
 def _persist_analysis(*, page_id: int, version: int, result: ChangeAnalysisResult | None) -> None:
-    storage.save_change_analysis(page_id, version, result)
+    storage.save_change_analysis(page_id, version, result, slack_channel=slack_delivery.configured_channel())
 
 
 @DBOS.workflow(name="analyze-page-change")
@@ -343,7 +343,7 @@ def analyze_page_change(page_id: int, version: int) -> None:
 
 @DBOS.step(name="persist-article-analysis", retries_allowed=True, should_retry=_retry_analysis)
 def _persist_article_analysis(*, source_id: int, article_url: str, result: ChangeAnalysisResult | None) -> None:
-    storage.save_article_analysis(source_id, article_url, result)
+    storage.save_article_analysis(source_id, article_url, result, slack_channel=slack_delivery.configured_channel())
 
 
 @DBOS.workflow(name="analyze-discovered-article")
@@ -392,6 +392,7 @@ def _enqueue_articles(queue: Queue) -> None:
 
 
 def run_worker(stop: Event) -> None:
+    slack_settings = slack_delivery.get_settings()
     try:
         queue = _start_dbos()
         next_feed_poll = 0.0
@@ -407,6 +408,11 @@ def run_worker(stop: Event) -> None:
             if not stop.is_set() and monotonic() >= next_feed_poll:
                 article_feeds.sync_feeds()
                 next_feed_poll = monotonic() + _FEED_INTERVAL_SECONDS
+            if slack_settings is not None and not stop.is_set():
+                try:
+                    slack_delivery.send_next(slack_settings)
+                except (sqlite3.OperationalError, OSError) as error:
+                    analysis_logger.warning("Could not update Slack delivery", error_type=type(error).__name__)
             stop.wait(_SCAN_INTERVAL_SECONDS)
     finally:
         DBOS.destroy(workflow_completion_timeout_sec=30)

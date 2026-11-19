@@ -80,6 +80,17 @@ and Held shows why each team passed on an analyzed article.
 Select **Use the first page for discovery only** if that page serves as an article listing. Other watched pages under
 the source are still analyzed. Clearing the feed URL stops discovery and preserves the source's article history.
 
+### Optional Slack delivery
+
+Invite the Slack bot to a sandbox channel and give it the `chat:write` bot scope. Set
+`SIGNALWATCH_SLACK_BOT_TOKEN` and `SIGNALWATCH_SLACK_CHANNEL_ID` in the worker's environment, then restart it.
+Leave both unset to disable delivery. Only newly completed analyses that qualify for Digest create a delivery.
+Pending posts keep their original channel ID and send only while that channel is configured.
+
+The worker records one send attempt per item. Rejections, rate limits, and uncertain outcomes are logged and
+recorded in `slack_deliveries`. Review the recorded error and check the channel before resending manually.
+A timeout or interruption can leave the result uncertain even if Slack accepted the message.
+
 ### Worker upgrades and retention
 
 Before changing DBOS or workflow code, stop the worker and check its system database for unfinished jobs. Replace the
