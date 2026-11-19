@@ -35,6 +35,10 @@ class ChangeAnalysisResult(BaseModel):
     research_and_development: TeamDecision
 
 
+class ArticleAnalysisResult(ChangeAnalysisResult):
+    change_quote: str | None
+
+
 class PageChangeAnalysis(BaseModel):
     status: Literal["queued", "completed", "failed"]
     result: ChangeAnalysisResult | None

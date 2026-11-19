@@ -59,7 +59,7 @@ type DigestEntry = {
   team_reasons: Partial<Record<TeamKey, string>>;
 } & (
   | { kind?: never; page_id: number; page_url: string; hold_reason?: "discovery_only" }
-  | { kind: "article"; title: string; article_url: string; source_id: number }
+  | { kind: "article"; title: string; article_url: string; source_id: number; hold_reason?: "business_fit_unverified" }
 );
 const digestAnalysisStatus = {
   pending: "Analysis pending.",
@@ -68,6 +68,10 @@ const digestAnalysisStatus = {
   failed: "Analysis failed.",
 } satisfies Record<DigestEntry["status"], string>;
 const discoveryOnlyReason = "Held because this page is set to discovery only.";
+const digestHoldReasons = {
+  discovery_only: discoveryOnlyReason,
+  business_fit_unverified: "Held because no single change was verified to match both your business and team interests.",
+};
 const configurationPath = "/?view=configuration";
 const articleFeedsPath = "/api/maintainer/article-feeds";
 const summarySentences = new Intl.Segmenter(undefined, { granularity: "sentence" });
@@ -474,7 +478,7 @@ function Digest({ held }: { held: boolean }) {
         <ol className="digest-feed">
           {entries.map((entry) => {
             const isArticle = entry.kind === "article";
-            const discoveryOnly = !isArticle && entry.hold_reason === "discovery_only";
+            const holdReason = entry.hold_reason ? digestHoldReasons[entry.hold_reason] : null;
             const sourceUrl = isArticle ? entry.article_url : entry.page_url;
             const destination = new URL(sourceUrl);
             const sourceLocation = isArticle || destination.pathname === "/"
@@ -497,14 +501,14 @@ function Digest({ held }: { held: boolean }) {
                     </div>
                     <h2>{isArticle ? entry.title : takeaway ?? "Page changed"}</h2>
                     {isArticle && takeaway && <p>{takeaway}</p>}
-                    {!takeaway && !discoveryOnly && (
+                    {!takeaway && !holdReason && (
                       <p className={entry.status === "failed" ? "digest-failed" : "muted"}>
                         {digestAnalysisStatus[entry.status]}
                       </p>
                     )}
                   </header>
-                  {discoveryOnly ? (
-                    <p className="muted">{discoveryOnlyReason}</p>
+                  {holdReason ? (
+                    <p className="muted">{holdReason}</p>
                   ) : completed && (teams.length === 0 ? <p className="muted">Skipped. No team matched.</p> : (
                     <div className="digest-relevance">
                       <h3>{showAllReasons ? "Team reasons" : "Why it matters"}</h3>
@@ -809,7 +813,7 @@ function TeamInterestsSettings() {
                 value={interests.business_context} onChange={(event) => updateInterest("business_context", event.target.value)} />
             </label>
             <small className="muted" id="business-context-help">
-              Share what your business does or is focused on. For example, we help enterprises secure AI agents.
+              Describe what your business does or is focused on. Articles need a clear match here to appear in Digest.
             </small>
             {analysisTeams.map(([key, name]) => (
               <label key={key}>{name}

@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from signalwatch import storage
-from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
+from signalwatch.analysis_models import ArticleAnalysisResult, ChangeAnalysisResult, TeamDecision, TeamInterests
 from signalwatch.catchup import catchup_lifespan
 from signalwatch.main import app
 
@@ -269,7 +269,8 @@ def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, mo
 
 
 def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
     monkeypatch.setattr(storage, "time", lambda: 10)
     first = storage.save_competitor("First feed", "https://first.example/")
     second = storage.save_competitor("Second feed", "https://second.example/")
@@ -284,9 +285,24 @@ def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monke
 
     held = TeamDecision(relevant=False, reason="No match", quote=None)
     product = TeamDecision(relevant=True, reason="Review the rollout options", quote="Publisher evidence")
-    result = ChangeAnalysisResult(summary=article.title, marketing=held, product=product, research_and_development=held)
+    result = ArticleAnalysisResult(
+        summary=article.title,
+        marketing=held,
+        product=product,
+        research_and_development=held,
+        change_quote="Publisher evidence",
+    )
     storage.save_article_analysis(first.id, article.article_url, result)
-    storage.save_article_analysis(second.id, article.article_url, result.model_copy(update={"product": held}))
+    legacy = {**result.model_dump(exclude={"change_quote"}), "business_quote": result.change_quote}
+    with sqlite3.connect(db_path) as database:
+        database.execute(
+            "INSERT INTO discovered_article_analyses VALUES (?, ?, 'completed', ?)",
+            (second.id, article.article_url, json.dumps(legacy)),
+        )
+    unmatched = storage.Article("An operations update", "https://publisher.example/update")
+    storage.save_discovered_articles(storage.ArticleFeed(second.id, f"{second.website}feed.xml"), [unmatched])
+    unmatched_result = result.model_copy(update={"product": held, "summary": unmatched.title})
+    storage.save_article_analysis(second.id, unmatched.article_url, unmatched_result)
     expected = {
         "kind": "article",
         "title": article.title,
@@ -302,8 +318,17 @@ def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monke
         "relevant_teams": [],
         "team_reasons": {"marketing": held.reason, "product": held.reason, "research_and_development": held.reason},
     }
+    legacy_article = {**held_article, "team_reasons": {}, "hold_reason": "business_fit_unverified"}
+    unmatched_article = {
+        **held_article,
+        "article_url": unmatched.article_url,
+        "title": unmatched.title,
+        "summary": unmatched.title,
+    }
 
     with TestClient(app) as client:
+        assert client.get("/api/digest").json() == []
+        storage.save_team_interests(TeamInterests(business_context="Enterprise controls", product="Rollout options"))
         assert client.get("/api/digest").json() == [
             {
                 **expected,
@@ -313,10 +338,10 @@ def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monke
                 "team_reasons": {"product": product.reason},
             }
         ]
-        assert client.get("/api/digest", params={"view": "held"}).json() == [held_article]
+        assert client.get("/api/digest", params={"view": "held"}).json() == [legacy_article, unmatched_article]
         assert client.delete(f"/api/competitors/{first.id}").status_code == HTTPStatus.NO_CONTENT
         assert client.get("/api/digest").json() == []
-        assert client.get("/api/digest", params={"view": "held"}).json() == [held_article]
+        assert client.get("/api/digest", params={"view": "held"}).json() == [legacy_article, unmatched_article]
     assert storage.get_discovered_article(first.id, article.article_url) is None
     assert storage.list_article_feeds() == [storage.ArticleFeed(second.id, f"{second.website}feed.xml")]
 

@@ -65,7 +65,9 @@ def test_worker_retries_handoff_and_limits_model_calls(
     lock = Lock()
     attempts: Counter[int | str] = Counter()
     publisher_reads: Counter[str] = Counter()
-    publisher_text = "The new tide sensor logs wave height every minute."
+    change = "The new tide sensor logs wave height every minute."
+    other_change = "A customer described a previous sensor prototype."
+    publisher_text = f"{change.removesuffix('.')}\n{change}\n{other_change}\nThe vendor redesigned the help page."
     active = peak = 0
 
     def publisher_respond(request: httpx2.Request) -> httpx2.Response:
@@ -102,10 +104,16 @@ def test_worker_retries_handoff_and_limits_model_calls(
         if "publisher_text" in evidence:
             assert evidence["headline"] == article.title
             assert evidence["publisher_text"] == publisher_text
-            item, summary = "article", publisher_text
+            item, summary = "article-draft", publisher_text
+        elif "candidate_passages" in evidence:
+            assert evidence["candidate_passages"] == [change, other_change]
+            assert set(evidence) == {"candidate_passages", "team_interests", "business_context"}
+            item, summary = "article-verifier", "The verifier's summary should not be saved."
         else:
             summary = evidence["after"][0]
             item = int(summary.removeprefix("Release "))
+        required_fields = body["text"]["format"]["schema"]["required"]
+        assert ("change_quote" in required_fields) == (item == "article-verifier")
         with lock:
             attempts[item] += 1
             attempt = attempts[item]
@@ -120,10 +128,18 @@ def test_worker_retries_handoff_and_limits_model_calls(
                 assert release.wait(12)
             if item == 4 or (item == 2 and attempt == 1):
                 return httpx2.Response(503, json={"error": {"message": "private provider error text"}})
+            quote = summary if item == 2 else "invented quote"
+            if item == "article-verifier":
+                return _model_response(
+                    summary=summary,
+                    quote="logs wave height every minute.",
+                    marketing_quote=other_change,
+                    change_quote=change if attempt == 1 else f"{change}\n{other_change}",
+                )
             return _model_response(
                 summary=summary,
-                quote=summary if item in {2, "article"} else "invented quote",
-                marketing_quote="invented marketing quote" if item == "article" else None,
+                quote="logs wave height every minute" if item == "article-draft" else quote,
+                marketing_quote=other_change if item == "article-draft" else None,
             )
         finally:
             with lock:
@@ -168,14 +184,14 @@ def test_worker_retries_handoff_and_limits_model_calls(
     analyses = storage.list_page_analyses(page.id)
     assert peak == 2
     assert handoffs == {2: 2, 3: 1, 4: 1}
-    assert attempts == {2: 2, 3: 1, 4: 3, "article": 2}
+    assert attempts == {2: 2, 3: 1, 4: 3, "article-draft": 2, "article-verifier": 2}
     assert publisher_reads == {article.article_url: 3, unreadable.article_url: 1}
-    assert held_article_statuses() == {blocked_key: "failed"}
     relevant_articles = [row for row in storage.list_digest() if isinstance(row, storage.DigestArticle)]
-    assert {row.source_id for row in relevant_articles} == {feed.source_id for feed in feeds}
     assert [(row.article_url, row.status, row.summary, row.relevant_teams) for row in relevant_articles] == [
         (article.article_url, "completed", publisher_text, ["product"]),
-    ] * 2
+    ]
+    held_source = next(feed.source_id for feed in feeds if feed.source_id != relevant_articles[0].source_id)
+    assert held_article_statuses() == {blocked_key: "failed", (held_source, article.article_url): "completed"}
     assert analyses["2"].status == "completed"
     assert analyses["2"].result is not None
     assert analyses["2"].result.product.relevant
@@ -284,7 +300,7 @@ def test_publisher_fetch_pins_public_address_and_preserves_host(monkeypatch: pyt
         assert request.headers["host"] == request.extensions["sni_hostname"] == "publisher.test"
         assert request.headers["accept-encoding"] == "identity"
         assert "authorization" not in request.headers and "cookie" not in request.headers
-        html = b"<header><p>Header</p></header><article><p>New <em>sensor</em> released &amp; tested.</p></article>"
+        html = b"<nav><p>Menu</p></nav><article><h2>Launch</h2><p><em>Sensor</em> shipped &amp; tested.</p></article>"
         return httpx2.Response(
             status, headers={"Content-Type": "text/html", "Location": "/another"}, stream=httpx2.ByteStream(html)
         )
@@ -295,7 +311,7 @@ def test_publisher_fetch_pins_public_address_and_preserves_host(monkeypatch: pyt
 
     evidence = article_content.read_publisher_text("https://publisher.test/story?edition=2#section")
 
-    assert evidence == ("New sensor released & tested." if status == HTTPStatus.OK else None)
+    assert evidence == ("Launch\nSensor shipped & tested." if status == HTTPStatus.OK else None)
 
 
 @pytest.mark.parametrize(
@@ -342,7 +358,9 @@ def test_publisher_fetch_stops_at_response_byte_limit(monkeypatch: pytest.Monkey
     assert article_content.read_publisher_text("https://1.1.1.1/story") == "New tides. High"
 
 
-def _model_response(*, summary: str, quote: str, marketing_quote: str | None = None) -> httpx2.Response:
+def _model_response(
+    *, summary: str, quote: str, marketing_quote: str | None = None, change_quote: str | None = None
+) -> httpx2.Response:
     marketing = {"relevant": marketing_quote is not None, "reason": "A customer is quoted.", "quote": marketing_quote}
     result = {
         "summary": summary,
@@ -350,6 +368,8 @@ def _model_response(*, summary: str, quote: str, marketing_quote: str | None = N
         "research_and_development": {"relevant": True, "reason": "A new release was listed.", "quote": summary},
         "product": {"relevant": True, "reason": "An updated release is described.", "quote": quote},
     }
+    if change_quote is not None:
+        result["change_quote"] = change_quote
     return httpx2.Response(
         HTTPStatus.OK,
         json={
