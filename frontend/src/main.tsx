@@ -24,6 +24,15 @@ type PageChangeAnalysis = {
   result: ChangeAnalysisResult | null;
 };
 type WebhookStatus = { configured: boolean };
+type SlackStatus = {
+  available: boolean;
+  authenticated: boolean;
+  connected: boolean;
+  workspace_name: string | null;
+  channel_id: string | null;
+  enabled: boolean;
+};
+type SlackChannel = { id: string; name: string };
 type AnalysisSettings = { quality: "economy" | "higher_quality" };
 type ArticleFeedSettings = {
   source_id: number;
@@ -74,6 +83,7 @@ const digestHoldReasons = {
 };
 const configurationPath = "/?view=configuration";
 const articleFeedsPath = "/api/maintainer/article-feeds";
+const slackPath = "/api/maintainer/slack";
 const summarySentences = new Intl.Segmenter(undefined, { granularity: "sentence" });
 
 function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
@@ -581,7 +591,7 @@ function PageHistory({ pageId, requestedVersion, fromHeld }: {
   );
 }
 
-function MaintainerSettings() {
+function MaintainerSettings({ slackCallback }: { slackCallback: string | null }) {
   const [status, setStatus] = useState<WebhookStatus | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [error, setError] = useState("");
@@ -613,9 +623,226 @@ function MaintainerSettings() {
         {error && <p role="alert">{error}</p>}
         {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
       </section>
+      <SlackSettings callback={slackCallback} />
       <AnalysisQualitySettings />
       <ArticleDiscoverySettings />
     </main>
+  );
+}
+
+async function readSlackStatus(signal?: AbortSignal) {
+  const timeout = AbortSignal.timeout(8000);
+  try {
+    return await request<SlackStatus>(slackPath, {
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout, cache: "no-store",
+    });
+  } catch (cause) {
+    return { error: `Could not load Slack settings. ${message(cause)}` };
+  }
+}
+
+function SlackSettings({ callback }: { callback: string | null }) {
+  const [status, setStatus] = useState<SlackStatus | { error: string } | null>(null);
+  const [statusAttempt, setStatusAttempt] = useState(0);
+  const [channels, setChannels] = useState<SlackChannel[] | { error: string } | null>(null);
+  const [channelAttempt, setChannelAttempt] = useState(0);
+  const [selectedChannel, setSelectedChannel] = useState<string | null>(null);
+  const [action, setAction] = useState("");
+  const [feedback, setFeedback] = useState<{ role: "status" | "alert"; text: string } | null>(null);
+
+  const settings = status && "available" in status ? status : null;
+  const connected = settings?.available && settings.authenticated && settings.connected;
+  const savedChannel = connected ? settings.channel_id : null;
+  const savedChannelName = Array.isArray(channels) ? channels.find((channel) => channel.id === savedChannel)?.name : null;
+  const channelId = selectedChannel ?? savedChannel ?? "";
+  const channelChanged = channelId !== (savedChannel ?? "");
+
+  useEffect(() => {
+    if (callback !== "connected" && callback !== "error") return;
+    const location = new URL(window.location.href);
+    location.searchParams.delete("slack");
+    window.history.replaceState(window.history.state, "", location);
+  }, [callback]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    readSlackStatus(controller.signal).then((next) => {
+      if (!controller.signal.aborted) setStatus(next);
+    });
+    return () => controller.abort();
+  }, [statusAttempt]);
+
+  useEffect(() => {
+    if (!connected) return;
+    const controller = new AbortController();
+    request<SlackChannel[]>(`${slackPath}/channels`, { signal: controller.signal, cache: "no-store" })
+      .then((result) => { if (!controller.signal.aborted) setChannels(result); })
+      .catch(async (cause) => {
+        if (controller.signal.aborted) return;
+        const next = await readSlackStatus(controller.signal);
+        if (controller.signal.aborted) return;
+        const error = `Could not load Slack channels. ${message(cause)}`;
+        setStatus(next);
+        setChannels({ error });
+        if ("authenticated" in next && next.available && !next.authenticated) {
+          setFeedback({ role: "alert", text: error });
+        }
+      });
+    return () => controller.abort();
+  }, [connected, channelAttempt]);
+
+  async function runAction(progress: string, perform: () => Promise<void>) {
+    if (action) return;
+    setAction(progress);
+    setFeedback(null);
+    try {
+      await perform();
+    } catch (cause) {
+      setFeedback({ role: "alert", text: message(cause) });
+      if (settings?.authenticated) {
+        const next = await readSlackStatus();
+        if ("error" in next || !next.available || !next.authenticated || !next.connected ||
+            next.workspace_name !== settings.workspace_name) {
+          setChannels(null);
+          setSelectedChannel(null);
+          if ("connected" in next && next.connected) setChannelAttempt((attempt) => attempt + 1);
+        }
+        setStatus(next);
+      }
+    } finally {
+      setAction("");
+    }
+  }
+
+  function unlock(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const password = new FormData(event.currentTarget).get("password");
+    event.currentTarget.reset();
+    if (typeof password !== "string" || !password) return;
+    void runAction("Unlocking Slack settings…", async () => {
+      await post<void>(`${slackPath}/session`, { password });
+      const next = await readSlackStatus();
+      setChannels(null);
+      setSelectedChannel(null);
+      setStatus(next);
+      if ("authenticated" in next && next.available && !next.authenticated) {
+        throw new Error("Could not start a maintainer session. Try again.");
+      }
+    });
+  }
+
+  function connect() {
+    void runAction("Opening Slack…", async () => {
+      const { url } = await post<{ url: string }>(`${slackPath}/connect`, {});
+      const destination = URL.parse(url);
+      if (!destination || destination.origin !== "https://slack.com" ||
+          destination.pathname !== "/oauth/v2/authorize" || destination.username || destination.password) {
+        throw new Error("Slack authorization returned an invalid link.");
+      }
+      window.location.assign(destination.href);
+    });
+  }
+
+  function saveDestination(destinationId: string, enabled: boolean, notice: string) {
+    void runAction("Saving Slack settings…", async () => {
+      const next = await request<SlackStatus>(slackPath, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel_id: destinationId, enabled }),
+      });
+      setStatus(next);
+      if (destinationId === channelId) setSelectedChannel(null);
+      setFeedback({ role: "status", text: notice });
+    });
+  }
+
+  function sendTest() {
+    void runAction("Sending test message…", async () => {
+      await post<void>(`${slackPath}/test`, {});
+      setFeedback({ role: "status", text: "Test message sent to the saved Slack channel." });
+    });
+  }
+
+  return (
+    <section className="slack-settings" aria-labelledby="slack-settings-title">
+      <h2 id="slack-settings-title">Slack delivery</h2>
+      {!action && !feedback && callback === "error" &&
+        <p role="alert">Slack authorization did not complete. Try connecting again.</p>}
+      {!action && !feedback && callback === "connected" && settings?.available && (
+        !settings.authenticated ? <p role="status">Unlock Slack settings to verify the connection.</p> :
+          settings.connected ? <p role="status">Slack workspace connected.</p> :
+            <p role="alert">Could not verify the Slack connection. Try connecting again.</p>
+      )}
+      {status === null && <p role="status">Loading Slack settings…</p>}
+      {status && "error" in status && (
+        <>
+          <p role="alert">{status.error}</p>
+          <button type="button" onClick={() => { setStatus(null); setStatusAttempt((attempt) => attempt + 1); }}>
+            Retry loading Slack settings
+          </button>
+        </>
+      )}
+      {settings && !settings.available && <p>Slack delivery is unavailable.</p>}
+      {settings?.available && !settings.authenticated && (
+        <form onSubmit={unlock} autoComplete="off">
+          <fieldset disabled={Boolean(action)}>
+            <label>Maintainer passphrase<input name="password" type="password" required /></label>
+            <button type="submit">Unlock Slack settings</button>
+          </fieldset>
+        </form>
+      )}
+      {settings?.available && settings.authenticated && !settings.connected && (
+        <button type="button" disabled={Boolean(action)} onClick={connect}>Connect Slack</button>
+      )}
+      {connected && (
+        <>
+          <p>Workspace <strong>{settings.workspace_name ?? "Slack"}</strong></p>
+          <button type="button" disabled={Boolean(action)} onClick={connect}>Reconnect Slack</button>
+          {channels === null && <p role="status">Loading Slack channels…</p>}
+          {channels && "error" in channels && <p role="alert">{channels.error}</p>}
+          {Array.isArray(channels) && channels.length === 0 && (
+            <p>No selectable channels. Invite the SignalWatch bot to a channel, then reload channels.</p>
+          )}
+          {channels && ("error" in channels || channels.length === 0) && (
+            <button type="button" disabled={Boolean(action)} onClick={() => {
+              setChannels(null);
+              setChannelAttempt((attempt) => attempt + 1);
+            }}>Reload channels</button>
+          )}
+          {Array.isArray(channels) && channels.length > 0 && (
+            <form onSubmit={(event) => {
+              event.preventDefault();
+              if (channelId && channelChanged) saveDestination(channelId, false, "Channel saved. Delivery is disabled.");
+            }}>
+              <fieldset disabled={Boolean(action)}>
+                <label>Slack channel
+                  <select value={channelId} onChange={(event) => setSelectedChannel(event.target.value)}>
+                    <option value="" disabled>Select a channel</option>
+                    {savedChannel && !savedChannelName &&
+                      <option value={savedChannel}>Saved channel ({savedChannel})</option>}
+                    {channels.map((channel) => <option key={channel.id} value={channel.id}>#{channel.name}</option>)}
+                  </select>
+                </label>
+                <button type="submit" disabled={!channelChanged}>Save channel</button>
+              </fieldset>
+            </form>
+          )}
+          {savedChannel && (!Array.isArray(channels) || channels.length === 0 || channelChanged) && (
+            <p>Saved channel <strong>{savedChannelName ? `#${savedChannelName}` : savedChannel}</strong></p>
+          )}
+          <p>Delivery is {settings.enabled ? "enabled" : "disabled"}.</p>
+          {savedChannel && (
+            <fieldset aria-label="Slack delivery controls" disabled={Boolean(action) || channels === null}>
+              <button type="button" onClick={sendTest}>Send test message</button>
+              <button type="button" disabled={channelChanged && !settings.enabled} onClick={() =>
+                saveDestination(savedChannel, !settings.enabled, "Delivery settings saved.")
+              }>{settings.enabled ? "Disable delivery" : "Enable delivery"}</button>
+            </fieldset>
+          )}
+        </>
+      )}
+      {action && <p role="status">{action}</p>}
+      {feedback && <p role={feedback.role}>{feedback.text}</p>}
+    </section>
   );
 }
 
@@ -952,7 +1179,7 @@ createRoot(root).render(
         <a href="/" aria-current={configurationActive ? undefined : current}>Digest</a>
         <a href={configurationPath} aria-current={configurationActive ? current : undefined}>Configuration</a>
       </nav>
-      {view === "maintainer" ? <MaintainerSettings /> : view === "history" ? (
+      {view === "maintainer" ? <MaintainerSettings slackCallback={search.get("slack")} /> : view === "history" ? (
         <PageHistory pageId={search.get("page") ?? ""} requestedVersion={requestedVersion} fromHeld={fromHeld} />
       ) : view === "configuration" ? <Configuration /> : <Digest held={held} />}
     </div>

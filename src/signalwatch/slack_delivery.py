@@ -6,7 +6,7 @@ from http import HTTPMethod, HTTPStatus
 import httpx2
 import structlog
 
-from signalwatch import network, storage
+from signalwatch import network, slack_oauth, storage
 
 _POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 _REJECTED_HTTP = {
@@ -41,9 +41,22 @@ slack_logger = structlog.get_logger()
 class SlackSettings:
     channel_id: str
     bot_token: str = field(repr=False)
+    connection: storage.SlackConnection | None = field(default=None, repr=False)
 
 
 def get_settings() -> SlackSettings | None:
+    if slack_oauth.oauth_requested():
+        config = slack_oauth.load_config()
+        if config is None:
+            return None
+        connection = storage.get_slack_connection()
+        if connection is None or not connection.enabled or connection.channel_id is None:
+            return None
+        try:
+            token = slack_oauth.decrypt_bot_token(config, connection.encrypted_token)
+        except slack_oauth.SlackOAuthError:
+            return None
+        return SlackSettings(connection.channel_id, token, connection)
     token = os.getenv("SIGNALWATCH_SLACK_BOT_TOKEN", "").strip()
     channel_id = os.getenv("SIGNALWATCH_SLACK_CHANNEL_ID", "").strip()
     if bool(token) != bool(channel_id):
@@ -59,11 +72,11 @@ def configured_channel() -> str | None:
 
 
 def send_next(settings: SlackSettings) -> None:
-    delivery = storage.claim_slack_delivery(settings.channel_id)
+    delivery = storage.claim_slack_delivery(settings.channel_id, settings.connection)
     if delivery is None:
         return
     try:
-        _post_message(settings, delivery.item)
+        post_message(settings, _delivery_message(delivery.item))
     except SlackPostError as error:
         status = "uncertain" if error.uncertain else "failed"
         storage.finish_slack_delivery(delivery.id, status, error.code)
@@ -81,14 +94,17 @@ class SlackPostError(Exception):
         self.uncertain = uncertain
 
 
-def _post_message(settings: SlackSettings, item: storage.DigestArticle | storage.DigestEntry) -> None:
+def _delivery_message(item: storage.DigestArticle | storage.DigestEntry) -> str:
     heading = item.source_name[:160]
     source_url = item.page_url if isinstance(item, storage.DigestEntry) else item.article_url
     if isinstance(item, storage.DigestArticle):
         heading = f"{heading} · {item.title[:180]}"
     reasons = "\n".join(f"{_TEAM_NAMES[team]}: {item.team_reasons[team][:220]}" for team in item.relevant_teams)
     summary = (item.summary or "Change detected.")[:800]
-    message = escape(f"{heading}\n{summary}\n\n{reasons}\n\n{source_url}", quote=False)
+    return f"{heading}\n{summary}\n\n{reasons}\n\n{source_url}"
+
+
+def post_message(settings: SlackSettings, message: str) -> None:
     try:
         response = network.send_request(
             method=HTTPMethod.POST,
@@ -96,7 +112,7 @@ def _post_message(settings: SlackSettings, item: storage.DigestArticle | storage
             headers={"Authorization": f"Bearer {settings.bot_token}"},
             payload={
                 "channel": settings.channel_id,
-                "text": message,
+                "text": escape(message, quote=False),
                 "mrkdwn": False,
                 "link_names": False,
                 "unfurl_links": False,

@@ -392,7 +392,7 @@ def _enqueue_articles(queue: Queue) -> None:
 
 
 def run_worker(stop: Event) -> None:
-    slack_settings = slack_delivery.get_settings()
+    slack_delivery.get_settings()
     try:
         queue = _start_dbos()
         next_feed_poll = 0.0
@@ -408,9 +408,10 @@ def run_worker(stop: Event) -> None:
             if not stop.is_set() and monotonic() >= next_feed_poll:
                 article_feeds.sync_feeds()
                 next_feed_poll = monotonic() + _FEED_INTERVAL_SECONDS
-            if slack_settings is not None and not stop.is_set():
+            if not stop.is_set():
                 try:
-                    slack_delivery.send_next(slack_settings)
+                    if (slack_settings := slack_delivery.get_settings()) is not None:
+                        slack_delivery.send_next(slack_settings)
                 except (sqlite3.OperationalError, OSError) as error:
                     analysis_logger.warning("Could not update Slack delivery", error_type=type(error).__name__)
             stop.wait(_SCAN_INTERVAL_SECONDS)

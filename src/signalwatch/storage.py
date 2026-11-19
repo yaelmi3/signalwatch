@@ -2,7 +2,7 @@ import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -71,6 +71,12 @@ _SLACK_DELIVERIES_SCHEMA = """(
     FOREIGN KEY (page_id, version) REFERENCES change_analyses(page_id, version) ON DELETE CASCADE,
     FOREIGN KEY (source_id, article_url)
         REFERENCES discovered_article_analyses(source_id, article_url) ON DELETE CASCADE
+)"""
+_SLACK_CONNECTION_SCHEMA = """(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    workspace_name TEXT NOT NULL, encrypted_token TEXT NOT NULL,
+    channel_id TEXT, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    CHECK (enabled = 0 OR channel_id IS NOT NULL)
 )"""
 _DISCOVERY_ONLY_PAGE_SQL = """EXISTS (
     SELECT 1 FROM article_feeds JOIN competitors ON competitors.id = article_feeds.source_id
@@ -155,6 +161,14 @@ class ArticleFeed:
 class SlackDelivery:
     id: int
     item: DigestEntry | DigestArticle
+
+
+@dataclass(frozen=True)
+class SlackConnection:
+    workspace_name: str
+    encrypted_token: str = field(repr=False)
+    channel_id: str | None
+    enabled: bool
 
 
 class ArticleFeedSettings(BaseModel):
@@ -331,14 +345,21 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
     return model.model_validate(item)
 
 
-def claim_slack_delivery(channel_id: str) -> SlackDelivery | None:
+def claim_slack_delivery(channel_id: str, connection: SlackConnection | None = None) -> SlackDelivery | None:
     with _database() as database:
         # Persist an uncertain outcome before the request so a restart cannot repeat a possibly accepted post.
         claim = database.execute(
             """UPDATE slack_deliveries SET status = 'uncertain', error = 'result_not_recorded'
-            WHERE id = (SELECT id FROM slack_deliveries WHERE channel_id = ? AND status = 'pending' ORDER BY id LIMIT 1)
+            WHERE id = (
+                SELECT id FROM slack_deliveries WHERE channel_id = :channel AND status = 'pending'
+                AND (:token IS NULL OR EXISTS (
+                    SELECT 1 FROM slack_connection
+                    WHERE channel_id = :channel AND encrypted_token = :token AND enabled = 1
+                ))
+                ORDER BY id LIMIT 1
+            )
             RETURNING id, page_id, version, source_id, article_url""",
-            (channel_id,),
+            {"channel": channel_id, "token": connection.encrypted_token if connection else None},
         ).fetchone()
         if claim is None:
             return None
@@ -356,6 +377,39 @@ def claim_slack_delivery(channel_id: str) -> SlackDelivery | None:
             )
             return None
         return SlackDelivery(claim["id"], _digest_entry(target, DigestView.RELEVANT))
+
+
+def _slack_connection(row: sqlite3.Row | None) -> SlackConnection | None:
+    if row is None:
+        return None
+    return SlackConnection(row["workspace_name"], row["encrypted_token"], row["channel_id"], bool(row["enabled"]))
+
+
+def get_slack_connection() -> SlackConnection | None:
+    with _database() as database:
+        return _slack_connection(database.execute("SELECT * FROM slack_connection WHERE id = 1").fetchone())
+
+
+def save_slack_connection(workspace_name: str, encrypted_token: str) -> None:
+    with _database() as database:
+        database.execute(
+            """INSERT INTO slack_connection (id, workspace_name, encrypted_token) VALUES (1, ?, ?)
+            ON CONFLICT (id) DO UPDATE SET workspace_name = excluded.workspace_name,
+                encrypted_token = excluded.encrypted_token, channel_id = NULL, enabled = 0""",
+            (workspace_name, encrypted_token),
+        )
+
+
+def save_slack_destination(
+    connection: SlackConnection, channel_id: str | None, enabled: bool
+) -> SlackConnection | None:
+    with _database() as database:
+        row = database.execute(
+            """UPDATE slack_connection SET channel_id = ?, enabled = ?
+            WHERE id = 1 AND encrypted_token = ? RETURNING *""",
+            (channel_id, enabled, connection.encrypted_token),
+        ).fetchone()
+    return _slack_connection(row)
 
 
 def finish_slack_delivery(
@@ -805,4 +859,5 @@ def _database() -> Iterator[sqlite3.Connection]:
             f"CREATE TABLE IF NOT EXISTS discovered_article_analyses {_DISCOVERED_ARTICLE_ANALYSES_SCHEMA}"
         )
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_deliveries {_SLACK_DELIVERIES_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS slack_connection {_SLACK_CONNECTION_SCHEMA}")
         yield database
