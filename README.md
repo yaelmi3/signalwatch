@@ -73,7 +73,7 @@ analysis status.
 ### Article discovery
 
 Open **Maintainer settings → Article discovery** and give a source a public RSS 2.0 feed URL. The worker checks the feed
-at startup and every five minutes. The first successful poll with articles records which links are already present.
+at startup and every five minutes. The first successful poll records the baseline, even when no articles are eligible.
 Later discoveries are analyzed from the original publisher page. Relevant articles link directly to the publisher,
 and Held shows why each team passed on an analyzed article.
 

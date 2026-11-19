@@ -340,8 +340,6 @@ def list_article_feeds() -> list[ArticleFeed]:
 
 
 def save_discovered_articles(feed: ArticleFeed, articles: list[Article]) -> None:
-    if not articles:
-        return
     with _database() as database:
         database.execute("BEGIN IMMEDIATE")
         current = database.execute(
@@ -635,6 +633,7 @@ def _database() -> Iterator[sqlite3.Connection]:
         database.execute(f"CREATE TABLE IF NOT EXISTS pages {_PAGES_SCHEMA}")
         schema_query = "SELECT sql FROM sqlite_schema WHERE name = 'pages'"
         if "AUTOINCREMENT" not in database.execute(schema_query).fetchone()["sql"].upper():
+            database.execute("PRAGMA foreign_keys = OFF")
             database.execute("BEGIN IMMEDIATE")
             # Another connection may have upgraded the table while this one waited for the write lock.
             if "AUTOINCREMENT" not in database.execute(schema_query).fetchone()["sql"].upper():
@@ -642,7 +641,10 @@ def _database() -> Iterator[sqlite3.Connection]:
                 database.execute("INSERT INTO pages_upgraded SELECT * FROM pages")
                 database.execute("DROP TABLE pages")
                 database.execute("ALTER TABLE pages_upgraded RENAME TO pages")
+                if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise sqlite3.IntegrityError("Page upgrade failed its foreign-key check.")
             database.commit()
+            database.execute("PRAGMA foreign_keys = ON")
         schema_query = "SELECT sql FROM sqlite_schema WHERE name = 'competitors'"
         if "AUTOINCREMENT" not in database.execute(schema_query).fetchone()["sql"].upper():
             database.execute("PRAGMA foreign_keys = OFF")
@@ -659,13 +661,17 @@ def _database() -> Iterator[sqlite3.Connection]:
         database.execute(f"CREATE TABLE IF NOT EXISTS page_changes {_PAGE_CHANGES_SCHEMA}")
         schema_query = "SELECT type FROM pragma_table_info('page_changes') WHERE name = 'version'"
         if database.execute(schema_query).fetchone()["type"].upper() == "TEXT":
+            database.execute("PRAGMA foreign_keys = OFF")
             database.execute("BEGIN IMMEDIATE")
             if database.execute(schema_query).fetchone()["type"].upper() == "TEXT":
                 database.execute(f"CREATE TABLE page_changes_upgraded {_PAGE_CHANGES_SCHEMA}")
                 database.execute("INSERT INTO page_changes_upgraded SELECT * FROM page_changes")
                 database.execute("DROP TABLE page_changes")
                 database.execute("ALTER TABLE page_changes_upgraded RENAME TO page_changes")
+                if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise sqlite3.IntegrityError("Page history upgrade failed its foreign-key check.")
             database.commit()
+            database.execute("PRAGMA foreign_keys = ON")
         database.execute(f"CREATE TABLE IF NOT EXISTS history_gaps {_HISTORY_GAPS_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS change_analyses {_CHANGE_ANALYSES_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS analysis_settings {_ANALYSIS_SETTINGS_SCHEMA}")

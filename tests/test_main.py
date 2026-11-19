@@ -235,7 +235,6 @@ def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, mo
     first_feed = storage.ArticleFeed(source.id, "https://releases.example/feed.xml")
     next_feed = storage.ArticleFeed(source.id, "https://releases.example/new-feed.xml")
     entry = {"source_id": source.id, "source_name": source.name, "website": source.website}
-    baseline = storage.Article("Already published", "https://publisher.example/baseline")
     new_article = storage.Article("New release", "https://publisher.example/release")
     next_baseline = storage.Article("Already in the new feed", "https://publisher.example/previous")
     stale = storage.Article("From the previous feed", "https://publisher.example/stale")
@@ -255,9 +254,8 @@ def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, mo
         assert storage.list_article_feeds() == [first_feed]
 
         storage.save_discovered_articles(first_feed, [])
-        storage.save_discovered_articles(first_feed, [baseline])
         assert client.get("/api/digest", params={"view": "held"}).json() == []
-        storage.save_discovered_articles(first_feed, [baseline, new_article])
+        storage.save_discovered_articles(first_feed, [new_article])
 
         assert client.put(settings_url, json={**enabled, "url": next_feed.url}).status_code == HTTPStatus.OK
         storage.save_discovered_articles(next_feed, [next_baseline])
@@ -447,6 +445,47 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
     with sqlite3.connect(db_path) as database:
         assert database.execute("SELECT COUNT(*) FROM page_changes").fetchone() == (0,)
         assert database.execute("SELECT COUNT(*) FROM history_gaps").fetchone() == (0,)
+
+
+def test_legacy_migrations_preserve_saved_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    storage.save_page_version(page_id=page.id, watch_id=_WATCH_ID, version=10, before="Before", after="After")
+    storage.record_history_gap(page.id, _WATCH_ID)
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+    analysis = ChangeAnalysisResult(summary="A change", marketing=held, product=held, research_and_development=held)
+    storage.save_change_analysis(page.id, 10, analysis)
+
+    with sqlite3.connect(db_path) as database:
+        legacy_pages_schema = storage._PAGES_SCHEMA.replace(" AUTOINCREMENT", "")
+        database.executescript(f"""
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE legacy_pages {legacy_pages_schema};
+            INSERT INTO legacy_pages SELECT * FROM pages;
+            DROP TABLE pages;
+            ALTER TABLE legacy_pages RENAME TO pages;
+            CREATE TABLE legacy_page_changes (
+                page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, PRIMARY KEY (page_id, version)
+            );
+            INSERT INTO legacy_page_changes SELECT * FROM page_changes;
+            DROP TABLE page_changes;
+            ALTER TABLE legacy_page_changes RENAME TO page_changes;
+        """)
+
+    with TestClient(app) as client:
+        changes = client.get(f"/api/pages/{page.id}/changes")
+        assert changes.json() == [{"version": "10", "before": "Before", "after": "After"}]
+        assert changes.headers[_HISTORY_GAP_HEADER] == "true"
+        assert client.get(f"/api/pages/{page.id}/analysis").json() == {
+            "10": {"status": "completed", "result": analysis.model_dump()}
+        }
+
+    with sqlite3.connect(db_path) as database:
+        assert database.execute("SELECT typeof(version) FROM page_changes").fetchone() == ("integer",)
+        assert database.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 @pytest.mark.parametrize("empty_history", [False, True])
