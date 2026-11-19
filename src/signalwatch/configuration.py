@@ -5,8 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import AfterValidator, BaseModel, BeforeValidator, HttpUrl, StringConstraints
 
-from signalwatch import changedetection, storage
-from signalwatch.storage import Competitor, Page, PageState
+from signalwatch import article_content, changedetection, storage
+from signalwatch.analysis_models import AnalysisSettings, PageChangeAnalysis, TeamInterests
+from signalwatch.storage import ArticleFeedSettings, Competitor, DigestArticle, DigestEntry, DigestView, Page, PageState
 
 router = APIRouter(prefix="/api", tags=["Configuration"])
 
@@ -32,6 +33,12 @@ def _check_target(url: HttpUrl) -> HttpUrl:
 type MonitoredUrl = Annotated[HttpUrl, BeforeValidator(_check_url_text), AfterValidator(_check_target)]
 
 
+def _check_article_feed_url(url: HttpUrl) -> HttpUrl:
+    if article_content.public_http_url(str(url)) is None:
+        raise ValueError("Use a public HTTP(S) feed URL on the default port.")
+    return url
+
+
 class CompetitorInput(BaseModel):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     website: MonitoredUrl
@@ -39,6 +46,11 @@ class CompetitorInput(BaseModel):
 
 class PageInput(BaseModel):
     url: MonitoredUrl
+
+
+class ArticleFeedInput(BaseModel):
+    url: Annotated[MonitoredUrl, AfterValidator(_check_article_feed_url)] | None = None
+    discovery_only: bool
 
 
 def _page(page_id: int) -> Page:
@@ -51,6 +63,22 @@ def _page(page_id: int) -> Page:
 @router.get("/competitors")
 def list_competitors() -> list[Competitor]:
     return storage.list_competitors()
+
+
+@router.get("/digest")
+def digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | DigestArticle]:
+    return storage.list_digest(view)
+
+
+@router.get("/team-interests")
+def get_team_interests() -> TeamInterests:
+    return storage.get_team_interests()
+
+
+@router.put("/team-interests")
+def set_team_interests(interests: TeamInterests) -> TeamInterests:
+    storage.save_team_interests(interests)
+    return interests
 
 
 @router.post("/competitors", status_code=HTTPStatus.CREATED)
@@ -139,4 +167,40 @@ def page_changes(page_id: int, response: Response) -> list[storage.PageChange]:
     changes = storage.list_page_changes(page_id)
     if page.watch_id is not None and storage.has_history_gap(page_id, page.watch_id):
         response.headers["X-SignalWatch-History-Gap"] = "true"
+    if storage.is_discovery_only_page(page_id):
+        response.headers["X-SignalWatch-Hold-Reason"] = "discovery_only"
     return changes
+
+
+@router.get("/pages/{page_id}/analysis")
+def page_analyses(page_id: int) -> dict[str, PageChangeAnalysis]:
+    _page(page_id)
+    return storage.list_page_analyses(page_id)
+
+
+@router.get("/maintainer/analysis")
+def get_analysis_settings() -> AnalysisSettings:
+    return AnalysisSettings(quality=storage.get_analysis_quality())
+
+
+@router.put("/maintainer/analysis")
+def set_analysis_settings(settings: AnalysisSettings) -> AnalysisSettings:
+    storage.save_analysis_quality(settings.quality)
+    return settings
+
+
+@router.get("/maintainer/article-feeds")
+def list_article_feeds() -> list[ArticleFeedSettings]:
+    return storage.list_article_feed_settings()
+
+
+@router.put("/maintainer/article-feeds/{source_id}")
+def set_article_feed(source_id: int, payload: ArticleFeedInput) -> ArticleFeedSettings:
+    settings = storage.set_article_feed(
+        source_id=source_id,
+        url=str(payload.url) if payload.url is not None else None,
+        discovery_only=payload.discovery_only,
+    )
+    if settings is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "Source not found.")
+    return settings

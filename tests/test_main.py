@@ -15,12 +15,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from signalwatch import storage
+from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
 from signalwatch.catchup import catchup_lifespan
 from signalwatch.main import app
 
 _WEBHOOK = "/api/webhooks/changedetection"
 _WEBHOOK_HEADERS = {"Authorization": "Basic " + b64encode(b"signalwatch:test-webhook-secret").decode("ascii")}
 _HISTORY_GAP_HEADER = "X-SignalWatch-History-Gap"
+_ARTICLE_FEEDS = "/api/maintainer/article-feeds"
 _WEBHOOK_SETUP_URL = "https://hooks.example.com/api/webhooks/changedetection"
 _WEBHOOK_SETUP_SECRET = "test-webhook-secret"
 _WATCH_NOTIFICATIONS = {
@@ -47,6 +49,276 @@ def test_serves_frontend_and_api_docs() -> None:
         docs = client.get("/docs")
         assert docs.status_code == HTTPStatus.OK
         assert "Swagger UI" in docs.text
+
+
+def test_maintainer_analysis_quality_persists_and_rejects_unknown_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    storage.save_competitor("Example", "https://example.com/")
+    settings_url = "/api/maintainer/analysis"
+    higher_quality = {"quality": "higher_quality"}
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == {"quality": "economy"}
+        saved = client.put(settings_url, json=higher_quality)
+        assert saved.status_code == HTTPStatus.OK
+        assert saved.json() == higher_quality
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == higher_quality
+        rejected = client.put(settings_url, json={"quality": "unsupported"})
+        assert rejected.status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+        assert client.get(settings_url).json() == higher_quality
+
+
+def test_team_interests_default_trim_and_persist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(database_path))
+    settings_url = "/api/team-interests"
+    expected = {
+        "marketing": "Pricing",
+        "product": "",
+        "research_and_development": "x" * 1000,
+        "business_context": "b" * 2000,
+    }
+    with TestClient(app) as client:
+        defaults = client.get(settings_url)
+        assert defaults.status_code == HTTPStatus.OK
+        assert defaults.json() == dict.fromkeys(expected, "")
+
+        with sqlite3.connect(database_path) as database:
+            database.execute("ALTER TABLE team_interests DROP COLUMN business_context")
+            database.execute("INSERT INTO team_interests VALUES (1, 'Positioning', 'Pricing', 'APIs')")
+        assert client.get(settings_url).json() == {
+            "marketing": "Positioning",
+            "product": "Pricing",
+            "research_and_development": "APIs",
+            "business_context": "",
+        }
+
+        saved = client.put(settings_url, json={key: f"  {value}\n" for key, value in expected.items()})
+        assert saved.status_code == HTTPStatus.OK
+        assert saved.json() == expected
+
+        for field, maximum in (("marketing", 1000), ("business_context", 2000)):
+            rejected = client.put(settings_url, json={**expected, field: "y" * (maximum + 1)})
+            assert rejected.status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+    assert storage.get_team_interests().model_dump() == expected
+    with TestClient(app) as client:
+        assert client.get(settings_url).json() == expected
+
+
+def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    discovery_home = storage.save_competitor("First", "https://first.example/").pages[0]
+    first = storage.save_page(discovery_home.competitor_id, "https://first.example/updates")
+    second = storage.save_competitor("Second", "https://second.example/").pages[0]
+    unlinked = storage.save_competitor("Unlinked", "https://unlinked.example/").pages[0]
+    for page in (first, second, unlinked, discovery_home):
+        storage.link_watch(page.id, f"watch-{page.id}")
+    for page, version, before in (
+        (first, 9, "old snapshot"),
+        (second, 10, "old snapshot"),
+        (first, 10, "old snapshot"),
+        (second, 8, "old snapshot"),
+        (first, 99, None),
+        (unlinked, 100, "old snapshot"),
+        (discovery_home, 11, "old snapshot"),
+    ):
+        assert storage.save_page_version(
+            page_id=page.id, watch_id=f"watch-{page.id}", version=version, before=before, after="new snapshot"
+        )
+    storage.record_watch_error(page_id=unlinked.id, state=storage.PageState.PENDING, error="Watch unavailable")
+    marketing = TeamDecision(relevant=True, reason="Pricing changed", quote="new snapshot")
+    product = TeamDecision(relevant=False, reason="No plan changes", quote=None)
+    research = TeamDecision(relevant=True, reason="API terms changed", quote=None)
+    storage.save_change_analysis(
+        first.id,
+        10,
+        ChangeAnalysisResult(
+            summary="Pricing changed.", marketing=marketing, product=product, research_and_development=research
+        ),
+    )
+    storage.mark_analysis_queued(second.id, 10)
+    storage.save_change_analysis(second.id, 8, None)
+    homepage_analysis = ChangeAnalysisResult(
+        summary="Front-page rankings changed.", marketing=marketing, product=product, research_and_development=research
+    )
+    storage.save_change_analysis(
+        first.id,
+        9,
+        ChangeAnalysisResult(
+            summary="Formatting changed.", marketing=product, product=product, research_and_development=product
+        ),
+    )
+    storage.save_team_interests(TeamInterests(product="New feature announcements"))
+    storage.set_article_feed(source_id=first.competitor_id, url="https://first.example/feed.xml", discovery_only=True)
+    assert (discovery_home.id, 11) not in storage.list_unqueued_changes()
+    assert storage.get_change_for_analysis(discovery_home.id, 11) is None
+    assert storage.get_change_for_analysis(first.id, 10) is not None
+    storage.save_change_analysis(discovery_home.id, 11, homepage_analysis)
+
+    with TestClient(app) as client:
+        response = client.get("/api/digest")
+        held = client.get("/api/digest", params={"view": "held"})
+        homepage_changes = client.get(f"/api/pages/{discovery_home.id}/changes")
+        other_changes = client.get(f"/api/pages/{first.id}/changes")
+        history = client.get(f"/api/pages/{discovery_home.id}/analysis")
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == [
+        {
+            "page_id": first.id,
+            "version": "10",
+            "source_name": "First",
+            "page_url": first.url,
+            "status": "completed",
+            "summary": "Pricing changed.",
+            "relevant_teams": ["marketing", "research_and_development"],
+            "team_reasons": {"marketing": "Pricing changed", "research_and_development": "API terms changed"},
+        },
+    ]
+    assert held.status_code == HTTPStatus.OK
+    assert held.json() == [
+        {
+            "page_id": discovery_home.id,
+            "version": "11",
+            "source_name": "First",
+            "page_url": discovery_home.url,
+            "status": "completed",
+            "summary": "Front-page rankings changed.",
+            "relevant_teams": [],
+            "team_reasons": {},
+            "hold_reason": "discovery_only",
+        },
+        {
+            "page_id": second.id,
+            "version": "10",
+            "source_name": "Second",
+            "page_url": second.url,
+            "status": "queued",
+            "summary": None,
+            "relevant_teams": [],
+            "team_reasons": {},
+        },
+        {
+            "page_id": first.id,
+            "version": "9",
+            "source_name": "First",
+            "page_url": first.url,
+            "status": "completed",
+            "summary": "Formatting changed.",
+            "relevant_teams": [],
+            "team_reasons": {},
+        },
+        {
+            "page_id": second.id,
+            "version": "8",
+            "source_name": "Second",
+            "page_url": second.url,
+            "status": "failed",
+            "summary": None,
+            "relevant_teams": [],
+            "team_reasons": {},
+        },
+    ]
+
+    assert homepage_changes.status_code == other_changes.status_code == HTTPStatus.OK
+    assert homepage_changes.headers["X-SignalWatch-Hold-Reason"] == "discovery_only"
+    assert "X-SignalWatch-Hold-Reason" not in other_changes.headers
+    assert homepage_changes.json() == [{"version": "11", "before": "old snapshot", "after": "new snapshot"}]
+    assert history.json()["11"] == {"status": "completed", "result": homepage_analysis.model_dump()}
+
+
+def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    source = storage.save_competitor("Releases", "https://releases.example/")
+    settings_url = f"{_ARTICLE_FEEDS}/{source.id}"
+    first_feed = storage.ArticleFeed(source.id, "https://releases.example/feed.xml")
+    next_feed = storage.ArticleFeed(source.id, "https://releases.example/new-feed.xml")
+    entry = {"source_id": source.id, "source_name": source.name, "website": source.website}
+    new_article = storage.Article("New release", "https://publisher.example/release")
+    next_baseline = storage.Article("Already in the new feed", "https://publisher.example/previous")
+    stale = storage.Article("From the previous feed", "https://publisher.example/stale")
+
+    with TestClient(app) as client:
+        disabled = {**entry, "url": None, "discovery_only": False}
+        assert client.get(_ARTICLE_FEEDS).json() == [disabled]
+        response = client.put(settings_url, json={"url": "http://127.0.0.1/rss", "discovery_only": False})
+        assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+        response = client.put(f"{_ARTICLE_FEEDS}/{source.id + 1}", json={"url": None, "discovery_only": False})
+        assert response.status_code == HTTPStatus.NOT_FOUND
+        enabled = {"url": first_feed.url, "discovery_only": True}
+        response = client.put(settings_url, json=enabled)
+        assert response.status_code == HTTPStatus.OK
+        assert response.json() == entry | enabled
+        assert client.get(_ARTICLE_FEEDS).json() == [entry | enabled]
+        assert storage.list_article_feeds() == [first_feed]
+
+        storage.save_discovered_articles(first_feed, [])
+        assert client.get("/api/digest", params={"view": "held"}).json() == []
+        storage.save_discovered_articles(first_feed, [new_article])
+
+        assert client.put(settings_url, json={**enabled, "url": next_feed.url}).status_code == HTTPStatus.OK
+        storage.save_discovered_articles(next_feed, [next_baseline])
+        storage.save_discovered_articles(first_feed, [stale])
+        assert client.put(settings_url, json={"url": None, "discovery_only": True}).json() == disabled
+        storage.save_discovered_articles(next_feed, [stale])
+        assert storage.list_article_feeds() == []
+        assert storage.list_unqueued_articles() == [(source.id, new_article.article_url)]
+        held = client.get("/api/digest", params={"view": "held"}).json()
+        assert [(item["article_url"], item["status"]) for item in held] == [(new_article.article_url, "pending")]
+
+
+def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setattr(storage, "time", lambda: 10)
+    first = storage.save_competitor("First feed", "https://first.example/")
+    second = storage.save_competitor("Second feed", "https://second.example/")
+    baseline = storage.Article("Baseline", "https://publisher.example/first")
+    article = storage.Article("A new release", "https://publisher.example/release?ref=feed")
+    for source in (first, second):
+        feed = storage.ArticleFeed(source.id, f"{source.website}feed.xml")
+        storage.set_article_feed(source_id=feed.source_id, url=feed.url, discovery_only=False)
+        storage.save_discovered_articles(feed, [baseline])
+        storage.save_discovered_articles(feed, [baseline, article, article])
+    assert storage.list_unqueued_articles() == [(first.id, article.article_url), (second.id, article.article_url)]
+
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+    product = TeamDecision(relevant=True, reason="Review the rollout options", quote="Publisher evidence")
+    result = ChangeAnalysisResult(summary=article.title, marketing=held, product=product, research_and_development=held)
+    storage.save_article_analysis(first.id, article.article_url, result)
+    storage.save_article_analysis(second.id, article.article_url, result.model_copy(update={"product": held}))
+    expected = {
+        "kind": "article",
+        "title": article.title,
+        "article_url": article.article_url,
+        "version": "10",
+        "status": "completed",
+        "summary": article.title,
+    }
+    held_article = {
+        **expected,
+        "source_id": second.id,
+        "source_name": second.name,
+        "relevant_teams": [],
+        "team_reasons": {"marketing": held.reason, "product": held.reason, "research_and_development": held.reason},
+    }
+
+    with TestClient(app) as client:
+        assert client.get("/api/digest").json() == [
+            {
+                **expected,
+                "source_id": first.id,
+                "source_name": first.name,
+                "relevant_teams": ["product"],
+                "team_reasons": {"product": product.reason},
+            }
+        ]
+        assert client.get("/api/digest", params={"view": "held"}).json() == [held_article]
+        assert client.delete(f"/api/competitors/{first.id}").status_code == HTTPStatus.NO_CONTENT
+        assert client.get("/api/digest").json() == []
+        assert client.get("/api/digest", params={"view": "held"}).json() == [held_article]
+    assert storage.get_discovered_article(first.id, article.article_url) is None
+    assert storage.list_article_feeds() == [storage.ArticleFeed(second.id, f"{second.website}feed.xml")]
 
 
 def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,6 +445,47 @@ def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
     with sqlite3.connect(db_path) as database:
         assert database.execute("SELECT COUNT(*) FROM page_changes").fetchone() == (0,)
         assert database.execute("SELECT COUNT(*) FROM history_gaps").fetchone() == (0,)
+
+
+def test_legacy_migrations_preserve_saved_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    storage.save_page_version(page_id=page.id, watch_id=_WATCH_ID, version=10, before="Before", after="After")
+    storage.record_history_gap(page.id, _WATCH_ID)
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+    analysis = ChangeAnalysisResult(summary="A change", marketing=held, product=held, research_and_development=held)
+    storage.save_change_analysis(page.id, 10, analysis)
+
+    with sqlite3.connect(db_path) as database:
+        legacy_pages_schema = storage._PAGES_SCHEMA.replace(" AUTOINCREMENT", "")
+        database.executescript(f"""
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE legacy_pages {legacy_pages_schema};
+            INSERT INTO legacy_pages SELECT * FROM pages;
+            DROP TABLE pages;
+            ALTER TABLE legacy_pages RENAME TO pages;
+            CREATE TABLE legacy_page_changes (
+                page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+                version TEXT NOT NULL, before TEXT NOT NULL, after TEXT NOT NULL, PRIMARY KEY (page_id, version)
+            );
+            INSERT INTO legacy_page_changes SELECT * FROM page_changes;
+            DROP TABLE page_changes;
+            ALTER TABLE legacy_page_changes RENAME TO page_changes;
+        """)
+
+    with TestClient(app) as client:
+        changes = client.get(f"/api/pages/{page.id}/changes")
+        assert changes.json() == [{"version": "10", "before": "Before", "after": "After"}]
+        assert changes.headers[_HISTORY_GAP_HEADER] == "true"
+        assert client.get(f"/api/pages/{page.id}/analysis").json() == {
+            "10": {"status": "completed", "result": analysis.model_dump()}
+        }
+
+    with sqlite3.connect(db_path) as database:
+        assert database.execute("SELECT typeof(version) FROM page_changes").fetchone() == ("integer",)
+        assert database.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 @pytest.mark.parametrize("empty_history", [False, True])
