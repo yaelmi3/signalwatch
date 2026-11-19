@@ -1,0 +1,100 @@
+name: signalwatch
+
+x-signalwatch: &signalwatch
+  image: ${SIGNALWATCH_IMAGE:?Set SIGNALWATCH_IMAGE to the loaded release image}
+  platform: linux/amd64
+  pull_policy: never
+  restart: unless-stopped
+  volumes:
+    - type: bind
+      source: ${SIGNALWATCH_STATE_DIR:?Set SIGNALWATCH_STATE_DIR to the persistent disk mount}/app
+      target: /state
+      bind:
+        create_host_path: false
+
+services:
+  app:
+    <<: *signalwatch
+    environment:
+      SIGNALWATCH_DB_PATH: /state/configuration.sqlite3
+      CHANGEDETECTION_URL: http://changedetection:5000
+      SIGNALWATCH_WEBHOOK_URL: http://signalwatch-hook:8000/api/webhooks/changedetection
+      CHANGEDETECTION_API_KEY: ${CHANGEDETECTION_API_KEY:?Set the changedetection API key}
+      CHANGEDETECTION_WEBHOOK_SECRET: ${CHANGEDETECTION_WEBHOOK_SECRET:?Set the webhook secret}
+    ports:
+      - "127.0.0.1:8001:8000"
+    networks:
+      default:
+        aliases: [signalwatch-hook]
+    depends_on:
+      changedetection:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/competitors', timeout=3).close()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    <<: *signalwatch
+    command: ["python", "-m", "signalwatch.analysis_worker"]
+    stop_grace_period: 90s
+    environment:
+      SIGNALWATCH_DB_PATH: /state/configuration.sqlite3
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set the analysis API key}
+      SIGNALWATCH_ANALYSIS_MODEL: ${SIGNALWATCH_ANALYSIS_MODEL:?Set the analysis model}
+      SIGNALWATCH_ANALYSIS_HIGHER_QUALITY_MODEL: ${SIGNALWATCH_ANALYSIS_HIGHER_QUALITY_MODEL:?Set the higher quality model}
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sqlite3
+          path = "file:/state/configuration.sqlite3.analysis.sqlite3?mode=ro"
+          with sqlite3.connect(path, uri=True, timeout=2) as db:
+              if db.execute("SELECT 1 FROM queues WHERE name = 'page-analysis'").fetchone() is None:
+                  raise SystemExit(1)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  changedetection:
+    image: ghcr.io/dgtlmoon/changedetection.io:0.70.3@sha256:47b1e9cc3eff820e6022b655e3fcc948625f60c1770ae8b9c30aa3bf104dc255
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      NETRC: /run/changedetection.netrc
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - type: bind
+        source: ${SIGNALWATCH_STATE_DIR:?Set SIGNALWATCH_STATE_DIR to the persistent disk mount}/changedetection
+        target: /datastore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/signalwatch/changedetection.netrc
+        target: /run/changedetection.netrc
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/', timeout=3).close()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
