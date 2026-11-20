@@ -98,11 +98,11 @@ Set these server variables on the app and worker:
 | `SIGNALWATCH_SLACK_MAINTAINER_PASSWORD` | Strong random passphrase for Slack setup |
 | `SIGNALWATCH_SLACK_ENCRYPTION_KEY` | Private Fernet key, generated with `cryptography.fernet.Fernet.generate_key()` |
 
-In **Maintainer settings**, unlock **Slack delivery**, connect the workspace, and save channels for Marketing, Product,
-and R&D. Test the saved channels, then enable delivery. Teams can share a channel, and each item posts once per matching
-channel with the reasons for its assigned teams. Leave a team unassigned to skip its Slack notifications. The worker
-picks up saved settings while running. Keep the encryption key separate from SQLite backups. Changing the key requires
-reconnecting Slack.
+In **Maintainer settings → Slack delivery**, use the setup passphrase to connect a workspace. Once connected, anyone
+with access to SignalWatch can select public Slack channels for Marketing, Product, and R&D, send test messages,
+and enable delivery. Teams can share a channel, and each item posts once per matching channel with the reasons
+for its assigned teams. Leave a team unassigned to skip its Slack notifications. The worker picks up saved settings
+while running. Keep the encryption key separate from SQLite backups. Changing the key requires reconnecting Slack.
 
 For environment-only delivery, leave the five OAuth variables unset and set `SIGNALWATCH_SLACK_BOT_TOKEN` and
 `SIGNALWATCH_SLACK_CHANNEL_ID` on the worker with the bot's `chat:write` scope and channel membership. This uses the
