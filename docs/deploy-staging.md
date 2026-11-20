@@ -64,24 +64,27 @@ printf 'machine signalwatch-hook\n  login signalwatch\n  password %s\n' "$token"
 SETUP
 ```
 
-On your workstation, set `VM` and `ZONE` to the instance name and zone. Copy the checked-out `compose.yaml` to the VM.
+On your workstation, set `VM` and `ZONE` to the instance name and zone. Build and copy the detector proxy with `compose.yaml`.
 
 ```bash
+docker build --platform linux/amd64 --target detector-egress --tag signalwatch-detector-egress:0.1.0 .
+docker save signalwatch-detector-egress:0.1.0 | gzip > /tmp/signalwatch-detector-egress.tar.gz
 gcloud compute scp --project="$PROJECT_ID" --zone="$ZONE" --tunnel-through-iap \
-  compose.yaml "$VM:~/signalwatch-bootstrap.yaml"
+  compose.yaml /tmp/signalwatch-detector-egress.tar.gz "$VM:~/"
 ```
 
-From a shell on the VM, start only changedetection.io against the persistent disk. The temporary values satisfy Compose interpolation for the app and worker, which start on the first deploy.
+From a shell on the VM, start changedetection.io and its proxy against the persistent disk. The temporary values satisfy Compose interpolation for the app and worker, which start on the first deploy.
 
 ```bash
 sudo install -d -o 10001 -g 10001 -m 0700 /var/lib/signalwatch/app
 sudo install -d -m 0700 /var/lib/signalwatch/changedetection
+gzip -dc "$HOME/signalwatch-detector-egress.tar.gz" | sudo docker load
 sudo env SIGNALWATCH_IMAGE=signalwatch:bootstrap SIGNALWATCH_STATE_DIR=/var/lib/signalwatch \
   CHANGEDETECTION_API_KEY=bootstrap OPENAI_API_KEY=bootstrap \
   SIGNALWATCH_ANALYSIS_MODEL=bootstrap SIGNALWATCH_ANALYSIS_HIGHER_QUALITY_MODEL=bootstrap \
   docker compose --project-name signalwatch --env-file /opt/signalwatch/staging.env \
-  --file "$HOME/signalwatch-bootstrap.yaml" \
-  up -d --no-deps changedetection
+  --file "$HOME/compose.yaml" \
+  up -d changedetection
 ```
 
 From your workstation, forward both loopback ports over IAP SSH. Keep the session open while using the web interfaces.

@@ -57,7 +57,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Build and compress the app image
+      - name: Build and compress the app and detector proxy images
         if: steps.staging.outputs.enabled == 'true'
         shell: bash
         run: |
@@ -66,7 +66,8 @@ jobs:
             exit 1
           fi
           docker build --platform linux/amd64 --tag "signalwatch:$GITHUB_SHA" .
-          docker save "signalwatch:$GITHUB_SHA" | gzip > "$RUNNER_TEMP/image.tar.gz"
+          docker build --platform linux/amd64 --target detector-egress --tag signalwatch-detector-egress:0.1.0 .
+          docker save "signalwatch:$GITHUB_SHA" signalwatch-detector-egress:0.1.0 | gzip > "$RUNNER_TEMP/image.tar.gz"
 
       - name: Authenticate to Google Cloud
         if: steps.staging.outputs.enabled == 'true'
@@ -92,8 +93,10 @@ jobs:
           CLOUDSDK_CORE_ACCOUNT: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
         run: |
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          ssh_key="$RUNNER_TEMP/signalwatch-ssh"
+          ssh-keygen -q -t rsa -N '' -f "$ssh_key"
           connection=(--project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --tunnel-through-iap
-                      --ssh-key-expire-after=1h --quiet)
+                      --ssh-key-file="$ssh_key" --ssh-key-expire-after=1h --quiet)
           upload_dir="$(gcloud compute ssh "$GCP_VM" "${connection[@]}" \
             --command='mktemp -d /tmp/signalwatch.XXXXXXXX')"
           if [[ ! "$upload_dir" =~ ^/tmp/signalwatch\.[a-zA-Z0-9]{8}$ ]]; then
