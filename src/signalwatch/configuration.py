@@ -50,7 +50,6 @@ class PageInput(BaseModel):
 
 class ArticleFeedInput(BaseModel):
     url: Annotated[MonitoredUrl, AfterValidator(_check_article_feed_url)] | None = None
-    discovery_only: bool
 
 
 def _page(page_id: int) -> Page:
@@ -167,8 +166,6 @@ def page_changes(page_id: int, response: Response) -> list[storage.PageChange]:
     changes = storage.list_page_changes(page_id)
     if page.watch_id is not None and storage.has_history_gap(page_id, page.watch_id):
         response.headers["X-SignalWatch-History-Gap"] = "true"
-    if storage.is_discovery_only_page(page_id):
-        response.headers["X-SignalWatch-Hold-Reason"] = "discovery_only"
     return changes
 
 
@@ -199,7 +196,6 @@ def set_article_feed(source_id: int, payload: ArticleFeedInput) -> ArticleFeedSe
     settings = storage.set_article_feed(
         source_id=source_id,
         url=str(payload.url) if payload.url is not None else None,
-        discovery_only=payload.discovery_only,
     )
     if settings is None:
         raise HTTPException(HTTPStatus.NOT_FOUND, "Source not found.")

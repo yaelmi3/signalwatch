@@ -79,8 +79,8 @@ at startup and every five minutes. The first successful poll records the baselin
 Later discoveries are analyzed from the original publisher page. Relevant articles link directly to the publisher,
 and Held shows why each team passed on an analyzed article.
 
-Select **Use the first page for discovery only** if that page serves as an article listing. Other watched pages under
-the source are still analyzed. Clearing the feed URL stops discovery and preserves the source's article history.
+RSS discovery runs alongside watched-page analysis. Saved edits to any watched page go through the same team relevance
+check. Clearing the feed URL stops discovery and preserves the source's article history.
 
 ### Optional Slack delivery
 

@@ -39,7 +39,7 @@ def test_worker_retries_handoff_and_limits_model_calls(
     unreadable = storage.Article(title="Blocked article", article_url="https://1.1.1.1/blocked")
     for name in ("Engineering", "Technology"):
         source = storage.save_competitor(name, f"https://{name.lower()}.test/")
-        storage.set_article_feed(source_id=source.id, url=f"https://{name.lower()}.test/feed", discovery_only=False)
+        storage.set_article_feed(source_id=source.id, url=f"https://{name.lower()}.test/feed")
     feeds = storage.list_article_feeds()
     for feed in feeds:
         storage.save_discovered_articles(feed, [baseline])
