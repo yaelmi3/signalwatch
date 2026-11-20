@@ -29,8 +29,9 @@ type SlackStatus = {
   authenticated: boolean;
   connected: boolean;
   workspace_name: string | null;
-  channel_id: string | null;
+  team_channels: SlackTeamChannels;
   enabled: boolean;
+  revision: string | null;
 };
 type SlackChannel = { id: string; name: string };
 type AnalysisSettings = { quality: "economy" | "higher_quality" };
@@ -56,6 +57,7 @@ const analysisTeams = [
   ["research_and_development", "R&D"],
 ] as const;
 type TeamKey = (typeof analysisTeams)[number][0];
+type SlackTeamChannels = Partial<Record<TeamKey, string>>;
 type TeamInterests = Record<TeamKey | "business_context", string>;
 type DigestEntry = {
   version: string;
@@ -638,16 +640,18 @@ function SlackSettings({ callback }: { callback: string | null }) {
   const [statusAttempt, setStatusAttempt] = useState(0);
   const [channels, setChannels] = useState<SlackChannel[] | { error: string } | null>(null);
   const [channelAttempt, setChannelAttempt] = useState(0);
-  const [selectedChannel, setSelectedChannel] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{ channels: SlackTeamChannels; revision: string } | null>(null);
   const [action, setAction] = useState("");
   const [feedback, setFeedback] = useState<{ role: "status" | "alert"; text: string } | null>(null);
 
   const settings = status && "available" in status ? status : null;
   const connected = settings?.available && settings.authenticated && settings.connected;
-  const savedChannel = connected ? settings.channel_id : null;
-  const savedChannelName = Array.isArray(channels) ? channels.find((channel) => channel.id === savedChannel)?.name : null;
-  const channelId = selectedChannel ?? savedChannel ?? "";
-  const channelChanged = channelId !== (savedChannel ?? "");
+  const revision = settings?.revision ?? null;
+  const savedChannels = settings?.team_channels ?? {};
+  const draftChannels = draft?.revision === revision ? draft.channels : null;
+  const teamChannels = draftChannels ?? savedChannels;
+  const channelsChanged = analysisTeams.some(([team]) => teamChannels[team] !== savedChannels[team]);
+  const availableChannels = Array.isArray(channels) ? channels : [];
 
   useEffect(() => {
     if (callback !== "connected" && callback !== "error") return;
@@ -693,12 +697,13 @@ function SlackSettings({ callback }: { callback: string | null }) {
       setFeedback({ role: "alert", text: message(cause) });
       if (settings?.authenticated) {
         const next = await readSlackStatus();
-        if ("error" in next || !next.available || !next.authenticated || !next.connected ||
-            next.workspace_name !== settings.workspace_name) {
+        const connectionChanged = "error" in next || !next.available || !next.authenticated || !next.connected ||
+          next.workspace_name !== settings.workspace_name;
+        if (connectionChanged) {
           setChannels(null);
-          setSelectedChannel(null);
           if ("connected" in next && next.connected) setChannelAttempt((attempt) => attempt + 1);
         }
+        if (connectionChanged || next.revision !== revision) setDraft(null);
         setStatus(next);
       }
     } finally {
@@ -715,7 +720,7 @@ function SlackSettings({ callback }: { callback: string | null }) {
       await post<void>(`${slackPath}/session`, { password });
       const next = await readSlackStatus();
       setChannels(null);
-      setSelectedChannel(null);
+      setDraft(null);
       setStatus(next);
       if ("authenticated" in next && next.available && !next.authenticated) {
         throw new Error("Could not start a maintainer session. Try again.");
@@ -735,22 +740,34 @@ function SlackSettings({ callback }: { callback: string | null }) {
     });
   }
 
-  function saveDestination(destinationId: string, enabled: boolean, notice: string) {
+  function selectChannel(team: TeamKey, channel: string) {
+    if (revision === null) return;
+    setDraft((current) => {
+      const next = { ...(current?.revision === revision ? current.channels : savedChannels) };
+      if (channel) next[team] = channel;
+      else delete next[team];
+      return { channels: next, revision };
+    });
+  }
+
+  function saveChannels(destinations: SlackTeamChannels, enabled: boolean, notice: string) {
+    if (revision === null) return;
     void runAction("Saving Slack settings…", async () => {
       const next = await request<SlackStatus>(slackPath, {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ channel_id: destinationId, enabled }),
+        body: JSON.stringify({ team_channels: destinations, enabled, revision }),
       });
       setStatus(next);
-      if (destinationId === channelId) setSelectedChannel(null);
+      setDraft(channelsChanged && destinations !== draftChannels && next.revision !== null
+        ? { channels: teamChannels, revision: next.revision } : null);
       setFeedback({ role: "status", text: notice });
     });
   }
 
-  function sendTest() {
+  function sendTest(team: TeamKey, teamName: string) {
     void runAction("Sending test message…", async () => {
-      await post<void>(`${slackPath}/test`, {});
-      setFeedback({ role: "status", text: "Test message sent to the saved Slack channel." });
+      await post<void>(`${slackPath}/test`, { team });
+      setFeedback({ role: "status", text: `Test message sent to the ${teamName} channel.` });
     });
   }
 
@@ -794,39 +811,48 @@ function SlackSettings({ callback }: { callback: string | null }) {
           {Array.isArray(channels) && channels.length === 0 && (
             <p>No selectable channels. Invite the SignalWatch bot to a channel, then reload channels.</p>
           )}
-          {channels && ("error" in channels || channels.length === 0) && (
+          {channels !== null && (
             <button type="button" disabled={Boolean(action)} onClick={() => {
               setChannels(null);
               setChannelAttempt((attempt) => attempt + 1);
             }}>Reload channels</button>
           )}
-          {Array.isArray(channels) && channels.length > 0 && (
-            <form onSubmit={(event) => {
-              event.preventDefault();
-              if (channelId && channelChanged) saveDestination(channelId, false, "Channel saved. Delivery is disabled.");
-            }}>
-              <fieldset disabled={Boolean(action)}>
-                <label>Slack channel
-                  <select value={channelId} onChange={(event) => setSelectedChannel(event.target.value)}>
-                    <option value="" disabled>Select a channel</option>
-                    {savedChannel && !savedChannelName &&
-                      <option value={savedChannel}>Saved channel ({savedChannel})</option>}
-                    {channels.map((channel) => <option key={channel.id} value={channel.id}>#{channel.name}</option>)}
-                  </select>
-                </label>
-                <button type="submit" disabled={!channelChanged}>Save channel</button>
-              </fieldset>
-            </form>
-          )}
-          {savedChannel && (!Array.isArray(channels) || channels.length === 0 || channelChanged) && (
-            <p>Saved channel <strong>{savedChannelName ? `#${savedChannelName}` : savedChannel}</strong></p>
-          )}
+          <form onSubmit={(event) => {
+            event.preventDefault();
+            if (channelsChanged) saveChannels(teamChannels, false, "Channels saved. Delivery is disabled.");
+          }}>
+            <fieldset className="slack-team-channels" disabled={Boolean(action) || channels === null || revision === null}>
+              {analysisTeams.map(([team, name]) => {
+                const savedChannel = savedChannels[team];
+                const channelId = teamChannels[team];
+                const savedUnavailable = savedChannel && !availableChannels.some((channel) => channel.id === savedChannel);
+                const draftUnavailable = channelId && channelId !== savedChannel &&
+                  !availableChannels.some((channel) => channel.id === channelId);
+                return (
+                  <div className="slack-team-channel" key={team}>
+                    <label>{name} channel
+                      <select value={channelId ?? ""} onChange={(event) => selectChannel(team, event.target.value)}>
+                        <option value="">No channel</option>
+                        {savedUnavailable && <option value={savedChannel}>Saved channel ({savedChannel})</option>}
+                        {draftUnavailable && <option value={channelId} disabled>Unavailable channel ({channelId})</option>}
+                        {availableChannels.map((channel) => <option key={channel.id} value={channel.id}>#{channel.name}</option>)}
+                      </select>
+                    </label>
+                    {savedChannel && (
+                      <button type="button" disabled={channelId !== savedChannel} aria-label={`Send ${name} test message`}
+                        onClick={() => sendTest(team, name)}>Send test message</button>
+                    )}
+                  </div>
+                );
+              })}
+              <button type="submit" disabled={!channelsChanged}>Save channels</button>
+            </fieldset>
+          </form>
           <p>Delivery is {settings.enabled ? "enabled" : "disabled"}.</p>
-          {savedChannel && (
-            <fieldset aria-label="Slack delivery controls" disabled={Boolean(action) || channels === null}>
-              <button type="button" onClick={sendTest}>Send test message</button>
-              <button type="button" disabled={channelChanged && !settings.enabled} onClick={() =>
-                saveDestination(savedChannel, !settings.enabled, "Delivery settings saved.")
+          {Object.keys(savedChannels).length > 0 && (
+            <fieldset aria-label="Slack delivery controls" disabled={Boolean(action) || channels === null || revision === null}>
+              <button type="button" disabled={channelsChanged && !settings.enabled} onClick={() =>
+                saveChannels(savedChannels, !settings.enabled, "Delivery settings saved.")
               }>{settings.enabled ? "Disable delivery" : "Enable delivery"}</button>
             </fieldset>
           )}

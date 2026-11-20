@@ -98,16 +98,19 @@ Set these server variables on the app and worker:
 | `SIGNALWATCH_SLACK_MAINTAINER_PASSWORD` | Strong random passphrase for Slack setup |
 | `SIGNALWATCH_SLACK_ENCRYPTION_KEY` | Private Fernet key, generated with `cryptography.fernet.Fernet.generate_key()` |
 
-In **Maintainer settings**, unlock **Slack delivery**, connect the workspace, save a channel the bot has joined, send
-a test, then enable delivery. The test works while delivery is disabled. The worker picks up saved settings while
-running. Keep the encryption key separate from SQLite backups. Changing the key requires reconnecting Slack.
+In **Maintainer settings**, unlock **Slack delivery**, connect the workspace, and save channels for Marketing, Product,
+and R&D. Test the saved channels, then enable delivery. Teams can share a channel, and each item posts once per matching
+channel with the reasons for its assigned teams. Leave a team unassigned to skip its Slack notifications. The worker
+picks up saved settings while running. Keep the encryption key separate from SQLite backups. Changing the key requires
+reconnecting Slack.
 
 For environment-only delivery, leave the five OAuth variables unset and set `SIGNALWATCH_SLACK_BOT_TOKEN` and
-`SIGNALWATCH_SLACK_CHANNEL_ID` on the worker with the bot's `chat:write` scope and channel membership. Leave all
-Slack variables unset to disable delivery. Only newly completed analyses that qualify for Digest create a delivery.
-Pending posts keep their original channel ID and send only while that channel is enabled.
+`SIGNALWATCH_SLACK_CHANNEL_ID` on the worker with the bot's `chat:write` scope and channel membership. This uses the
+same channel for all teams. Leave all Slack variables unset to disable delivery. Only newly completed analyses that
+qualify for Digest create a delivery.
+Pending posts keep their original channel and include teams still assigned to it when delivery is enabled.
 
-The worker records one send attempt per item. Rejections, rate limits, and uncertain outcomes are logged and
+The worker records one send attempt per item and channel. Rejections, rate limits, and uncertain outcomes are logged and
 recorded in `slack_deliveries`. Review the recorded error and check the channel before resending manually.
 A timeout or interruption can leave the result uncertain even if Slack accepted the message.
 

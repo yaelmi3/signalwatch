@@ -58,7 +58,7 @@ def test_worker_retries_handoff_and_limits_model_calls(
         research_and_development=held,
     )
     storage.save_change_analysis(page.id, 0, old_result)
-    storage.save_change_analysis(page.id, 0, old_result, slack_channel="C_TEST")
+    storage.save_change_analysis(page.id, 0, old_result, slack_channels=slack_delivery.configured_channels())
 
     original_mark = storage.mark_analysis_queued
     handoffs: Counter[int] = Counter()
@@ -253,6 +253,7 @@ def test_slack_rejections_and_ambiguous_outcomes_are_terminal(
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(app_db))
     page = storage.save_competitor("Example", "https://example.test/").pages[0]
     storage.link_watch(page.id, "test-watch")
+    channels = {storage.DigestTeam.PRODUCT: "C_TEST"}
     held = TeamDecision(relevant=False, reason="No match.", quote=None)
     result = ChangeAnalysisResult(
         summary="New release",
@@ -264,7 +265,7 @@ def test_slack_rejections_and_ambiguous_outcomes_are_terminal(
         assert storage.save_page_version(
             page_id=page.id, watch_id="test-watch", version=version, before="Old", after="New"
         )
-        storage.save_change_analysis(page.id, version, result, slack_channel="C_TEST")
+        storage.save_change_analysis(page.id, version, result, slack_channels=channels)
 
     attempts = []
 
@@ -280,7 +281,7 @@ def test_slack_rejections_and_ambiguous_outcomes_are_terminal(
             super().__init__(transport=httpx2.MockTransport(respond), **kwargs)
 
     monkeypatch.setattr(httpx2, "Client", TestClient)
-    settings = slack_delivery.SlackSettings("C_TEST", "fake-slack-token")
+    settings = slack_delivery.SlackSettings(channels, "fake-slack-token")
     for _ in range(3):
         slack_delivery.send_next(settings)
     assert len(attempts) == 2
@@ -291,6 +292,61 @@ def test_slack_rejections_and_ambiguous_outcomes_are_terminal(
         ]
     logs = capfd.readouterr()
     assert "private-text" not in logs.out + logs.err and "fake-slack-token" not in logs.out + logs.err
+
+
+def test_slack_migrates_saved_channel_and_groups_team_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_db = tmp_path / "app.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(app_db))
+    page = storage.save_competitor("Example", "https://example.test/").pages[0]
+    storage.link_watch(page.id, "test-watch")
+    result = ChangeAnalysisResult(
+        summary="New release",
+        marketing=TeamDecision(relevant=True, reason="New positioning.", quote="New"),
+        product=TeamDecision(relevant=True, reason="New feature.", quote="New"),
+        research_and_development=TeamDecision(relevant=True, reason="New API.", quote="New"),
+    )
+    for version in (1, 2, 3):
+        storage.save_page_version(page_id=page.id, watch_id="test-watch", version=version, before="Old", after="New")
+    storage.save_change_analysis(page.id, 1, result)
+    storage.save_change_analysis(page.id, 2, result)
+    with sqlite3.connect(app_db) as db:
+        db.executescript("""
+            DROP TABLE slack_connection;
+            CREATE TABLE slack_connection (id INTEGER PRIMARY KEY, workspace_name TEXT, encrypted_token TEXT,
+                                           channel_id TEXT, enabled INTEGER);
+            INSERT INTO slack_connection VALUES (1, 'Test', 'encrypted', 'C_OLD', 1);
+            DROP TABLE slack_deliveries;
+            CREATE TABLE slack_deliveries (id INTEGER PRIMARY KEY, channel_id TEXT, page_id INTEGER, version INTEGER,
+                                           source_id INTEGER, article_url TEXT, status TEXT, error TEXT,
+                                           UNIQUE (page_id, version), UNIQUE (source_id, article_url));
+            """)
+        db.executemany(
+            "INSERT INTO slack_deliveries VALUES (?, 'C_OLD', ?, ?, NULL, NULL, ?, NULL)",
+            [(1, page.id, 1, "sent"), (2, page.id, 2, "pending")],
+        )
+
+    connection = storage.get_slack_connection()
+    assert connection and connection.enabled and connection.team_channels == dict.fromkeys(storage.DigestTeam, "C_OLD")
+    posts: list[tuple[str, str]] = []
+    monkeypatch.setattr(slack_delivery, "post_message", lambda channel, token, text: posts.append((channel, text)))
+    slack_delivery.send_next(slack_delivery.SlackSettings(connection.team_channels, "fake", connection))
+    assert [channel for channel, _ in posts] == ["C_OLD"]
+
+    channels = dict(zip(storage.DigestTeam, ("C_SHARED", "C_SHARED", "C_RD"), strict=True))
+    connection = storage.save_slack_destination(connection, channels, True)
+    assert connection is not None
+    storage.save_change_analysis(page.id, 3, result, slack_channels=channels)
+    storage.save_change_analysis(page.id, 3, result, slack_channels=channels)
+    for _ in range(3):
+        slack_delivery.send_next(slack_delivery.SlackSettings(channels, "fake", connection))
+
+    assert [channel for channel, _ in posts] == ["C_OLD", "C_SHARED", "C_RD"]
+    assert posts[1][1].splitlines()[3:-2] == ["Marketing: New positioning.", "Product: New feature."]
+    assert posts[2][1].splitlines()[3:-2] == ["R&D: New API."]
+    with sqlite3.connect(app_db) as db:
+        assert db.execute("SELECT id, status FROM slack_deliveries ORDER BY id").fetchall() == [
+            (1, "sent"), (2, "sent"), (3, "sent"), (4, "sent"),
+        ]
 
 
 @pytest.mark.parametrize(
