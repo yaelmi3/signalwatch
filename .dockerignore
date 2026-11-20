@@ -1,0 +1,14 @@
+**
+!pyproject.toml
+!uv.lock
+!frontend/
+!frontend/index.html
+!frontend/package.json
+!frontend/pnpm-lock.yaml
+!frontend/tsconfig.json
+!frontend/vite.config.ts
+!frontend/src/
+!frontend/src/**
+!src/
+!src/signalwatch/
+!src/signalwatch/*.py

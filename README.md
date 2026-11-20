@@ -4,6 +4,8 @@ Competitor content monitoring with audience-specific insights.
 
 [Draft technical design](docs/technical_design_records/0001_signalwatch.md)
 
+[Staging deployment](docs/deploy-staging.md)
+
 FastAPI serves the compiled React frontend and API docs from one origin.
 
 ## Local setup

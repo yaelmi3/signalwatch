@@ -1,0 +1,113 @@
+name: Deploy staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: signalwatch-staging
+  queue: max
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_ZONE: ${{ vars.GCP_ZONE }}
+      GCP_VM: ${{ vars.GCP_VM }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+    steps:
+      - name: Check staging configuration
+        id: staging
+        shell: bash
+        run: |
+          if [[ -z "$GCP_VM" ]]; then
+            echo '::notice::Staging is disabled. Set GCP_VM after completing staging setup.'
+            exit 0
+          fi
+
+          require_match() {
+            local name="$1" pattern="$2"
+            if [[ ! "${!name}" =~ $pattern ]]; then
+              echo "::error::$name is missing or invalid in the staging environment."
+              exit 1
+            fi
+          }
+
+          require_match GCP_VM '^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$'
+          require_match GCP_PROJECT_ID '^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
+          require_match GCP_ZONE '^[a-z]+(-[a-z]+)+[0-9]+-[a-z]$'
+          require_match GCP_WORKLOAD_IDENTITY_PROVIDER '^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$'
+          require_match GCP_DEPLOY_SERVICE_ACCOUNT "^[a-z][a-z0-9-]{4,28}[a-z0-9]@${GCP_PROJECT_ID}\.iam\.gserviceaccount\.com$"
+          printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
+
+      - name: Check out deployment commit
+        if: steps.staging.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build and compress the app image
+        if: steps.staging.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo '::error::The checkout does not match the full deployment commit SHA.'
+            exit 1
+          fi
+          docker build --platform linux/amd64 --tag "signalwatch:$GITHUB_SHA" .
+          docker save "signalwatch:$GITHUB_SHA" | gzip > "$RUNNER_TEMP/image.tar.gz"
+
+      - name: Authenticate to Google Cloud
+        if: steps.staging.outputs.enabled == 'true'
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Set up the Google Cloud CLI
+        if: steps.staging.outputs.enabled == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          skip_install: true
+
+      - name: Upload and deploy over IAP
+        if: steps.staging.outputs.enabled == 'true'
+        shell: bash
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          CLOUDSDK_CORE_ACCOUNT: ${{ env.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          connection=(--project="$GCP_PROJECT_ID" --zone="$GCP_ZONE" --tunnel-through-iap
+                      --ssh-key-expire-after=1h --quiet)
+          upload_dir="$(gcloud compute ssh "$GCP_VM" "${connection[@]}" \
+            --command='mktemp -d /tmp/signalwatch.XXXXXXXX')"
+          if [[ ! "$upload_dir" =~ ^/tmp/signalwatch\.[a-zA-Z0-9]{8}$ ]]; then
+            echo '::error::The VM returned an invalid upload directory.'
+            exit 1
+          fi
+          connection+=(--strict-host-key-checking=yes)
+
+          if ! gcloud compute scp "${connection[@]}" deploy/staging/deploy.sh compose.yaml \
+            "$RUNNER_TEMP/image.tar.gz" "$GCP_VM:$upload_dir/"; then
+            gcloud compute ssh "$GCP_VM" "${connection[@]}" --command="rm -rf -- '$upload_dir'" || true
+            exit 1
+          fi
+
+          gcloud compute ssh "$GCP_VM" "${connection[@]}" --command="
+            trap \"rm -rf -- '$upload_dir'\" EXIT
+            sudo -n bash '$upload_dir/deploy.sh' '$GITHUB_SHA' '$upload_dir'"
