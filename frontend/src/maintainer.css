@@ -1,0 +1,118 @@
+.maintainer-page {
+  container: maintainer / inline-size;
+}
+
+.maintainer-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.maintainer-grid > .panel {
+  min-width: 0;
+  margin: 0;
+}
+
+.analysis-quality {
+  max-width: 16rem;
+  margin-top: 0.75rem;
+}
+
+.analysis-quality select,
+.slack-team-channel select {
+  width: 100%;
+  min-width: 0;
+}
+
+.slack-settings .slack-passphrase {
+  max-width: 30rem;
+}
+
+.slack-passphrase fieldset {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.slack-channels-heading {
+  margin-block: 1rem 0;
+  padding-block: 0.75rem;
+  border-top: 1px solid var(--rule);
+}
+
+.slack-channels-heading h3 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.configuration .slack-team-channels {
+  display: grid;
+  align-items: stretch;
+  gap: 0;
+}
+
+.slack-team-channel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem 1rem;
+  min-width: 0;
+  padding-block: 0.65rem;
+  border-top: 1px solid var(--rule);
+}
+
+.slack-team-channel > label {
+  min-width: 0;
+}
+
+.slack-team-channels > button {
+  justify-self: start;
+  margin-top: 0.25rem;
+}
+
+.slack-delivery-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--rule);
+}
+
+.slack-delivery-footer > p {
+  margin: 0;
+}
+
+.article-feed-form {
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--rule);
+  overflow-wrap: anywhere;
+}
+
+.article-feed-form legend {
+  padding: 0 0 0.5rem;
+  font-weight: 650;
+}
+
+.article-feed-form label {
+  min-width: 0;
+}
+
+@container maintainer (min-width: 45rem) {
+  .maintainer-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .slack-settings,
+  .article-discovery-settings {
+    grid-column: 1 / -1;
+  }
+
+  .slack-team-channel > label {
+    grid-template-columns: 9rem minmax(0, 25rem);
+    align-items: center;
+    gap: 1rem;
+  }
+}
