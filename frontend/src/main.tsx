@@ -1,6 +1,7 @@
 import { StrictMode, useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
+import "./maintainer.css";
 
 type Page = {
   id: number;
@@ -217,7 +218,7 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
 
   return (
     <div className="history-layout">
-      <div className="history-sidebar">
+      <div className="history-sidebar panel">
         <h2>Change history</h2>
         <button type="button" disabled={loading} onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
           Refresh changes
@@ -247,7 +248,7 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
         )}
       </div>
       {selected && (
-        <article className="history-detail" aria-label="Selected change">
+        <article className="history-detail panel" aria-label="Selected change">
           <div className="history-meta">
             <ChangeTime version={selected.version} />
             <a href={pageUrl}>Open source page</a>
@@ -285,7 +286,7 @@ function DeleteConfirmation({ kind, target, disabled, deleting, onConfirm }: {
 
   return (
     <>
-      <button type="button" disabled={disabled || deleting} aria-label={`${label} ${target}`}
+      <button className="button-danger" type="button" disabled={disabled || deleting} aria-label={`${label} ${target}`}
         onClick={() => {
           dialog.current?.showModal();
           cancel.current?.focus();
@@ -343,10 +344,18 @@ function PageItem({ page, onChange, onDelete, disabled }: {
 
   return (
     <li className="page-item">
-      <p className="page-url">{page.url}</p>
-      <p className="muted">{pageStates[page.state]}</p>
+      <div className="page-item-heading">
+        <p className="page-url">{page.url}</p>
+        <span className={`status-pill ${page.state === "linked" ? "positive" : "attention"}`}>
+          {pageStates[page.state]}
+        </span>
+      </div>
       {page.error && <p role="alert">{page.error}</p>}
       <div className="page-actions">
+        {page.state === "linked" && (
+          <a className="button-link" href={`/?view=history&page=${page.id}`}
+            aria-label={`Change history for ${page.url}`}>Change history</a>
+        )}
         {page.state === "pending" && (
           <button disabled={busy !== null || disabled} onClick={() => void run("connect")}>
             {busy === "connect" ? "Connecting…" : "Retry connection"}
@@ -367,9 +376,6 @@ function PageItem({ page, onChange, onDelete, disabled }: {
         <p>Check count: {status.check_count ?? "Unknown"}</p>
         {status.error && <p>{status.error}</p>}
       </div>}
-      {page.state === "linked" && (
-        <a href={`/?view=history&page=${page.id}`} aria-label={`Change history for ${page.url}`}>Change history</a>
-      )}
     </li>
   );
 }
@@ -416,9 +422,11 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
 
   return (
     <section className="competitor" aria-labelledby={`competitor-${competitor.id}`}>
-      <h2 id={`competitor-${competitor.id}`}>{competitor.name}</h2>
-      <DeleteConfirmation kind="source" target={competitor.name} disabled={busy !== null}
-        deleting={busy === "delete"} onConfirm={() => void deleteCompetitor()} />
+      <div className="panel-heading">
+        <h3 id={`competitor-${competitor.id}`}>{competitor.name}</h3>
+        <DeleteConfirmation kind="source" target={competitor.name} disabled={busy !== null}
+          deleting={busy === "delete"} onConfirm={() => void deleteCompetitor()} />
+      </div>
       {competitor.pages.length ? (
         <ul className="page-list">{competitor.pages.map((page) => (
           <PageItem key={page.id} page={page} onChange={onPage} onDelete={onDelete} disabled={busy === "delete"} />
@@ -438,14 +446,29 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
   );
 }
 
-function SiteHeader() {
+function SiteNavigation({ active, nested }: {
+  active: "digest" | "configuration" | "maintainer"; nested: boolean;
+}) {
+  const current = nested ? "true" : "page";
   return (
-    <header className="site-header">
-      <div className="brand">SignalWatch</div>
-      <nav aria-label="Resources">
-        <a href="/docs">API docs</a>
+    <aside className="site-rail">
+      <a className="brand" href="/">
+        <span className="brand-mark" aria-hidden="true" />
+        SignalWatch
+      </a>
+      <nav className="app-nav" aria-label="Main navigation">
+        <a href="/" aria-current={active === "digest" ? current : undefined}>
+          <span className="nav-icon nav-digest" aria-hidden="true" />Digest
+        </a>
+        <a href={configurationPath} aria-current={active === "configuration" ? current : undefined}>
+          <span className="nav-icon nav-configuration" aria-hidden="true" />Configuration
+        </a>
+        <a href="/?view=maintainer" aria-current={active === "maintainer" ? current : undefined}>
+          <span className="nav-icon nav-maintainer" aria-hidden="true" />Maintainer settings
+        </a>
       </nav>
-    </header>
+      <a className="docs-link" href="/docs">API docs</a>
+    </aside>
   );
 }
 
@@ -465,18 +488,27 @@ function Digest({ held }: { held: boolean }) {
   }, [held, loadAttempt]);
 
   return (
-    <main className="configuration">
-      {held && <a href="/?view=maintainer">← Maintainer settings</a>}
-      <h1>{held ? "Held items" : "Digest"}</h1>
+    <main id="main-content" tabIndex={-1} className="configuration">
+      {held && <a className="back-link" href="/?view=maintainer">← Maintainer settings</a>}
+      <div className="page-heading">
+        <div>
+          <h1>{held ? "Held items" : "Digest"}</h1>
+          <p className="muted">{held
+            ? "Review analysis status and updates held from the digest."
+            : "Updates that match your team interests."}</p>
+        </div>
+      </div>
       {error ? (
-        <>
+        <div className="panel view-state">
           <p role="alert">{held ? "Could not load held items." : "Could not load the digest."}</p>
           <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
-        </>
+        </div>
       ) : entries === null ? (
-        <p role="status">{held ? "Loading held items…" : "Loading digest…"}</p>
+        <div className="panel view-state"><p role="status">{held ? "Loading held items…" : "Loading digest…"}</p></div>
       ) : entries.length === 0 ? (
-        <p role="status">{held ? "No held items yet." : "No items match your team interests yet."}</p>
+        <div className="panel view-state">
+          <p role="status">{held ? "No held items yet." : "No items match your team interests yet."}</p>
+        </div>
       ) : (
         <ol className="digest-feed">
           {entries.map((entry) => {
@@ -497,7 +529,7 @@ function Digest({ held }: { held: boolean }) {
               `/?view=history&page=${entry.page_id}&version=${encodeURIComponent(entry.version)}${held ? "&from=held" : ""}`;
             return (
               <li key={isArticle ? `article:${entry.source_id}:${sourceUrl}` : `edit:${entry.page_id}/${entry.version}`}>
-                <article className="digest-entry">
+                <article className="panel digest-entry">
                   <header>
                     <div className="digest-entry-meta">
                       <span>{isArticle ? `Via ${entry.source_name}` : entry.source_name}</span>
@@ -506,7 +538,7 @@ function Digest({ held }: { held: boolean }) {
                     <h2>{isArticle ? entry.title : takeaway ?? "Page changed"}</h2>
                     {isArticle && takeaway && <p>{takeaway}</p>}
                     {!takeaway && !holdReason && (
-                      <p className={entry.status === "failed" ? "digest-failed" : "muted"}>
+                      <p className={entry.status === "failed" ? "error-text" : "muted"}>
                         {digestAnalysisStatus[entry.status]}
                       </p>
                     )}
@@ -565,22 +597,28 @@ function PageHistory({ pageId, requestedVersion, fromHeld }: {
   }, [loadAttempt]);
 
   return (
-    <main className="configuration history-page">
-      {fromHeld ? <a href="/?view=held">← Held items</a> : requestedVersion !== null ? <a href="/">← Digest</a> : (
-        <a href={source ? `${configurationPath}#competitor-${source.id}` : configurationPath}>← Configuration</a>
+    <main id="main-content" tabIndex={-1} className="configuration history-page">
+      {fromHeld ? <a className="back-link" href="/?view=held">← Held items</a> : requestedVersion !== null ? (
+        <a className="back-link" href="/">← Digest</a>
+      ) : (
+        <a className="back-link" href={source ? `${configurationPath}#competitor-${source.id}` : configurationPath}>
+          ← Configuration
+        </a>
       )}
-      <div className="history-heading">
-        <h1>{linked ? source.name : "Change history"}</h1>
-        {linked && <p className="page-url muted">{page.url}</p>}
+      <div className="page-heading">
+        <div>
+          <h1>{linked ? source.name : "Change history"}</h1>
+          {linked && <p className="page-url muted">{page.url}</p>}
+        </div>
       </div>
       {error ? (
-        <>
+        <div className="panel view-state">
           <p role="alert">{error}</p>
           <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
-        </>
-      ) : sources === null ? <p role="status">Loading watched page…</p> : linked ? (
+        </div>
+      ) : sources === null ? <div className="panel view-state"><p role="status">Loading watched page…</p></div> : linked ? (
         <ChangeHistory pageId={page.id} pageUrl={page.url} requestedVersion={requestedVersion} />
-      ) : <p role="status">This watched page is no longer available.</p>}
+      ) : <div className="panel view-state"><p role="status">This watched page is no longer available.</p></div>}
     </main>
   );
 }
@@ -600,26 +638,38 @@ function MaintainerSettings({ slackCallback }: { slackCallback: string | null })
   }, [loadAttempt]);
 
   return (
-    <main className="configuration">
-      <a href={configurationPath}>← Configuration</a>
-      <h1>Maintainer settings</h1>
-      <p><a href="/?view=held">Review held items</a></p>
-      <section aria-labelledby="webhooks-title">
-        <h2 id="webhooks-title">changedetection webhooks</h2>
-        {status ? (
-          <>
-            <p role="status"><strong>{status.configured ? "Webhook settings configured" : "Setup required"}</strong></p>
-            <p className="muted">{status.configured
-              ? "SignalWatch checked the format of the webhook URL and shared secret set on the server."
-              : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
-          </>
-        ) : !error && <p role="status">Loading webhook status…</p>}
-        {error && <p role="alert">{error}</p>}
-        {error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
-      </section>
-      <SlackSettings callback={slackCallback} />
-      <AnalysisQualitySettings />
-      <ArticleDiscoverySettings />
+    <main id="main-content" tabIndex={-1} className="configuration maintainer-page">
+      <header className="page-heading">
+        <div>
+          <h1>Maintainer settings</h1>
+          <p className="muted">Manage integrations and analysis for your watched sources.</p>
+        </div>
+        <div className="page-heading-actions">
+          <a className="button-link button-primary" href="/?view=held">Review held items</a>
+        </div>
+      </header>
+      <div className="maintainer-grid">
+        <section className="panel" aria-labelledby="webhooks-title">
+          <h2 id="webhooks-title">changedetection webhooks</h2>
+          {status ? (
+            <>
+              <p role="status">
+                <span className={status.configured ? "status-pill positive" : "status-pill attention"}>
+                  {status.configured ? "Webhook settings configured" : "Setup required"}
+                </span>
+              </p>
+              <p className="muted">{status.configured
+                ? "SignalWatch checked the format of the webhook URL and shared secret set on the server."
+                : "Set the SignalWatch webhook URL and shared secret on the server."}</p>
+            </>
+          ) : !error && <p role="status">Loading webhook status…</p>}
+          {error && <p role="alert">{error}</p>}
+          {error && <button type="button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
+        </section>
+        <AnalysisQualitySettings />
+        <SlackSettings callback={slackCallback} />
+        <ArticleDiscoverySettings />
+      </div>
     </main>
   );
 }
@@ -647,6 +697,7 @@ function SlackSettings({ callback }: { callback: string | null }) {
 
   const settings = status && "available" in status ? status : null;
   const connected = settings?.available && settings.connected;
+  const awaitingPassphrase = settings?.available && setupRequested && !settings.authenticated;
   const revision = settings?.revision ?? null;
   const savedChannels = settings?.team_channels ?? {};
   const draftChannels = draft?.revision === revision ? draft.channels : null;
@@ -771,8 +822,18 @@ function SlackSettings({ callback }: { callback: string | null }) {
   }
 
   return (
-    <section className="slack-settings" aria-labelledby="slack-settings-title">
-      <h2 id="slack-settings-title">Slack delivery</h2>
+    <section className="panel slack-settings" aria-labelledby="slack-settings-title">
+      <header className="panel-heading">
+        <div>
+          <h2 id="slack-settings-title">Slack delivery</h2>
+          {connected && <p className="muted">Workspace <strong>{settings.workspace_name ?? "Slack"}</strong></p>}
+        </div>
+        {settings?.available && !awaitingPassphrase && (
+          <button type="button" disabled={Boolean(action)} onClick={connect}>
+            {connected ? "Reconnect Slack" : "Connect Slack"}
+          </button>
+        )}
+      </header>
       {!action && !feedback && callback === "error" &&
         <p role="alert">Slack authorization did not complete. Try connecting again.</p>}
       {!action && !feedback && callback === "connected" && settings?.available && (
@@ -789,38 +850,39 @@ function SlackSettings({ callback }: { callback: string | null }) {
         </>
       )}
       {settings && !settings.available && <p>Slack delivery is unavailable.</p>}
-      {connected && <p>Workspace <strong>{settings.workspace_name ?? "Slack"}</strong></p>}
-      {settings?.available && (setupRequested && !settings.authenticated ? (
-        <form onSubmit={authorizeSetup} autoComplete="off">
+      {awaitingPassphrase && (
+        <form className="slack-passphrase" onSubmit={authorizeSetup} autoComplete="off">
           <fieldset disabled={Boolean(action)}>
             <label>Maintainer passphrase<input name="password" type="password" required /></label>
-            <button type="submit">Continue to Slack</button>
-            <button type="button" onClick={() => { setSetupRequested(false); setFeedback(null); }}>Cancel</button>
+            <div className="button-row">
+              <button type="submit" className="button-primary">Continue to Slack</button>
+              <button type="button" onClick={() => { setSetupRequested(false); setFeedback(null); }}>Cancel</button>
+            </div>
           </fieldset>
         </form>
-      ) : (
-        <button type="button" disabled={Boolean(action)} onClick={connect}>
-          {connected ? "Reconnect Slack" : "Connect Slack"}
-        </button>
-      ))}
+      )}
       {connected && (
         <>
+          <div className="panel-heading slack-channels-heading">
+            <h3 id="slack-channels-title">Team channels</h3>
+            {channels !== null && (
+              <button type="button" disabled={Boolean(action)} onClick={() => {
+                setChannels(null);
+                setChannelAttempt((attempt) => attempt + 1);
+              }}>Reload channels</button>
+            )}
+          </div>
           {channels === null && <p role="status">Loading Slack channels…</p>}
           {channels && "error" in channels && <p role="alert">{channels.error}</p>}
           {Array.isArray(channels) && channels.length === 0 && (
             <p>No selectable channels. Invite the SignalWatch bot to a channel, then reload channels.</p>
           )}
-          {channels !== null && (
-            <button type="button" disabled={Boolean(action)} onClick={() => {
-              setChannels(null);
-              setChannelAttempt((attempt) => attempt + 1);
-            }}>Reload channels</button>
-          )}
           <form onSubmit={(event) => {
             event.preventDefault();
             if (channelsChanged) saveChannels(teamChannels, false, "Channels saved. Delivery is disabled.");
           }}>
-            <fieldset className="slack-team-channels" disabled={Boolean(action) || channels === null || revision === null}>
+            <fieldset className="slack-team-channels" aria-labelledby="slack-channels-title"
+              disabled={Boolean(action) || channels === null || revision === null}>
               {analysisTeams.map(([team, name]) => {
                 const savedChannel = savedChannels[team];
                 const channelId = teamChannels[team];
@@ -829,7 +891,8 @@ function SlackSettings({ callback }: { callback: string | null }) {
                   !availableChannels.some((channel) => channel.id === channelId);
                 return (
                   <div className="slack-team-channel" key={team}>
-                    <label>{name} channel
+                    <label>
+                      <span>{name} channel</span>
                       <select value={channelId ?? ""} onChange={(event) => selectChannel(team, event.target.value)}>
                         <option value="">No channel</option>
                         {savedUnavailable && <option value={savedChannel}>Saved channel ({savedChannel})</option>}
@@ -844,17 +907,23 @@ function SlackSettings({ callback }: { callback: string | null }) {
                   </div>
                 );
               })}
-              <button type="submit" disabled={!channelsChanged}>Save channels</button>
+              <button type="submit" className="button-primary" disabled={!channelsChanged}>Save channels</button>
             </fieldset>
           </form>
-          <p>Delivery is {settings.enabled ? "enabled" : "disabled"}.</p>
-          {Object.keys(savedChannels).length > 0 && (
-            <fieldset aria-label="Slack delivery controls" disabled={Boolean(action) || channels === null || revision === null}>
-              <button type="button" disabled={channelsChanged && !settings.enabled} onClick={() =>
-                saveChannels(savedChannels, !settings.enabled, "Delivery settings saved.")
-              }>{settings.enabled ? "Disable delivery" : "Enable delivery"}</button>
-            </fieldset>
-          )}
+          <div className="slack-delivery-footer">
+            <p role="status">
+              <span className={settings.enabled ? "status-pill positive" : "status-pill"}>
+                Delivery is {settings.enabled ? "enabled" : "disabled"}
+              </span>
+            </p>
+            {Object.keys(savedChannels).length > 0 && (
+              <fieldset aria-label="Slack delivery controls" disabled={Boolean(action) || channels === null || revision === null}>
+                <button type="button" disabled={channelsChanged && !settings.enabled} onClick={() =>
+                  saveChannels(savedChannels, !settings.enabled, "Delivery settings saved.")
+                }>{settings.enabled ? "Disable delivery" : "Enable delivery"}</button>
+              </fieldset>
+            )}
+          </div>
         </>
       )}
       {action && <p role="status">{action}</p>}
@@ -897,18 +966,19 @@ function AnalysisQualitySettings() {
   }
 
   return (
-    <section aria-labelledby="analysis-settings-title">
+    <section className="panel analysis-settings" aria-labelledby="analysis-settings-title">
       <h2 id="analysis-settings-title">Saved page analysis</h2>
       {settings ? (
-        <label>
+        <label className="analysis-quality">
           Analysis quality
-          <select value={settings.quality} disabled={saving} onChange={(event) => void saveQuality(event.target.value)}>
+          <select value={settings.quality} disabled={saving} aria-describedby="analysis-quality-help"
+            onChange={(event) => void saveQuality(event.target.value)}>
             <option value="economy">Economy</option>
             <option value="higher_quality">Higher quality</option>
           </select>
         </label>
       ) : !error && <p role="status">Loading analysis quality…</p>}
-      <p className="muted">Applies to upcoming page analyses.</p>
+      <p className="muted" id="analysis-quality-help">Applies to upcoming page analyses.</p>
       {saving && <p role="status">Saving analysis quality…</p>}
       {error && <p role="alert">{error}</p>}
       {!settings && error && <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>}
@@ -932,7 +1002,7 @@ function ArticleDiscoverySettings() {
   }, [loadAttempt]);
 
   return (
-    <section aria-labelledby="article-discovery-title">
+    <section className="panel article-discovery-settings" aria-labelledby="article-discovery-title">
       <h2 id="article-discovery-title">Article discovery</h2>
       {error ? (
         <>
@@ -986,7 +1056,7 @@ function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
           <input type="url" name="url" value={feedUrl} aria-describedby="article-feed-help"
             onChange={(event) => setFeedUrl(event.target.value)} />
         </label>
-        <button type="submit">{saveState === "saving" ? "Saving…" : "Save feed"}</button>
+        <button type="submit" className="button-primary">{saveState === "saving" ? "Saving…" : "Save feed"}</button>
       </fieldset>
       {saveState === "saved" && <p role="status">Feed settings saved.</p>}
       {error && <p role="alert">{error}</p>}
@@ -1035,7 +1105,7 @@ function TeamInterestsSettings() {
   }
 
   return (
-    <section aria-labelledby="team-interests-title">
+    <section className="panel" aria-labelledby="team-interests-title">
       <h2 id="team-interests-title">Team interests</h2>
       <p className="muted" id="team-interests-help">
         Describe what each team wants to hear about. These interests apply across all watched pages and articles.
@@ -1057,7 +1127,7 @@ function TeamInterestsSettings() {
                   onChange={(event) => updateInterest(key, event.target.value)} />
               </label>
             ))}
-            <button type="submit">{saveState === "saving" ? "Saving…" : "Save team interests"}</button>
+            <button className="button-primary" type="submit">{saveState === "saving" ? "Saving…" : "Save team interests"}</button>
           </fieldset>
           {saveState === "saved" && <p role="status">Team interests saved.</p>}
         </form>
@@ -1130,38 +1200,45 @@ function Configuration() {
   }
 
   return (
-    <main className="configuration">
-      <h1>Configuration</h1>
-      <p className="muted">Add sources and choose which pages to monitor.</p>
-      <a href="/?view=maintainer">Maintainer settings</a>
-      <TeamInterestsSettings />
-      <section aria-labelledby="add-competitor-title">
-        <h2 id="add-competitor-title">Add source</h2>
-        <form onSubmit={addCompetitor}>
-          <fieldset disabled={saving || loading || Boolean(loadError)}>
-            <label>Source name<input name="name" required /></label>
-            <label>First page to watch
-              <input name="website" type="url" placeholder="https://example.com" required />
-            </label>
-            <button type="submit">{saving ? "Saving…" : "Add source"}</button>
-          </fieldset>
-          {saveError && <p role="alert">{saveError}</p>}
-          {saved && <p role="status">Source and first page saved.</p>}
-        </form>
-      </section>
-      <section aria-labelledby="competitors-title">
-        <h2 id="competitors-title">Sources</h2>
-        {loading ? <p role="status">Loading sources…</p> : loadError ? (
-          <div>
-            <p role="alert">{loadError}</p>
-            <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
-          </div>
-        ) : competitors.length === 0 ? <p>No sources saved.</p> : competitors.map((competitor) => (
-          <CompetitorSection key={competitor.id} competitor={competitor}
-            onPage={updatePage} onDelete={deletePage}
-            onRemove={(id) => setCompetitors((current) => current.filter((item) => item.id !== id))} />
-        ))}
-      </section>
+    <main id="main-content" tabIndex={-1} className="configuration">
+      <div className="page-heading">
+        <div>
+          <h1>Configuration</h1>
+          <p className="muted">Manage watched pages and what each team wants to hear about.</p>
+        </div>
+      </div>
+      <div className="configuration-grid">
+        <div className="source-panels">
+          <section className="panel" aria-labelledby="add-competitor-title">
+            <h2 id="add-competitor-title">Add source</h2>
+            <form onSubmit={addCompetitor}>
+              <fieldset disabled={saving || loading || Boolean(loadError)}>
+                <label>Source name<input name="name" required /></label>
+                <label>First page to watch
+                  <input name="website" type="url" placeholder="https://example.com" required />
+                </label>
+                <button className="button-primary" type="submit">{saving ? "Saving…" : "Add source"}</button>
+              </fieldset>
+              {saveError && <p role="alert">{saveError}</p>}
+              {saved && <p role="status">Source and first page saved.</p>}
+            </form>
+          </section>
+          <section className="panel" aria-labelledby="competitors-title">
+            <h2 id="competitors-title">Sources</h2>
+            {loading ? <p role="status">Loading sources…</p> : loadError ? (
+              <div>
+                <p role="alert">{loadError}</p>
+                <button onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry loading</button>
+              </div>
+            ) : competitors.length === 0 ? <p className="muted">No sources saved.</p> : competitors.map((competitor) => (
+              <CompetitorSection key={competitor.id} competitor={competitor}
+                onPage={updatePage} onDelete={deletePage}
+                onRemove={(id) => setCompetitors((current) => current.filter((item) => item.id !== id))} />
+            ))}
+          </section>
+        </div>
+        <TeamInterestsSettings />
+      </div>
     </main>
   );
 }
@@ -1177,17 +1254,13 @@ const view = search.get("view");
 const requestedVersion = search.get("version");
 const held = view === "held";
 const fromHeld = view === "history" && search.get("from") === "held";
-const configurationActive = view === "configuration" || view === "maintainer" || held ||
-  (view === "history" && (requestedVersion === null || fromHeld));
-const current = view === "history" || view === "maintainer" || held ? "true" : "page";
+const active = view === "maintainer" || held || fromHeld ? "maintainer" :
+  view === "configuration" || (view === "history" && requestedVersion === null) ? "configuration" : "digest";
 createRoot(root).render(
   <StrictMode>
-    <SiteHeader />
+    <a className="skip-link" href="#main-content">Skip to content</a>
     <div className="app-layout">
-      <nav className="app-nav" aria-label="Main navigation">
-        <a href="/" aria-current={configurationActive ? undefined : current}>Digest</a>
-        <a href={configurationPath} aria-current={configurationActive ? current : undefined}>Configuration</a>
-      </nav>
+      <SiteNavigation active={active} nested={view === "history" || held} />
       {view === "maintainer" ? <MaintainerSettings slackCallback={search.get("slack")} /> : view === "history" ? (
         <PageHistory pageId={search.get("page") ?? ""} requestedVersion={requestedVersion} fromHeld={fromHeld} />
       ) : view === "configuration" ? <Configuration /> : <Digest held={held} />}
