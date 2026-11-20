@@ -104,6 +104,9 @@ body {
 .slack-settings form { max-width: 28rem; }
 .slack-settings label { min-width: 0; }
 .slack-settings select { width: 100%; }
+.configuration .slack-team-channels { display: grid; }
+.slack-team-channel { display: flex; flex-wrap: wrap; align-items: end; gap: 0.75rem; }
+.slack-team-channels > button { justify-self: start; }
 .configuration .team-interests-fields { display: grid; align-items: start; max-width: 34rem; }
 .team-interests-fields textarea { resize: vertical; }
 .team-interests-fields button { justify-self: start; }

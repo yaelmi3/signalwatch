@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from collections.abc import Iterator
@@ -5,6 +6,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from time import time
 from typing import Literal
@@ -62,12 +64,12 @@ _DISCOVERED_ARTICLE_ANALYSES_SCHEMA = """(
 )"""
 _SLACK_DELIVERIES_SCHEMA = """(
     id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL,
-    page_id INTEGER, version INTEGER, source_id INTEGER, article_url TEXT,
+    page_id INTEGER, version INTEGER, source_id INTEGER, article_url TEXT, teams TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'uncertain', 'skipped')),
     error TEXT,
     CHECK ((page_id IS NOT NULL AND version IS NOT NULL AND source_id IS NULL AND article_url IS NULL)
         OR (source_id IS NOT NULL AND article_url IS NOT NULL AND page_id IS NULL AND version IS NULL)),
-    UNIQUE (page_id, version), UNIQUE (source_id, article_url),
+    UNIQUE (channel_id, page_id, version), UNIQUE (channel_id, source_id, article_url),
     FOREIGN KEY (page_id, version) REFERENCES change_analyses(page_id, version) ON DELETE CASCADE,
     FOREIGN KEY (source_id, article_url)
         REFERENCES discovered_article_analyses(source_id, article_url) ON DELETE CASCADE
@@ -75,8 +77,8 @@ _SLACK_DELIVERIES_SCHEMA = """(
 _SLACK_CONNECTION_SCHEMA = """(
     id INTEGER PRIMARY KEY CHECK (id = 1),
     workspace_name TEXT NOT NULL, encrypted_token TEXT NOT NULL,
-    channel_id TEXT, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
-    CHECK (enabled = 0 OR channel_id IS NOT NULL)
+    team_channels TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    CHECK (enabled = 0 OR team_channels <> '{}')
 )"""
 _DIGEST_LIMIT = 50
 
@@ -154,15 +156,22 @@ class ArticleFeed:
 @dataclass(frozen=True)
 class SlackDelivery:
     id: int
+    channel_id: str
     item: DigestEntry | DigestArticle
+    teams: list[DigestTeam]
 
 
 @dataclass(frozen=True)
 class SlackConnection:
     workspace_name: str
     encrypted_token: str = field(repr=False)
-    channel_id: str | None
+    team_channels: dict[DigestTeam, str]
     enabled: bool
+
+    @property
+    def revision(self) -> str:
+        snapshot = json.dumps((self.encrypted_token, self.team_channels, self.enabled), sort_keys=True)
+        return sha256(snapshot.encode()).hexdigest()
 
 
 class ArticleFeedSettings(BaseModel):
@@ -327,21 +336,25 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
     return model.model_validate(item)
 
 
-def claim_slack_delivery(channel_id: str, connection: SlackConnection | None = None) -> SlackDelivery | None:
+def claim_slack_delivery(
+    team_channels: dict[DigestTeam, str], connection: SlackConnection | None = None
+) -> SlackDelivery | None:
     with _database() as database:
+        database.execute("BEGIN IMMEDIATE")
+        if connection is not None:
+            current = _slack_connection(database.execute("SELECT * FROM slack_connection WHERE id = 1").fetchone())
+            if not connection.enabled or current != connection:
+                return None
         # Persist an uncertain outcome before the request so a restart cannot repeat a possibly accepted post.
         claim = database.execute(
             """UPDATE slack_deliveries SET status = 'uncertain', error = 'result_not_recorded'
             WHERE id = (
-                SELECT id FROM slack_deliveries WHERE channel_id = :channel AND status = 'pending'
-                AND (:token IS NULL OR EXISTS (
-                    SELECT 1 FROM slack_connection
-                    WHERE channel_id = :channel AND encrypted_token = :token AND enabled = 1
-                ))
+                SELECT id FROM slack_deliveries WHERE status = 'pending'
+                AND channel_id IN (SELECT value FROM json_each(?))
                 ORDER BY id LIMIT 1
             )
-            RETURNING id, page_id, version, source_id, article_url""",
-            {"channel": channel_id, "token": connection.encrypted_token if connection else None},
+            RETURNING id, channel_id, page_id, version, source_id, article_url, teams""",
+            (json.dumps(team_channels),),
         ).fetchone()
         if claim is None:
             return None
@@ -352,19 +365,25 @@ def claim_slack_delivery(channel_id: str, connection: SlackConnection | None = N
             source_id=claim["source_id"],
             article_url=claim["article_url"],
         )
-        if target is None:
-            database.execute(
-                "UPDATE slack_deliveries SET status = 'skipped', error = 'no_longer_eligible' WHERE id = ?",
-                (claim["id"],),
-            )
-            return None
-        return SlackDelivery(claim["id"], _digest_entry(target, DigestView.RELEVANT))
+        if target is not None:
+            item = _digest_entry(target, DigestView.RELEVANT)
+            channel_id = claim["channel_id"]
+            queued_teams = set(json.loads(claim["teams"]))
+            if teams := [team for team in item.relevant_teams
+                         if team in queued_teams and team_channels.get(team) == channel_id]:
+                return SlackDelivery(claim["id"], channel_id, item, teams)
+        database.execute(
+            "UPDATE slack_deliveries SET status = 'skipped', error = 'no_longer_eligible' WHERE id = ?",
+            (claim["id"],),
+        )
+        return None
 
 
 def _slack_connection(row: sqlite3.Row | None) -> SlackConnection | None:
     if row is None:
         return None
-    return SlackConnection(row["workspace_name"], row["encrypted_token"], row["channel_id"], bool(row["enabled"]))
+    team_channels = {DigestTeam(team): channel for team, channel in json.loads(row["team_channels"]).items()}
+    return SlackConnection(row["workspace_name"], row["encrypted_token"], team_channels, bool(row["enabled"]))
 
 
 def get_slack_connection() -> SlackConnection | None:
@@ -377,19 +396,21 @@ def save_slack_connection(workspace_name: str, encrypted_token: str) -> None:
         database.execute(
             """INSERT INTO slack_connection (id, workspace_name, encrypted_token) VALUES (1, ?, ?)
             ON CONFLICT (id) DO UPDATE SET workspace_name = excluded.workspace_name,
-                encrypted_token = excluded.encrypted_token, channel_id = NULL, enabled = 0""",
+                encrypted_token = excluded.encrypted_token, team_channels = '{}', enabled = 0""",
             (workspace_name, encrypted_token),
         )
 
 
 def save_slack_destination(
-    connection: SlackConnection, channel_id: str | None, enabled: bool
+    connection: SlackConnection, team_channels: dict[DigestTeam, str], enabled: bool
 ) -> SlackConnection | None:
     with _database() as database:
         row = database.execute(
-            """UPDATE slack_connection SET channel_id = ?, enabled = ?
-            WHERE id = 1 AND encrypted_token = ? RETURNING *""",
-            (channel_id, enabled, connection.encrypted_token),
+            """UPDATE slack_connection SET team_channels = ?, enabled = ?
+            WHERE id = 1 AND encrypted_token = ? AND json(team_channels) = json(?) AND enabled = ?
+            RETURNING *""",
+            (json.dumps(team_channels), enabled, connection.encrypted_token,
+             json.dumps(connection.team_channels), connection.enabled),
         ).fetchone()
     return _slack_connection(row)
 
@@ -424,22 +445,29 @@ def _relevant_digest_item(
 
 def _enqueue_slack_delivery(
     database: sqlite3.Connection,
-    channel_id: str,
+    team_channels: dict[DigestTeam, str],
     *,
     page_id: int | None = None,
     version: int | None = None,
     source_id: int | None = None,
     article_url: str | None = None,
 ) -> None:
-    if (
-        _relevant_digest_item(database, page_id=page_id, version=version, source_id=source_id, article_url=article_url)
-        is not None
-    ):
-        database.execute(
-            """INSERT INTO slack_deliveries (channel_id, page_id, version, source_id, article_url)
-            VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-            (channel_id, page_id, version, source_id, article_url),
-        )
+    target = _relevant_digest_item(
+        database, page_id=page_id, version=version, source_id=source_id, article_url=article_url
+    )
+    if target is None:
+        return
+    item = _digest_entry(target, DigestView.RELEVANT)
+    channel_teams: dict[str, list[DigestTeam]] = {}
+    for team in item.relevant_teams:
+        if (channel := team_channels.get(team)) is not None:
+            channel_teams.setdefault(channel, []).append(team)
+    database.executemany(
+        """INSERT INTO slack_deliveries (channel_id, page_id, version, source_id, article_url, teams)
+        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+        [(channel, page_id, version, source_id, article_url, json.dumps(teams))
+         for channel, teams in channel_teams.items()],
+    )
 
 
 def list_article_feed_settings() -> list[ArticleFeedSettings]:
@@ -536,7 +564,8 @@ def mark_article_analysis_queued(source_id: int, article_url: str) -> None:
 
 
 def save_article_analysis(
-    source_id: int, article_url: str, result: ChangeAnalysisResult | None, *, slack_channel: str | None = None
+    source_id: int, article_url: str, result: ChangeAnalysisResult | None,
+    *, slack_channels: dict[DigestTeam, str] | None = None,
 ) -> None:
     status = "completed" if result is not None else "failed"
     result_json = result.model_dump_json() if result is not None else None
@@ -549,8 +578,8 @@ def save_article_analysis(
             WHERE discovered_article_analyses.status != 'completed'""",
             (status, result_json, source_id, article_url),
         )
-        if saved.rowcount and result is not None and slack_channel is not None:
-            _enqueue_slack_delivery(database, slack_channel, source_id=source_id, article_url=article_url)
+        if saved.rowcount and result is not None and slack_channels:
+            _enqueue_slack_delivery(database, slack_channels, source_id=source_id, article_url=article_url)
 
 
 def list_unqueued_changes(limit: int = 100) -> list[tuple[int, int]]:
@@ -588,7 +617,8 @@ def mark_analysis_queued(page_id: int, version: int) -> None:
 
 
 def save_change_analysis(
-    page_id: int, version: int, result: ChangeAnalysisResult | None, *, slack_channel: str | None = None
+    page_id: int, version: int, result: ChangeAnalysisResult | None,
+    *, slack_channels: dict[DigestTeam, str] | None = None,
 ) -> None:
     status = "completed" if result is not None else "failed"
     result_json = result.model_dump_json() if result is not None else None
@@ -601,8 +631,8 @@ def save_change_analysis(
             WHERE change_analyses.status != 'completed'""",
             (status, result_json, page_id, version),
         )
-        if saved.rowcount and result is not None and slack_channel is not None:
-            _enqueue_slack_delivery(database, slack_channel, page_id=page_id, version=version)
+        if saved.rowcount and result is not None and slack_channels:
+            _enqueue_slack_delivery(database, slack_channels, page_id=page_id, version=version)
 
 
 def list_page_analyses(page_id: int) -> dict[str, PageChangeAnalysis]:
@@ -769,6 +799,37 @@ def link_watch(page_id: int, watch_id: str) -> None:
         )
 
 
+def _migrate_slack_tables(database: sqlite3.Connection) -> None:
+    legacy_connection = "SELECT 1 FROM pragma_table_info('slack_connection') WHERE name = 'channel_id'"
+    new_deliveries = "SELECT 1 FROM pragma_table_info('slack_deliveries') WHERE name = 'teams'"
+    if database.execute(legacy_connection).fetchone() is None and database.execute(new_deliveries).fetchone():
+        return
+    database.execute("BEGIN IMMEDIATE")
+    if database.execute(legacy_connection).fetchone() is not None:
+        database.execute(f"CREATE TABLE slack_connection_upgraded {_SLACK_CONNECTION_SCHEMA}")
+        team_pairs = ", ".join("?, channel_id" for _ in DigestTeam)
+        database.execute(
+            f"""INSERT INTO slack_connection_upgraded (id, workspace_name, encrypted_token, team_channels, enabled)
+            SELECT id, workspace_name, encrypted_token,
+                CASE WHEN channel_id IS NULL THEN '{{}}' ELSE json_object({team_pairs}) END, enabled
+            FROM slack_connection""",
+            tuple(DigestTeam),
+        )
+        database.execute("DROP TABLE slack_connection")
+        database.execute("ALTER TABLE slack_connection_upgraded RENAME TO slack_connection")
+    if database.execute(new_deliveries).fetchone() is None:
+        database.execute(f"CREATE TABLE slack_deliveries_upgraded {_SLACK_DELIVERIES_SCHEMA}")
+        database.execute(
+            """INSERT INTO slack_deliveries_upgraded
+            (id, channel_id, page_id, version, source_id, article_url, teams, status, error)
+            SELECT id, channel_id, page_id, version, source_id, article_url, ?, status, error FROM slack_deliveries""",
+            (json.dumps(list(DigestTeam)),),
+        )
+        database.execute("DROP TABLE slack_deliveries")
+        database.execute("ALTER TABLE slack_deliveries_upgraded RENAME TO slack_deliveries")
+    database.commit()
+
+
 @contextmanager
 def _database() -> Iterator[sqlite3.Connection]:
     path = Path(os.getenv("SIGNALWATCH_DB_PATH", str(Path.home() / ".local/share/signalwatch/configuration.sqlite3")))
@@ -842,4 +903,5 @@ def _database() -> Iterator[sqlite3.Connection]:
         )
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_deliveries {_SLACK_DELIVERIES_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_connection {_SLACK_CONNECTION_SCHEMA}")
+        _migrate_slack_tables(database)
         yield database

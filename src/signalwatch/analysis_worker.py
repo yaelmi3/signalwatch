@@ -321,7 +321,7 @@ def _normalize_decisions(*, interests: TeamInterests, result: ChangeAnalysisResu
 
 @DBOS.step(name="persist-page-analysis", retries_allowed=True, should_retry=_retry_analysis)
 def _persist_analysis(*, page_id: int, version: int, result: ChangeAnalysisResult | None) -> None:
-    storage.save_change_analysis(page_id, version, result, slack_channel=slack_delivery.configured_channel())
+    storage.save_change_analysis(page_id, version, result, slack_channels=slack_delivery.configured_channels())
 
 
 @DBOS.workflow(name="analyze-page-change")
@@ -343,7 +343,7 @@ def analyze_page_change(page_id: int, version: int) -> None:
 
 @DBOS.step(name="persist-article-analysis", retries_allowed=True, should_retry=_retry_analysis)
 def _persist_article_analysis(*, source_id: int, article_url: str, result: ChangeAnalysisResult | None) -> None:
-    storage.save_article_analysis(source_id, article_url, result, slack_channel=slack_delivery.configured_channel())
+    storage.save_article_analysis(source_id, article_url, result, slack_channels=slack_delivery.configured_channels())
 
 
 @DBOS.workflow(name="analyze-discovered-article")

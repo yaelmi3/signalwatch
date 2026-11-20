@@ -1,12 +1,13 @@
 import sqlite3
 from http import HTTPStatus
 from secrets import compare_digest, token_urlsafe
+from typing import Annotated
 
 import structlog
 from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StringConstraints
 
 from signalwatch import slack_delivery, slack_oauth, storage
 from signalwatch.slack_oauth import SLACK_SETTINGS_PATH, SlackChannel, SlackOAuthConfig, SlackOAuthError
@@ -15,6 +16,7 @@ _SESSION_COOKIE = "__Host-signalwatch-slack-session"
 _STATE_COOKIE = "__Host-signalwatch-slack-state"
 _SESSION_TTL = 900
 _STATE_TTL = 300
+_SETTINGS_CHANGED = "Slack settings changed. Review the current channels and try again."
 slack_configuration_logger = structlog.get_logger()
 router = APIRouter(prefix=SLACK_SETTINGS_PATH, tags=["Slack settings"])
 
@@ -24,13 +26,19 @@ class SlackStatus(BaseModel):
     authenticated: bool = False
     connected: bool = False
     workspace_name: str | None = None
-    channel_id: str | None = None
+    team_channels: dict[storage.DigestTeam, str] = Field(default_factory=dict)
     enabled: bool = False
+    revision: str | None = None
 
 
 class SlackDestinationInput(BaseModel):
-    channel_id: str | None
+    team_channels: dict[storage.DigestTeam, Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]]
     enabled: bool
+    revision: str
+
+
+class SlackTestInput(BaseModel):
+    team: storage.DigestTeam
 
 
 class SlackConnectURL(BaseModel):
@@ -123,29 +131,33 @@ def save_destination(payload: SlackDestinationInput, request: Request, response:
     config = _authorized_config(request, mutation=True)
     response.headers["Cache-Control"] = "no-store"
     connection = _require_connection()
-    channel_id = payload.channel_id
-    if payload.enabled and channel_id is None:
+    if payload.revision != connection.revision:
+        raise HTTPException(HTTPStatus.CONFLICT, _SETTINGS_CHANGED)
+    team_channels = payload.team_channels
+    if payload.enabled and not team_channels:
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Select a Slack channel before enabling delivery.")
-    if channel_id is not None and (channel_id != connection.channel_id or payload.enabled):
-        _require_member(_bot_token(config, connection), channel_id)
-    updated = storage.save_slack_destination(connection, channel_id, payload.enabled)
+    if channel_ids := {
+        channel_id for team, channel_id in team_channels.items()
+        if payload.enabled or channel_id != connection.team_channels.get(team)
+    }:
+        _require_members(_bot_token(config, connection), channel_ids)
+    updated = storage.save_slack_destination(connection, team_channels, payload.enabled)
     if updated is None:
-        raise HTTPException(HTTPStatus.CONFLICT, "Slack was reconnected. Refresh and try again.")
+        raise HTTPException(HTTPStatus.CONFLICT, _SETTINGS_CHANGED)
     return _status(updated)
 
 
 @router.post("/test", status_code=HTTPStatus.NO_CONTENT)
-def send_test(request: Request) -> None:
+def send_test(payload: SlackTestInput, request: Request) -> None:
     config = _authorized_config(request, mutation=True)
     connection = _require_connection()
-    if connection.channel_id is None:
-        raise HTTPException(HTTPStatus.BAD_REQUEST, "Save a Slack channel before sending a test.")
+    channel_id = connection.team_channels.get(payload.team)
+    if channel_id is None:
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "Save a Slack channel for this team before sending a test.")
     token = _bot_token(config, connection)
-    _require_member(token, connection.channel_id)
+    _require_members(token, {channel_id})
     try:
-        slack_delivery.post_message(
-            slack_delivery.SlackSettings(connection.channel_id, token), "SignalWatch test message. Slack is connected."
-        )
+        slack_delivery.post_message(channel_id, token, "SignalWatch test message. Slack is connected.")
     except slack_delivery.SlackPostError as error:
         if error.uncertain:
             message = "SignalWatch could not confirm the test delivery. Check the channel before trying again."
@@ -160,8 +172,9 @@ def _status(connection: storage.SlackConnection | None) -> SlackStatus:
         authenticated=True,
         connected=connection is not None,
         workspace_name=connection.workspace_name if connection else None,
-        channel_id=connection.channel_id if connection else None,
+        team_channels=connection.team_channels if connection else {},
         enabled=connection.enabled if connection else False,
+        revision=connection.revision if connection else None,
     )
 
 
@@ -221,6 +234,6 @@ def _member_channels(token: str) -> list[SlackChannel]:
         raise HTTPException(HTTPStatus.BAD_GATEWAY, str(error)) from None
 
 
-def _require_member(token: str, channel_id: str) -> None:
-    if not any(channel.id == channel_id for channel in _member_channels(token)):
-        raise HTTPException(HTTPStatus.BAD_REQUEST, "Choose a channel the Slack bot has joined.")
+def _require_members(token: str, channel_ids: set[str]) -> None:
+    if not channel_ids.issubset(channel.id for channel in _member_channels(token)):
+        raise HTTPException(HTTPStatus.BAD_REQUEST, "Choose channels the Slack bot has joined.")
