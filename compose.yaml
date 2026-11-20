@@ -68,12 +68,23 @@ services:
       retries: 6
       start_period: 20s
 
+  detector-egress:
+    image: signalwatch-detector-egress:0.1.0
+    platform: linux/amd64
+    pull_policy: never
+    restart: unless-stopped
+
   changedetection:
     image: ghcr.io/dgtlmoon/changedetection.io:0.70.3@sha256:47b1e9cc3eff820e6022b655e3fcc948625f60c1770ae8b9c30aa3bf104dc255
     platform: linux/amd64
     restart: unless-stopped
     environment:
       NETRC: /run/changedetection.netrc
+      HTTP_PROXY: http://detector-egress:4750
+      HTTPS_PROXY: http://detector-egress:4750
+      NO_PROXY: 127.0.0.1,signalwatch-hook
+    depends_on:
+      - detector-egress
     ports:
       - "127.0.0.1:5000:5000"
     volumes:
