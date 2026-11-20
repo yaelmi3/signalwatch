@@ -44,6 +44,7 @@ class SlackChannel(BaseModel):
 class _ChannelEntry(SlackChannel):
     is_archived: bool = False
     is_member: bool = True
+    is_private: bool | None = None
 
 
 class _ChannelCursor(BaseModel):
@@ -133,8 +134,9 @@ def decrypt_bot_token(config: SlackOAuthConfig, encrypted_token: str) -> str:
     return token[4:]
 
 
-def list_member_channels(bot_token: str) -> list[SlackChannel]:
-    params = {"types": "public_channel,private_channel", "exclude_archived": "true", "limit": "200"}
+def list_member_channels(bot_token: str, *, public_only: bool = False) -> list[SlackChannel]:
+    channel_types = "public_channel" if public_only else "public_channel,private_channel"
+    params = {"types": channel_types, "exclude_archived": "true", "limit": "200"}
     channels: dict[str, SlackChannel] = {}
     seen_cursors: set[str] = set()
     while True:
@@ -143,13 +145,11 @@ def list_member_channels(bot_token: str) -> list[SlackChannel]:
             page = _ChannelPage.model_validate(data)
         except ValidationError:
             raise SlackOAuthError("Slack returned an invalid channel list.") from None
-        channels.update(
-            {
-                channel.id: SlackChannel(id=channel.id, name=channel.name)
-                for channel in page.channels
-                if channel.is_member and not channel.is_archived
-            }
-        )
+        channels |= {
+            channel.id: SlackChannel(id=channel.id, name=channel.name)
+            for channel in page.channels
+            if channel.is_member and not channel.is_archived and (not public_only or channel.is_private is False)
+        }
         cursor = page.response_metadata.next_cursor.strip()
         if not cursor:
             return sorted(channels.values(), key=lambda channel: (channel.name.casefold(), channel.id))

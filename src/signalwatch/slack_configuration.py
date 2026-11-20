@@ -49,9 +49,9 @@ class SlackConnectURL(BaseModel):
 def get_status(request: Request, response: Response) -> SlackStatus:
     response.headers["Cache-Control"] = "no-store"
     config = slack_oauth.load_config()
-    if config is None or _session_id(request, config) is None:
-        return SlackStatus(available=config is not None)
-    return _status(storage.get_slack_connection())
+    if config is None:
+        return SlackStatus(available=False)
+    return _status(storage.get_slack_connection(), authenticated=_session_id(request, config) is not None)
 
 
 @router.post("/session", status_code=HTTPStatus.NO_CONTENT)
@@ -74,8 +74,12 @@ async def start_session(request: Request, response: Response) -> None:
 
 @router.post("/connect")
 def connect(request: Request, response: Response) -> SlackConnectURL:
-    config = _authorized_config(request, mutation=True)
-    state = config.cipher.encrypt(f"oauth:{_session_id(request, config)}".encode()).decode()
+    config = _available_config()
+    session_id = _session_id(request, config)
+    if session_id is None:
+        raise HTTPException(HTTPStatus.UNAUTHORIZED, "Sign in to Slack settings first.")
+    _require_origin(request, config)
+    state = config.cipher.encrypt(f"oauth:{session_id}".encode()).decode()
     _set_cookie(response, _STATE_COOKIE, state, _STATE_TTL)
     response.headers["Cache-Control"] = "no-store"
     return SlackConnectURL(url=slack_oauth.authorization_url(config, state))
@@ -120,16 +124,18 @@ def callback(request: Request) -> RedirectResponse:
 
 @router.get("/channels")
 def channels(request: Request, response: Response) -> list[SlackChannel]:
-    config = _authorized_config(request)
+    config = _available_config()
     response.headers["Cache-Control"] = "no-store"
     token = _bot_token(config, _require_connection())
-    return _member_channels(token)
+    return _member_channels(token, public_only=_session_id(request, config) is None)
 
 
 @router.put("")
 def save_destination(payload: SlackDestinationInput, request: Request, response: Response) -> SlackStatus:
-    config = _authorized_config(request, mutation=True)
+    config = _available_config()
+    _require_origin(request, config)
     response.headers["Cache-Control"] = "no-store"
+    authenticated = _session_id(request, config) is not None
     connection = _require_connection()
     if payload.revision != connection.revision:
         raise HTTPException(HTTPStatus.CONFLICT, _SETTINGS_CHANGED)
@@ -140,22 +146,23 @@ def save_destination(payload: SlackDestinationInput, request: Request, response:
         channel_id for team, channel_id in team_channels.items()
         if payload.enabled or channel_id != connection.team_channels.get(team)
     }:
-        _require_members(_bot_token(config, connection), channel_ids)
+        _require_members(_bot_token(config, connection), channel_ids, public_only=not authenticated)
     updated = storage.save_slack_destination(connection, team_channels, payload.enabled)
     if updated is None:
         raise HTTPException(HTTPStatus.CONFLICT, _SETTINGS_CHANGED)
-    return _status(updated)
+    return _status(updated, authenticated=authenticated)
 
 
 @router.post("/test", status_code=HTTPStatus.NO_CONTENT)
 def send_test(payload: SlackTestInput, request: Request) -> None:
-    config = _authorized_config(request, mutation=True)
+    config = _available_config()
+    _require_origin(request, config)
     connection = _require_connection()
     channel_id = connection.team_channels.get(payload.team)
     if channel_id is None:
         raise HTTPException(HTTPStatus.BAD_REQUEST, "Save a Slack channel for this team before sending a test.")
     token = _bot_token(config, connection)
-    _require_members(token, {channel_id})
+    _require_members(token, {channel_id}, public_only=_session_id(request, config) is None)
     try:
         slack_delivery.post_message(channel_id, token, "SignalWatch test message. Slack is connected.")
     except slack_delivery.SlackPostError as error:
@@ -166,10 +173,10 @@ def send_test(payload: SlackTestInput, request: Request) -> None:
         raise HTTPException(HTTPStatus.BAD_GATEWAY, message) from None
 
 
-def _status(connection: storage.SlackConnection | None) -> SlackStatus:
+def _status(connection: storage.SlackConnection | None, *, authenticated: bool) -> SlackStatus:
     return SlackStatus(
         available=True,
-        authenticated=True,
+        authenticated=authenticated,
         connected=connection is not None,
         workspace_name=connection.workspace_name if connection else None,
         team_channels=connection.team_channels if connection else {},
@@ -205,15 +212,6 @@ def _available_config() -> SlackOAuthConfig:
     return config
 
 
-def _authorized_config(request: Request, *, mutation: bool = False) -> SlackOAuthConfig:
-    config = _available_config()
-    if _session_id(request, config) is None:
-        raise HTTPException(HTTPStatus.UNAUTHORIZED, "Sign in to Slack settings first.")
-    if mutation:
-        _require_origin(request, config)
-    return config
-
-
 def _require_connection() -> storage.SlackConnection:
     if (connection := storage.get_slack_connection()) is None:
         raise HTTPException(HTTPStatus.CONFLICT, "Connect Slack before choosing a channel.")
@@ -227,13 +225,16 @@ def _bot_token(config: SlackOAuthConfig, connection: storage.SlackConnection) ->
         raise HTTPException(HTTPStatus.SERVICE_UNAVAILABLE, str(error)) from None
 
 
-def _member_channels(token: str) -> list[SlackChannel]:
+def _member_channels(token: str, *, public_only: bool) -> list[SlackChannel]:
     try:
-        return slack_oauth.list_member_channels(token)
+        return slack_oauth.list_member_channels(token, public_only=public_only)
     except SlackOAuthError as error:
         raise HTTPException(HTTPStatus.BAD_GATEWAY, str(error)) from None
 
 
-def _require_members(token: str, channel_ids: set[str]) -> None:
-    if not channel_ids.issubset(channel.id for channel in _member_channels(token)):
-        raise HTTPException(HTTPStatus.BAD_REQUEST, "Choose channels the Slack bot has joined.")
+def _require_members(token: str, channel_ids: set[str], *, public_only: bool) -> None:
+    if not channel_ids.issubset(channel.id for channel in _member_channels(token, public_only=public_only)):
+        message = "Choose public channels the Slack bot has joined." if public_only else (
+            "Choose channels the Slack bot has joined."
+        )
+        raise HTTPException(HTTPStatus.BAD_REQUEST, message)

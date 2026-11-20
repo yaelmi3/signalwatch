@@ -138,7 +138,7 @@ SIGNALWATCH_SLACK_MAINTAINER_PASSWORD=<strong random Slack-only passphrase>
 SIGNALWATCH_SLACK_ENCRYPTION_KEY=<private Fernet key>
 ```
 
-After deploying from `main`, check that `GET /api/maintainer/slack` on the public site reports `available: true`. Open **Maintainer settings**, unlock **Slack delivery** with the Slack-only passphrase, and choose **Connect Slack**.
+After deploying from `main`, check that `GET /api/maintainer/slack` reports `available: true`. To connect a workspace, open **Maintainer settings → Slack delivery** and use the setup passphrase. Once connected, anyone who can open the site can select public Slack channels, enable delivery, and send test messages.
 
 ## Back up and roll back
 

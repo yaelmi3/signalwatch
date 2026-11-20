@@ -17,7 +17,7 @@ _ROOT = "/api/maintainer/slack"
 _ORIGIN = "https://signalwatch.test"
 
 
-def test_slack_operator_connects_selects_tests_and_enables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_slack_visitors_configure_connected_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_path = tmp_path / "slack.sqlite3"
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
     key = Fernet.generate_key()
@@ -50,13 +50,17 @@ def test_slack_operator_connects_selects_tests_and_enables(tmp_path: Path, monke
                 if not channels_available:
                     return httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE)
                 params = request.url.params
-                assert params["types"] == "public_channel,private_channel" and params["exclude_archived"] == "true"
+                assert params["types"] in {"public_channel", "public_channel,private_channel"}
+                assert params["exclude_archived"] == "true"
                 assert "user" not in params
-                channels = [{"id": "G_TEAM", "name": "team-private"}]
+                channels = [
+                    {"id": "C_PRODUCT", "name": "product-public", "is_private": False},
+                    {"id": "G_TEAM", "name": "team-private", "is_private": True},
+                ]
                 if not params.get("cursor"):
                     channels = [
-                        {"id": "C_TEAM", "name": "team-public"},
-                        {"id": "C_ARCHIVED", "name": "archived", "is_archived": True},
+                        {"id": "C_TEAM", "name": "team-public", "is_private": False},
+                        {"id": "C_ARCHIVED", "name": "archived", "is_archived": True, "is_private": False},
                     ]
                 body = {
                     "channels": channels,
@@ -86,8 +90,9 @@ def test_slack_operator_connects_selects_tests_and_enables(tmp_path: Path, monke
         "revision": None,
     }
     with TestClient(app, base_url=_ORIGIN) as operator, TestClient(app, base_url=_ORIGIN) as visitor:
+        visitor.headers["Origin"] = _ORIGIN
         assert visitor.get(_ROOT).json() == public
-        assert visitor.get(f"{_ROOT}/channels").status_code == HTTPStatus.UNAUTHORIZED
+        assert visitor.get(f"{_ROOT}/channels").status_code == HTTPStatus.CONFLICT
         assert visitor.post(f"{_ROOT}/connect", json={}).status_code == HTTPStatus.UNAUTHORIZED
         assert slack_delivery.get_settings() is None
         password = {"password": "fake-passphrase"}
@@ -116,45 +121,53 @@ def test_slack_operator_connects_selects_tests_and_enables(tmp_path: Path, monke
         assert "fake-install-code" not in returned.text + str(returned.headers)
         replay = operator.get(callback, params=query, follow_redirects=False)
         assert replay.headers["location"] == "/?view=maintainer&slack=error" and len(requests) == 1
-        assert visitor.get(_ROOT).json() == public
-        connected = {**public, "authenticated": True, "connected": True, "workspace_name": "Sandbox"}
-        status = operator.get(_ROOT).json()
+        assert visitor.post(f"{_ROOT}/connect", json={}).status_code == HTTPStatus.UNAUTHORIZED
+        connected = {**public, "connected": True, "workspace_name": "Sandbox"}
+        status = visitor.get(_ROOT).json()
         initial_revision = status["revision"]
         assert isinstance(initial_revision, str) and initial_revision
         assert status == connected | {"revision": initial_revision}
         connection = storage.get_slack_connection()
         assert connection and Fernet(key).decrypt(connection.encrypted_token) == b"bot:fake-bot-token"
         assert b"fake-bot-token" not in db_path.read_bytes()
-        assert operator.get(f"{_ROOT}/channels").json() == [
-            {"id": "G_TEAM", "name": "team-private"},
+        public_channel_list = [
+            {"id": "C_PRODUCT", "name": "product-public"},
             {"id": "C_TEAM", "name": "team-public"},
         ]
-        team_channels = {"marketing": "C_TEAM", "product": "G_TEAM", "research_and_development": "G_TEAM"}
+        assert visitor.get(f"{_ROOT}/channels").json() == public_channel_list
+        assert requests[-1].url.params["types"] == "public_channel"
+        assert operator.get(f"{_ROOT}/channels").json() == [
+            public_channel_list[0], {"id": "G_TEAM", "name": "team-private"}, public_channel_list[1],
+        ]
+        assert requests[-1].url.params["types"] == "public_channel,private_channel"
+        team_channels = {"marketing": "C_TEAM", "product": "C_PRODUCT", "research_and_development": "C_PRODUCT"}
         destination = {"team_channels": team_channels, "enabled": False, "revision": initial_revision}
-        cross_site = operator.put(_ROOT, json=destination, headers={"Origin": "https://other.test"})
+        cross_site = visitor.put(_ROOT, json=destination, headers={"Origin": "https://other.test"})
         assert cross_site.status_code == HTTPStatus.FORBIDDEN
-        assert operator.post(f"{_ROOT}/test", json={"team": "product"}).status_code == HTTPStatus.BAD_REQUEST
+        assert visitor.post(f"{_ROOT}/test", json={"team": "product"}).status_code == HTTPStatus.BAD_REQUEST
         empty_enabled = destination | {"team_channels": {}, "enabled": True}
-        assert operator.put(_ROOT, json=empty_enabled).status_code == HTTPStatus.BAD_REQUEST
-        wrong_channel = destination | {"team_channels": {**team_channels, "marketing": "C_OTHER"}}
-        assert operator.put(_ROOT, json=wrong_channel).status_code == HTTPStatus.BAD_REQUEST
+        assert visitor.put(_ROOT, json=empty_enabled).status_code == HTTPStatus.BAD_REQUEST
+        wrong_channel = destination | {"team_channels": {**team_channels, "marketing": "G_TEAM"}}
+        assert visitor.put(_ROOT, json=wrong_channel).status_code == HTTPStatus.BAD_REQUEST
         invalid_team = destination | {"team_channels": {"sales": "C_TEAM"}}
-        assert operator.put(_ROOT, json=invalid_team).status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+        assert visitor.put(_ROOT, json=invalid_team).status_code == HTTPStatus.UNPROCESSABLE_ENTITY
         before_save = len(requests)
-        saved = operator.put(_ROOT, json=destination).json()
+        saved = visitor.put(_ROOT, json=destination).json()
         assert saved["revision"] and saved["revision"] != initial_revision
         destination["revision"] = saved["revision"]
         assert saved == connected | destination
         assert [request.url.params.get("cursor") for request in requests[before_save:]] == [None, "next"]
         assert storage.save_slack_destination(connection, {}, False) is None
-        assert visitor.get(_ROOT).json() == public
+        assert visitor.get(_ROOT).json() == saved
         assert slack_delivery.configured_channels() == {}
+        cross_site_test = visitor.post(f"{_ROOT}/test", json={"team": "product"}, headers={"Origin": "https://other.test"})
+        assert cross_site_test.status_code == HTTPStatus.FORBIDDEN and not sent_to
         for team in ("product", "marketing"):
-            test = operator.post(f"{_ROOT}/test", json={"team": team})
+            test = visitor.post(f"{_ROOT}/test", json={"team": team})
             assert test.status_code == HTTPStatus.NO_CONTENT and not test.content
-        assert sent_to == ["G_TEAM", "C_TEAM"]
-        assert operator.get(_ROOT).json()["enabled"] is False
-        enabled = operator.put(_ROOT, json=destination | {"enabled": True}).json()
+        assert sent_to == ["C_PRODUCT", "C_TEAM"]
+        assert visitor.get(_ROOT).json()["enabled"] is False
+        enabled = visitor.put(_ROOT, json=destination | {"enabled": True}).json()
         assert enabled["enabled"] is True and enabled["revision"] != saved["revision"]
         assert slack_delivery.configured_channels() == team_channels
         previously_enabled = slack_delivery.get_settings()
@@ -174,20 +187,31 @@ def test_slack_operator_connects_selects_tests_and_enables(tmp_path: Path, monke
         storage.save_change_analysis(page.id, 1, analysis, slack_channels=slack_delivery.configured_channels())
         channels_available = False
         before_disable = len(requests)
-        disabled = operator.put(_ROOT, json=destination | {"revision": enabled["revision"]}).json()
+        disabled = visitor.put(_ROOT, json=destination | {"revision": enabled["revision"]}).json()
         assert disabled["enabled"] is False
         other_tab = destination | {"revision": disabled["revision"]}
-        remaining = other_tab | {"team_channels": {"product": "G_TEAM"}}
-        current = operator.put(_ROOT, json=remaining).json()
+        remaining = other_tab | {"team_channels": {"product": "C_PRODUCT"}}
+        current = visitor.put(_ROOT, json=remaining).json()
         assert current["revision"] and current["revision"] != other_tab["revision"]
         assert current == connected | remaining | {"revision": current["revision"]}
         for enable in (False, True):
-            assert operator.put(_ROOT, json=other_tab | {"enabled": enable}).status_code == HTTPStatus.CONFLICT
-        assert operator.get(_ROOT).json() == current
+            assert visitor.put(_ROOT, json=other_tab | {"enabled": enable}).status_code == HTTPStatus.CONFLICT
+        assert visitor.get(_ROOT).json() == current
         assert len(requests) == before_disable
         assert slack_delivery.get_settings() is None
         slack_delivery.send_next(previously_enabled)
-        assert sent_to == ["G_TEAM", "C_TEAM"]
+        assert sent_to == ["C_PRODUCT", "C_TEAM"]
+        channels_available = True
+        private_destination = {"team_channels": {"product": "G_TEAM"}, "enabled": False}
+        private_save = operator.put(_ROOT, json=private_destination | {"revision": current["revision"]})
+        assert private_save.status_code == HTTPStatus.OK
+        private_revision = private_save.json()["revision"]
+        private_enable = private_destination | {"enabled": True, "revision": private_revision}
+        assert visitor.put(_ROOT, json=private_enable).status_code == HTTPStatus.BAD_REQUEST
+        assert visitor.post(f"{_ROOT}/test", json={"team": "product"}).status_code == HTTPStatus.BAD_REQUEST
+        assert sent_to == ["C_PRODUCT", "C_TEAM"]
+        assert operator.post(f"{_ROOT}/test", json={"team": "product"}).status_code == HTTPStatus.NO_CONTENT
+        assert sent_to == ["C_PRODUCT", "C_TEAM", "G_TEAM"]
 
 
 def test_incomplete_oauth_is_unavailable_and_legacy_worker_mode_still_works(

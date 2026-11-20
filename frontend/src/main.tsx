@@ -641,11 +641,12 @@ function SlackSettings({ callback }: { callback: string | null }) {
   const [channels, setChannels] = useState<SlackChannel[] | { error: string } | null>(null);
   const [channelAttempt, setChannelAttempt] = useState(0);
   const [draft, setDraft] = useState<{ channels: SlackTeamChannels; revision: string } | null>(null);
+  const [setupRequested, setSetupRequested] = useState(false);
   const [action, setAction] = useState("");
   const [feedback, setFeedback] = useState<{ role: "status" | "alert"; text: string } | null>(null);
 
   const settings = status && "available" in status ? status : null;
-  const connected = settings?.available && settings.authenticated && settings.connected;
+  const connected = settings?.available && settings.connected;
   const revision = settings?.revision ?? null;
   const savedChannels = settings?.team_channels ?? {};
   const draftChannels = draft?.revision === revision ? draft.channels : null;
@@ -680,7 +681,7 @@ function SlackSettings({ callback }: { callback: string | null }) {
         const error = `Could not load Slack channels. ${message(cause)}`;
         setStatus(next);
         setChannels({ error });
-        if ("authenticated" in next && next.available && !next.authenticated) {
+        if ("connected" in next && next.available && !next.connected) {
           setFeedback({ role: "alert", text: error });
         }
       });
@@ -695,9 +696,9 @@ function SlackSettings({ callback }: { callback: string | null }) {
       await perform();
     } catch (cause) {
       setFeedback({ role: "alert", text: message(cause) });
-      if (settings?.authenticated) {
+      if (settings?.connected || settings?.authenticated) {
         const next = await readSlackStatus();
-        const connectionChanged = "error" in next || !next.available || !next.authenticated || !next.connected ||
+        const connectionChanged = "error" in next || !next.available || !next.connected ||
           next.workspace_name !== settings.workspace_name;
         if (connectionChanged) {
           setChannels(null);
@@ -711,33 +712,31 @@ function SlackSettings({ callback }: { callback: string | null }) {
     }
   }
 
-  function unlock(event: FormEvent<HTMLFormElement>) {
+  function authorizeSetup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const password = new FormData(event.currentTarget).get("password");
     event.currentTarget.reset();
     if (typeof password !== "string" || !password) return;
-    void runAction("Unlocking Slack settings…", async () => {
+    void runAction("Opening Slack…", async () => {
       await post<void>(`${slackPath}/session`, { password });
-      const next = await readSlackStatus();
-      setChannels(null);
-      setDraft(null);
-      setStatus(next);
-      if ("authenticated" in next && next.available && !next.authenticated) {
-        throw new Error("Could not start a maintainer session. Try again.");
-      }
+      await openSlack();
     });
   }
 
   function connect() {
-    void runAction("Opening Slack…", async () => {
-      const { url } = await post<{ url: string }>(`${slackPath}/connect`, {});
-      const destination = URL.parse(url);
-      if (!destination || destination.origin !== "https://slack.com" ||
-          destination.pathname !== "/oauth/v2/authorize" || destination.username || destination.password) {
-        throw new Error("Slack authorization returned an invalid link.");
-      }
-      window.location.assign(destination.href);
-    });
+    setSetupRequested(true);
+    setFeedback(null);
+    if (settings?.authenticated) void runAction("Opening Slack…", openSlack);
+  }
+
+  async function openSlack() {
+    const { url } = await post<{ url: string }>(`${slackPath}/connect`, {});
+    const destination = URL.parse(url);
+    if (!destination || destination.origin !== "https://slack.com" ||
+        destination.pathname !== "/oauth/v2/authorize" || destination.username || destination.password) {
+      throw new Error("Slack authorization returned an invalid link.");
+    }
+    window.location.assign(destination.href);
   }
 
   function selectChannel(team: TeamKey, channel: string) {
@@ -777,9 +776,8 @@ function SlackSettings({ callback }: { callback: string | null }) {
       {!action && !feedback && callback === "error" &&
         <p role="alert">Slack authorization did not complete. Try connecting again.</p>}
       {!action && !feedback && callback === "connected" && settings?.available && (
-        !settings.authenticated ? <p role="status">Unlock Slack settings to verify the connection.</p> :
-          settings.connected ? <p role="status">Slack workspace connected.</p> :
-            <p role="alert">Could not verify the Slack connection. Try connecting again.</p>
+        settings.connected ? <p role="status">Slack workspace connected.</p> :
+          <p role="alert">Could not verify the Slack connection. Try connecting again.</p>
       )}
       {status === null && <p role="status">Loading Slack settings…</p>}
       {status && "error" in status && (
@@ -791,21 +789,22 @@ function SlackSettings({ callback }: { callback: string | null }) {
         </>
       )}
       {settings && !settings.available && <p>Slack delivery is unavailable.</p>}
-      {settings?.available && !settings.authenticated && (
-        <form onSubmit={unlock} autoComplete="off">
+      {connected && <p>Workspace <strong>{settings.workspace_name ?? "Slack"}</strong></p>}
+      {settings?.available && (setupRequested && !settings.authenticated ? (
+        <form onSubmit={authorizeSetup} autoComplete="off">
           <fieldset disabled={Boolean(action)}>
             <label>Maintainer passphrase<input name="password" type="password" required /></label>
-            <button type="submit">Unlock Slack settings</button>
+            <button type="submit">Continue to Slack</button>
+            <button type="button" onClick={() => { setSetupRequested(false); setFeedback(null); }}>Cancel</button>
           </fieldset>
         </form>
-      )}
-      {settings?.available && settings.authenticated && !settings.connected && (
-        <button type="button" disabled={Boolean(action)} onClick={connect}>Connect Slack</button>
-      )}
+      ) : (
+        <button type="button" disabled={Boolean(action)} onClick={connect}>
+          {connected ? "Reconnect Slack" : "Connect Slack"}
+        </button>
+      ))}
       {connected && (
         <>
-          <p>Workspace <strong>{settings.workspace_name ?? "Slack"}</strong></p>
-          <button type="button" disabled={Boolean(action)} onClick={connect}>Reconnect Slack</button>
           {channels === null && <p role="status">Loading Slack channels…</p>}
           {channels && "error" in channels && <p role="alert">{channels.error}</p>}
           {Array.isArray(channels) && channels.length === 0 && (
