@@ -37,9 +37,7 @@ type AnalysisSettings = { quality: "economy" | "higher_quality" };
 type ArticleFeedSettings = {
   source_id: number;
   source_name: string;
-  website: string;
   url: string | null;
-  discovery_only: boolean;
 };
 type WatchStatus = {
   available: boolean;
@@ -67,7 +65,7 @@ type DigestEntry = {
   relevant_teams: TeamKey[];
   team_reasons: Partial<Record<TeamKey, string>>;
 } & (
-  | { kind?: never; page_id: number; page_url: string; hold_reason?: "discovery_only" }
+  | { kind?: never; page_id: number; page_url: string }
   | { kind: "article"; title: string; article_url: string; source_id: number; hold_reason?: "business_fit_unverified" }
 );
 const digestAnalysisStatus = {
@@ -76,11 +74,8 @@ const digestAnalysisStatus = {
   completed: "Analysis summary unavailable.",
   failed: "Analysis failed.",
 } satisfies Record<DigestEntry["status"], string>;
-const discoveryOnlyReason = "Held because this page is set to discovery only.";
-const digestHoldReasons = {
-  discovery_only: discoveryOnlyReason,
-  business_fit_unverified: "Held because no single change was verified to match both your business and team interests.",
-};
+const businessFitUnverifiedReason =
+  "Held because no single change was verified to match both your business and team interests.";
 const configurationPath = "/?view=configuration";
 const articleFeedsPath = "/api/maintainer/article-feeds";
 const slackPath = "/api/maintainer/slack";
@@ -167,9 +162,7 @@ function RawComparison({ change, result }: { change: PageChange; result?: Change
 function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
   pageId: number; pageUrl: string; requestedVersion: string | null;
 }) {
-  const [history, setHistory] = useState<{ changes: PageChange[]; historyGap: boolean; discoveryOnly: boolean } | null>(
-    null,
-  );
+  const [history, setHistory] = useState<{ changes: PageChange[]; historyGap: boolean } | null>(null);
   const [selectedVersion, setSelectedVersion] = useState(requestedVersion);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -177,7 +170,6 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
   const [analyses, setAnalyses] = useState<Record<string, PageChangeAnalysis> | null>(null);
   const [analysisError, setAnalysisError] = useState(false);
   const changes = history?.changes ?? null;
-  const discoveryOnly = history?.discoveryOnly;
   const selected = selectedVersion === null ? changes?.[0] : changes?.find((change) => change.version === selectedVersion);
   const analysis = selected && analyses?.[selected.version];
   const result = analysis?.status === "completed" ? analysis.result : null;
@@ -190,13 +182,12 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
     async function refresh() {
       const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
       try {
-        const metadata = { historyGap: false, discoveryOnly: false };
+        let historyGap = false;
         const changes = await request<PageChange[]>(`/api/pages/${pageId}/changes`, { signal }, (headers) => {
-          metadata.historyGap = headers.get("X-SignalWatch-History-Gap") === "true";
-          metadata.discoveryOnly = headers.get("X-SignalWatch-Hold-Reason") === "discovery_only";
+          historyGap = headers.get("X-SignalWatch-History-Gap") === "true";
         });
         if (!controller.signal.aborted) {
-          setHistory({ changes, ...metadata });
+          setHistory({ changes, historyGap });
           setSelectedVersion((version) =>
             version === requestedVersion || changes.some((change) => change.version === version) ? version : null,
           );
@@ -259,7 +250,7 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
             <ChangeTime version={selected.version} />
             <a href={pageUrl}>Open source page</a>
           </div>
-          {analysisError && !discoveryOnly && (
+          {analysisError && (
             <p role="alert">Could not load change analysis. Use Refresh changes to try again.</p>
           )}
           {result ? (
@@ -267,14 +258,14 @@ function ChangeHistory({ pageId, pageUrl, requestedVersion }: {
               <h2 className="change-summary-title">Summary</h2>
               <p className="change-summary">{result.summary}</p>
             </>
-          ) : !analysisError && !discoveryOnly && (
+          ) : !analysisError && (
             <p role="status">
               {analyses === null ? "Loading analysis…" : analysis?.status === "failed"
                 ? "Analysis failed for this edit." : "Analysis pending."}
             </p>
           )}
-          {discoveryOnly ? <p className="muted">{discoveryOnlyReason}</p> : result && <TeamTakeaways result={result} />}
-          <RawComparison key={selected.version} change={selected} result={discoveryOnly ? null : result} />
+          {result && <TeamTakeaways result={result} />}
+          <RawComparison key={selected.version} change={selected} result={result} />
         </article>
       )}
     </div>
@@ -488,7 +479,8 @@ function Digest({ held }: { held: boolean }) {
         <ol className="digest-feed">
           {entries.map((entry) => {
             const isArticle = entry.kind === "article";
-            const holdReason = entry.hold_reason ? digestHoldReasons[entry.hold_reason] : null;
+            const holdReason = isArticle && entry.hold_reason === "business_fit_unverified"
+              ? businessFitUnverifiedReason : null;
             const sourceUrl = isArticle ? entry.article_url : entry.page_url;
             const destination = new URL(sourceUrl);
             const sourceLocation = isArticle || destination.pathname === "/"
@@ -935,10 +927,9 @@ function ArticleDiscoverySettings() {
 }
 
 function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
-  const [settings, setSettings] = useState(feed);
+  const [feedUrl, setFeedUrl] = useState(feed.url ?? "");
   const [saveState, setSaveState] = useState<"saving" | "saved" | null>(null);
   const [error, setError] = useState("");
-  const url = settings.url?.trim() || null;
 
   async function saveFeed(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -946,11 +937,12 @@ function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
     setSaveState("saving");
     setError("");
     try {
-      setSettings(await request<ArticleFeedSettings>(`${articleFeedsPath}/${feed.source_id}`, {
+      const saved = await request<ArticleFeedSettings>(`${articleFeedsPath}/${feed.source_id}`, {
         method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, discovery_only: url !== null && settings.discovery_only }),
+        body: JSON.stringify({ url: feedUrl.trim() || null }),
         signal: AbortSignal.timeout(8000),
-      }));
+      });
+      setFeedUrl(saved.url ?? "");
       setSaveState("saved");
     } catch (cause) {
       setError(`Could not save feed settings. ${message(cause)}`);
@@ -966,16 +958,8 @@ function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
       <fieldset disabled={saveState === "saving"}>
         <legend>{feed.source_name}</legend>
         <label>RSS 2.0 URL
-          <input type="url" name="url" value={settings.url ?? ""} aria-describedby="article-feed-help"
-            onChange={(event) => {
-              const value = event.target.value;
-              setSettings({ ...settings, url: value, discovery_only: value.trim() !== "" && settings.discovery_only });
-            }} />
-        </label>
-        <label className="article-feed-discovery">
-          <input type="checkbox" name="discovery_only" checked={settings.discovery_only} disabled={url === null}
-            onChange={(event) => setSettings({ ...settings, discovery_only: event.target.checked })} />
-          <span>Use the first page for discovery only<small className="muted">{feed.website}</small></span>
+          <input type="url" name="url" value={feedUrl} aria-describedby="article-feed-help"
+            onChange={(event) => setFeedUrl(event.target.value)} />
         </label>
         <button type="submit">{saveState === "saving" ? "Saving…" : "Save feed"}</button>
       </fieldset>

@@ -46,7 +46,7 @@ _TEAM_INTERESTS_SCHEMA = """(
 )"""
 _ARTICLE_FEEDS_SCHEMA = """(
     source_id INTEGER PRIMARY KEY REFERENCES competitors(id) ON DELETE CASCADE,
-    url TEXT NOT NULL, discovery_only INTEGER NOT NULL CHECK (discovery_only IN (0, 1)),
+    url TEXT NOT NULL,
     seeded INTEGER NOT NULL DEFAULT 0 CHECK (seeded IN (0, 1))
 )"""
 _DISCOVERED_ARTICLES_SCHEMA = """(
@@ -77,11 +77,6 @@ _SLACK_CONNECTION_SCHEMA = """(
     workspace_name TEXT NOT NULL, encrypted_token TEXT NOT NULL,
     channel_id TEXT, enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
     CHECK (enabled = 0 OR channel_id IS NOT NULL)
-)"""
-_DISCOVERY_ONLY_PAGE_SQL = """EXISTS (
-    SELECT 1 FROM article_feeds JOIN competitors ON competitors.id = article_feeds.source_id
-    WHERE article_feeds.source_id = pages.competitor_id AND article_feeds.discovery_only
-        AND competitors.website = pages.url
 )"""
 _DIGEST_LIMIT = 50
 
@@ -131,7 +126,6 @@ class DigestEntry(_DigestAnalysis):
     page_id: int
     source_name: str
     page_url: str
-    hold_reason: Literal["discovery_only"] | None = Field(default=None, exclude_if=lambda reason: reason is None)
 
 
 class DigestArticle(_DigestAnalysis):
@@ -176,7 +170,6 @@ class ArticleFeedSettings(BaseModel):
     source_name: str
     website: str
     url: str | None
-    discovery_only: bool
 
 
 @dataclass(frozen=True)
@@ -270,19 +263,10 @@ def list_page_changes(page_id: int) -> list[PageChange]:
     return [PageChange.model_validate(dict(row)) for row in rows]
 
 
-def is_discovery_only_page(page_id: int) -> bool:
-    with _database() as database:
-        row = database.execute(
-            f"SELECT 1 FROM pages WHERE id = ? AND {_DISCOVERY_ONLY_PAGE_SQL}", (page_id,)
-        ).fetchone()
-    return row is not None
-
-
-_DIGEST_ITEMS_SQL = f"""WITH items AS (
+_DIGEST_ITEMS_SQL = """WITH items AS (
     SELECT changes.page_id, changes.version, competitors.id AS source_id, competitors.name AS source_name,
            pages.url AS page_url,
            NULL AS title, NULL AS article_url, analyses.status, analyses.result,
-           CASE WHEN {_DISCOVERY_ONLY_PAGE_SQL} THEN 'discovery_only' END AS hold_reason,
            1 AS business_fit
     FROM page_changes AS changes
     JOIN pages ON pages.id = changes.page_id
@@ -292,7 +276,7 @@ _DIGEST_ITEMS_SQL = f"""WITH items AS (
     WHERE changes.before IS NOT NULL AND pages.state = :linked AND pages.watch_id IS NOT NULL
     UNION ALL
     SELECT NULL, articles.discovered_at, articles.source_id, competitors.name, NULL, articles.title,
-           articles.article_url, analyses.status, analyses.result, NULL,
+           articles.article_url, analyses.status, analyses.result,
            COALESCE(json_type(analyses.result, '$.change_quote') = 'text'
                AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
                AND EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> ''), 0)
@@ -302,7 +286,7 @@ _DIGEST_ITEMS_SQL = f"""WITH items AS (
     WHERE articles.discovered_at IS NOT NULL
 )"""
 
-_DIGEST_RELEVANCE_SQL = """COALESCE(hold_reason IS NULL AND business_fit AND status = 'completed' AND (
+_DIGEST_RELEVANCE_SQL = """COALESCE(business_fit AND status = 'completed' AND (
     json_extract(result, '$.marketing.relevant') OR json_extract(result, '$.product.relevant')
     OR json_extract(result, '$.research_and_development.relevant')
 ), 0)"""
@@ -326,9 +310,7 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
         if row["status"] == "completed" and row["result"] is not None
         else None
     )
-    hold_reason = row["hold_reason"]
-    if is_article and analysis is not None and not row["business_fit"]:
-        hold_reason = "business_fit_unverified"
+    hold_reason = "business_fit_unverified" if is_article and analysis is not None and not row["business_fit"] else None
     decisions = analysis.model_dump(exclude={"summary"}) if analysis and hold_reason is None else {}
     relevant_teams = [team for team in DigestTeam if team in decisions and decisions[team]["relevant"]]
     reason_teams = list(decisions) if is_article and view == DigestView.HELD else relevant_teams
@@ -463,15 +445,15 @@ def _enqueue_slack_delivery(
 def list_article_feed_settings() -> list[ArticleFeedSettings]:
     with _database() as database:
         rows = database.execute(
-            """SELECT competitors.id AS source_id, competitors.name AS source_name, competitors.website,
-                      article_feeds.url, COALESCE(article_feeds.discovery_only, 0) AS discovery_only
+            """SELECT competitors.id AS source_id, competitors.name AS source_name,
+                      competitors.website, article_feeds.url
             FROM competitors LEFT JOIN article_feeds ON competitors.id = article_feeds.source_id
             ORDER BY competitors.id"""
         ).fetchall()
     return [ArticleFeedSettings.model_validate(dict(row)) for row in rows]
 
 
-def set_article_feed(*, source_id: int, url: str | None, discovery_only: bool) -> ArticleFeedSettings | None:
+def set_article_feed(*, source_id: int, url: str | None) -> ArticleFeedSettings | None:
     with _database() as database:
         database.execute("BEGIN IMMEDIATE")
         source = database.execute("SELECT name, website FROM competitors WHERE id = ?", (source_id,)).fetchone()
@@ -479,20 +461,18 @@ def set_article_feed(*, source_id: int, url: str | None, discovery_only: bool) -
             return None
         if url is None:
             database.execute("DELETE FROM article_feeds WHERE source_id = ?", (source_id,))
-            discovery_only = False
         else:
             database.execute(
-                """INSERT INTO article_feeds (source_id, url, discovery_only) VALUES (?, ?, ?)
-                ON CONFLICT (source_id) DO UPDATE SET url = excluded.url, discovery_only = excluded.discovery_only,
+                """INSERT INTO article_feeds (source_id, url) VALUES (?, ?)
+                ON CONFLICT (source_id) DO UPDATE SET url = excluded.url,
                     seeded = CASE WHEN article_feeds.url = excluded.url THEN article_feeds.seeded ELSE 0 END""",
-                (source_id, url, discovery_only),
+                (source_id, url),
             )
     return ArticleFeedSettings(
         source_id=source_id,
         source_name=source["name"],
         website=source["website"],
         url=url,
-        discovery_only=discovery_only,
     )
 
 
@@ -576,9 +556,8 @@ def save_article_analysis(
 def list_unqueued_changes(limit: int = 100) -> list[tuple[int, int]]:
     with _database() as database:
         rows = database.execute(
-            f"""SELECT changes.page_id, changes.version FROM page_changes AS changes
-            JOIN pages ON pages.id = changes.page_id
-            WHERE changes.before IS NOT NULL AND NOT {_DISCOVERY_ONLY_PAGE_SQL} AND NOT EXISTS (
+            """SELECT changes.page_id, changes.version FROM page_changes AS changes
+            WHERE changes.before IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM change_analyses AS analyses
                 WHERE analyses.page_id = changes.page_id AND analyses.version = changes.version
             )
@@ -591,10 +570,7 @@ def list_unqueued_changes(limit: int = 100) -> list[tuple[int, int]]:
 def get_change_for_analysis(page_id: int, version: int) -> ChangeToAnalyze | None:
     with _database() as database:
         row = database.execute(
-            f"""SELECT changes.before, changes.after FROM page_changes AS changes
-            JOIN pages ON pages.id = changes.page_id
-            WHERE changes.page_id = ? AND changes.version = ? AND changes.before IS NOT NULL
-                AND NOT {_DISCOVERY_ONLY_PAGE_SQL}""",
+            "SELECT before, after FROM page_changes WHERE page_id = ? AND version = ? AND before IS NOT NULL",
             (page_id, version),
         ).fetchone()
     return ChangeToAnalyze(before=row["before"], after=row["after"]) if row is not None else None
@@ -854,6 +830,12 @@ def _database() -> Iterator[sqlite3.Connection]:
                 database.execute("ALTER TABLE team_interests ADD COLUMN business_context TEXT NOT NULL DEFAULT ''")
             database.commit()
         database.execute(f"CREATE TABLE IF NOT EXISTS article_feeds {_ARTICLE_FEEDS_SCHEMA}")
+        schema_query = "SELECT 1 FROM pragma_table_info('article_feeds') WHERE name = 'discovery_only'"
+        if database.execute(schema_query).fetchone() is not None:
+            database.execute("BEGIN IMMEDIATE")
+            if database.execute(schema_query).fetchone() is not None:
+                database.execute("ALTER TABLE article_feeds DROP COLUMN discovery_only")
+            database.commit()
         database.execute(f"CREATE TABLE IF NOT EXISTS discovered_articles {_DISCOVERED_ARTICLES_SCHEMA}")
         database.execute(
             f"CREATE TABLE IF NOT EXISTS discovered_article_analyses {_DISCOVERED_ARTICLE_ANALYSES_SCHEMA}"

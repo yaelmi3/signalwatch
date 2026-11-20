@@ -109,11 +109,11 @@ def test_team_interests_default_trim_and_persist(tmp_path: Path, monkeypatch: py
 
 def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
-    discovery_home = storage.save_competitor("First", "https://first.example/").pages[0]
-    first = storage.save_page(discovery_home.competitor_id, "https://first.example/updates")
+    homepage = storage.save_competitor("First", "https://first.example/").pages[0]
+    first = storage.save_page(homepage.competitor_id, "https://first.example/updates")
     second = storage.save_competitor("Second", "https://second.example/").pages[0]
     unlinked = storage.save_competitor("Unlinked", "https://unlinked.example/").pages[0]
-    for page in (first, second, unlinked, discovery_home):
+    for page in (first, second, unlinked, homepage):
         storage.link_watch(page.id, f"watch-{page.id}")
     for page, version, before in (
         (first, 9, "old snapshot"),
@@ -122,7 +122,7 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
         (second, 8, "old snapshot"),
         (first, 99, None),
         (unlinked, 100, "old snapshot"),
-        (discovery_home, 11, "old snapshot"),
+        (homepage, 11, "old snapshot"),
     ):
         assert storage.save_page_version(
             page_id=page.id, watch_id=f"watch-{page.id}", version=version, before=before, after="new snapshot"
@@ -141,7 +141,7 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
     storage.mark_analysis_queued(second.id, 10)
     storage.save_change_analysis(second.id, 8, None)
     homepage_analysis = ChangeAnalysisResult(
-        summary="Front-page rankings changed.", marketing=marketing, product=product, research_and_development=research
+        summary="Homepage pricing changed.", marketing=marketing, product=product, research_and_development=research
     )
     storage.save_change_analysis(
         first.id,
@@ -151,20 +151,28 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
         ),
     )
     storage.save_team_interests(TeamInterests(product="New feature announcements"))
-    storage.set_article_feed(source_id=first.competitor_id, url="https://first.example/feed.xml", discovery_only=True)
-    assert (discovery_home.id, 11) not in storage.list_unqueued_changes()
-    assert storage.get_change_for_analysis(discovery_home.id, 11) is None
-    assert storage.get_change_for_analysis(first.id, 10) is not None
-    storage.save_change_analysis(discovery_home.id, 11, homepage_analysis)
+    storage.set_article_feed(source_id=first.competitor_id, url="https://first.example/feed.xml")
+    assert (homepage.id, 11) in storage.list_unqueued_changes()
+    assert storage.get_change_for_analysis(homepage.id, 11) == storage.ChangeToAnalyze("old snapshot", "new snapshot")
+    storage.save_change_analysis(homepage.id, 11, homepage_analysis)
 
     with TestClient(app) as client:
         response = client.get("/api/digest")
         held = client.get("/api/digest", params={"view": "held"})
-        homepage_changes = client.get(f"/api/pages/{discovery_home.id}/changes")
-        other_changes = client.get(f"/api/pages/{first.id}/changes")
-        history = client.get(f"/api/pages/{discovery_home.id}/analysis")
+        homepage_changes = client.get(f"/api/pages/{homepage.id}/changes")
+        history = client.get(f"/api/pages/{homepage.id}/analysis")
     assert response.status_code == HTTPStatus.OK
     assert response.json() == [
+        {
+            "page_id": homepage.id,
+            "version": "11",
+            "source_name": "First",
+            "page_url": homepage.url,
+            "status": "completed",
+            "summary": "Homepage pricing changed.",
+            "relevant_teams": ["marketing", "research_and_development"],
+            "team_reasons": {"marketing": "Pricing changed", "research_and_development": "API terms changed"},
+        },
         {
             "page_id": first.id,
             "version": "10",
@@ -178,17 +186,6 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
     ]
     assert held.status_code == HTTPStatus.OK
     assert held.json() == [
-        {
-            "page_id": discovery_home.id,
-            "version": "11",
-            "source_name": "First",
-            "page_url": discovery_home.url,
-            "status": "completed",
-            "summary": "Front-page rankings changed.",
-            "relevant_teams": [],
-            "team_reasons": {},
-            "hold_reason": "discovery_only",
-        },
         {
             "page_id": second.id,
             "version": "10",
@@ -221,9 +218,8 @@ def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monke
         },
     ]
 
-    assert homepage_changes.status_code == other_changes.status_code == HTTPStatus.OK
-    assert homepage_changes.headers["X-SignalWatch-Hold-Reason"] == "discovery_only"
-    assert "X-SignalWatch-Hold-Reason" not in other_changes.headers
+    assert homepage_changes.status_code == HTTPStatus.OK
+    assert "X-SignalWatch-Hold-Reason" not in homepage_changes.headers
     assert homepage_changes.json() == [{"version": "11", "before": "old snapshot", "after": "new snapshot"}]
     assert history.json()["11"] == {"status": "completed", "result": homepage_analysis.model_dump()}
 
@@ -240,13 +236,13 @@ def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, mo
     stale = storage.Article("From the previous feed", "https://publisher.example/stale")
 
     with TestClient(app) as client:
-        disabled = {**entry, "url": None, "discovery_only": False}
+        disabled = {**entry, "url": None}
         assert client.get(_ARTICLE_FEEDS).json() == [disabled]
-        response = client.put(settings_url, json={"url": "http://127.0.0.1/rss", "discovery_only": False})
+        response = client.put(settings_url, json={"url": "http://127.0.0.1/rss"})
         assert response.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
-        response = client.put(f"{_ARTICLE_FEEDS}/{source.id + 1}", json={"url": None, "discovery_only": False})
+        response = client.put(f"{_ARTICLE_FEEDS}/{source.id + 1}", json={"url": None})
         assert response.status_code == HTTPStatus.NOT_FOUND
-        enabled = {"url": first_feed.url, "discovery_only": True}
+        enabled = {"url": first_feed.url}
         response = client.put(settings_url, json=enabled)
         assert response.status_code == HTTPStatus.OK
         assert response.json() == entry | enabled
@@ -257,10 +253,10 @@ def test_article_feed_settings_keep_history_and_seed_new_urls(tmp_path: Path, mo
         assert client.get("/api/digest", params={"view": "held"}).json() == []
         storage.save_discovered_articles(first_feed, [new_article])
 
-        assert client.put(settings_url, json={**enabled, "url": next_feed.url}).status_code == HTTPStatus.OK
+        assert client.put(settings_url, json={"url": next_feed.url}).status_code == HTTPStatus.OK
         storage.save_discovered_articles(next_feed, [next_baseline])
         storage.save_discovered_articles(first_feed, [stale])
-        assert client.put(settings_url, json={"url": None, "discovery_only": True}).json() == disabled
+        assert client.put(settings_url, json={"url": None}).json() == disabled
         storage.save_discovered_articles(next_feed, [stale])
         assert storage.list_article_feeds() == []
         assert storage.list_unqueued_articles() == [(source.id, new_article.article_url)]
@@ -278,7 +274,7 @@ def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monke
     article = storage.Article("A new release", "https://publisher.example/release?ref=feed")
     for source in (first, second):
         feed = storage.ArticleFeed(source.id, f"{source.website}feed.xml")
-        storage.set_article_feed(source_id=feed.source_id, url=feed.url, discovery_only=False)
+        storage.set_article_feed(source_id=feed.source_id, url=feed.url)
         storage.save_discovered_articles(feed, [baseline])
         storage.save_discovered_articles(feed, [baseline, article, article])
     assert storage.list_unqueued_articles() == [(first.id, article.article_url), (second.id, article.article_url)]
@@ -295,10 +291,18 @@ def test_digest_keeps_per_source_articles_and_held_reasons(tmp_path: Path, monke
     storage.save_article_analysis(first.id, article.article_url, result)
     legacy = {**result.model_dump(exclude={"change_quote"}), "business_quote": result.change_quote}
     with sqlite3.connect(db_path) as database:
+        database.execute("""ALTER TABLE article_feeds ADD COLUMN
+            discovery_only INTEGER NOT NULL DEFAULT 1 CHECK (discovery_only IN (0, 1))""")
         database.execute(
             "INSERT INTO discovered_article_analyses VALUES (?, ?, 'completed', ?)",
             (second.id, article.article_url, json.dumps(legacy)),
         )
+    assert storage.list_article_feeds() == [
+        storage.ArticleFeed(source.id, f"{source.website}feed.xml") for source in (first, second)
+    ]
+    with sqlite3.connect(db_path) as database:
+        columns = [row[1] for row in database.execute("PRAGMA table_info(article_feeds)")]
+        assert columns == ["source_id", "url", "seeded"]
     unmatched = storage.Article("An operations update", "https://publisher.example/update")
     storage.save_discovered_articles(storage.ArticleFeed(second.id, f"{second.website}feed.xml"), [unmatched])
     unmatched_result = result.model_copy(update={"product": held, "summary": unmatched.title})
