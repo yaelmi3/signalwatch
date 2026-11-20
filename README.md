@@ -80,6 +80,35 @@ and Held shows why each team passed on an analyzed article.
 Select **Use the first page for discovery only** if that page serves as an article listing. Other watched pages under
 the source are still analyzed. Clearing the feed URL stops discovery and preserves the source's article history.
 
+### Optional Slack delivery
+
+Invite the Slack bot to a sandbox channel. For OAuth setup, add the `chat:write`, `channels:read`, and `groups:read`
+bot scopes. Register the exact HTTPS URL ending in `/api/maintainer/slack/callback` in Slack. This integration uses
+workspace bot tokens with token rotation off. Exclude the callback query string from proxy and hosting access logs.
+
+Set these server variables on the app and worker:
+
+| Variable | Value |
+| --- | --- |
+| `SIGNALWATCH_SLACK_CLIENT_ID` | Slack app client ID |
+| `SIGNALWATCH_SLACK_CLIENT_SECRET` | Slack app client secret |
+| `SIGNALWATCH_SLACK_REDIRECT_URL` | Exact registered HTTPS callback URL |
+| `SIGNALWATCH_SLACK_MAINTAINER_PASSWORD` | Strong random passphrase for Slack setup |
+| `SIGNALWATCH_SLACK_ENCRYPTION_KEY` | Private Fernet key, generated with `cryptography.fernet.Fernet.generate_key()` |
+
+In **Maintainer settings**, unlock **Slack delivery**, connect the workspace, save a channel the bot has joined, send
+a test, then enable delivery. The test works while delivery is disabled. The worker picks up saved settings while
+running. Keep the encryption key separate from SQLite backups. Changing the key requires reconnecting Slack.
+
+For environment-only delivery, leave the five OAuth variables unset and set `SIGNALWATCH_SLACK_BOT_TOKEN` and
+`SIGNALWATCH_SLACK_CHANNEL_ID` on the worker with the bot's `chat:write` scope and channel membership. Leave all
+Slack variables unset to disable delivery. Only newly completed analyses that qualify for Digest create a delivery.
+Pending posts keep their original channel ID and send only while that channel is enabled.
+
+The worker records one send attempt per item. Rejections, rate limits, and uncertain outcomes are logged and
+recorded in `slack_deliveries`. Review the recorded error and check the channel before resending manually.
+A timeout or interruption can leave the result uncertain even if Slack accepted the message.
+
 ### Worker upgrades and retention
 
 Before changing DBOS or workflow code, stop the worker and check its system database for unfinished jobs. Replace the

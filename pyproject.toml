@@ -5,6 +5,7 @@ description = "Competitor content monitoring with audience-specific insights."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "cryptography==50.0.2",
     "dbos>=3.6.0",
     "fastapi>=0.163.1",
     "httpx2==2.16.2",

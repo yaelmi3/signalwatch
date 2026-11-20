@@ -101,6 +101,9 @@ body {
 }
 .configuration [role="alert"], .digest-entry .digest-failed { color: #9b3028; }
 .configuration [role="status"] { color: var(--link); }
+.slack-settings form { max-width: 28rem; }
+.slack-settings label { min-width: 0; }
+.slack-settings select { width: 100%; }
 .configuration .team-interests-fields { display: grid; align-items: start; max-width: 34rem; }
 .team-interests-fields textarea { resize: vertical; }
 .team-interests-fields button { justify-self: start; }
