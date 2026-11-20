@@ -5,6 +5,9 @@ x-signalwatch: &signalwatch
   platform: linux/amd64
   pull_policy: never
   restart: unless-stopped
+  env_file:
+    - path: /opt/signalwatch/slack.env
+      required: false
   volumes:
     - type: bind
       source: ${SIGNALWATCH_STATE_DIR:?Set SIGNALWATCH_STATE_DIR to the persistent disk mount}/app

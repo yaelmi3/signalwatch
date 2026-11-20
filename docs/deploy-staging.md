@@ -124,6 +124,22 @@ Watch the workflow through rollout. Open [SignalWatch](http://127.0.0.1:8001) ov
 
 To retry, fix the reported error and dispatch from `main` again. Re-running a failed GitHub run deploys that run’s original commit, so use that option when it is still the release you intend to deploy. If the remote rollout already started, check the running containers and logs before retrying.
 
+## 5. Enable Slack delivery (optional)
+
+In the Slack app settings, register the exact HTTPS callback URL for this deployment. For the public SignalWatch site, use `https://signalwatch-q5xrkk4n7a-uc.a.run.app/api/maintainer/slack/callback`. Exclude callback query strings from gateway and hosting access logs before connecting Slack.
+
+Keep the values in Secret Manager under `signalwatch-slack-client-secret`, `signalwatch-slack-maintainer-passphrase`, and `signalwatch-slack-encryption-key`. Install the settings below from Secret Manager and the Slack app configuration into `/opt/signalwatch/slack.env` on the VM. Set owner `root:root` and mode `0600`. The app and worker both load this optional file.
+
+```dotenv
+SIGNALWATCH_SLACK_CLIENT_ID=<Slack app client ID>
+SIGNALWATCH_SLACK_CLIENT_SECRET=<existing Slack app client secret>
+SIGNALWATCH_SLACK_REDIRECT_URL=https://signalwatch-q5xrkk4n7a-uc.a.run.app/api/maintainer/slack/callback
+SIGNALWATCH_SLACK_MAINTAINER_PASSWORD=<strong random Slack-only passphrase>
+SIGNALWATCH_SLACK_ENCRYPTION_KEY=<private Fernet key>
+```
+
+After deploying from `main`, check that `GET /api/maintainer/slack` on the public site reports `available: true`. Open **Maintainer settings**, unlock **Slack delivery** with the Slack-only passphrase, and choose **Connect Slack**.
+
 ## Back up and roll back
 
 Clear `GCP_VM` and let any active deployment finish before maintenance. For upgrades that change DBOS or its workflows, follow the [worker upgrade procedure](../README.md#worker-upgrades-and-retention) using the previous release. The deploy script checks for unfinished jobs and saves SQLite backups under `/var/lib/signalwatch/backups` before switching releases.
