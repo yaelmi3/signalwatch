@@ -72,6 +72,20 @@ Open **Digest** for updates that match at least one team. Each match includes a 
 Select an edit to open its saved details. **Maintainer settings** links to **Held items** for skipped updates and
 analysis status.
 
+### Team feedback and suggested changes
+
+Set `SIGNALWATCH_FEEDBACK_ORIGIN` in the app or Compose environment to the exact origin of a private, access-controlled
+installation. Use HTTPS or localhost (`http://127.0.0.1:8001`). Leave it unset on the public demo.
+
+Use **Give feedback** on a saved update or **Report a missed update** if you can't find it. Choose the team.
+In **Maintainer settings**, select that team and click **Suggest change**. The worker proposes one edit to its
+interest note and compares the current and draft notes on up to three saved articles. Review the wording and
+each team's results. **Apply** saves the note for future analyses. **Dismiss** leaves the current note in place.
+The comparison sends no alerts.
+
+Suggestions require feedback on a saved article with the original text available. Older reports, uncaptured
+updates, and page-edit reports still appear in the feedback list.
+
 ### Article discovery
 
 Open **Maintainer settings → Article discovery** and give a source a public RSS 2.0 feed URL. The worker checks the feed

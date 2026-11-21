@@ -10,14 +10,146 @@ from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
 from typing import Any
+from unittest.mock import Mock
+from uuid import uuid4
 
 import httpx2
 import pytest
-from dbos import DBOS
+from dbos import DBOS, SetEnqueueOptions, SetWorkflowID
 from openai import OpenAI
+from pydantic import ValidationError
 
 from signalwatch import analysis_worker, article_content, article_feeds, slack_delivery, storage
-from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
+from signalwatch.analysis_models import ArticleAnalysisResult, ChangeAnalysisResult, TeamDecision, TeamInterests
+
+
+def test_feedback_suggestion_runs_in_worker_with_saved_article_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setenv("SIGNALWATCH_ANALYSIS_MODEL", "test-model")
+    monkeypatch.setattr(article_feeds, "sync_feeds", lambda: None)
+    monkeypatch.setattr(slack_delivery, "get_settings", lambda: None)
+    team = storage.DigestTeam.RESEARCH_AND_DEVELOPMENT
+    interests = TeamInterests(
+        business_context="AI security tools",
+        marketing="Positioning",
+        product="API launches",
+        research_and_development="New APIs",
+    )
+    proposed = "Security improvements to existing APIs"
+    draft = interests.model_copy(update={team.value: proposed})
+    storage.save_team_interests(interests)
+    source = storage.save_competitor("Vendor", "https://example.test/")
+    storage.set_article_feed(source_id=source.id, url="https://example.test/feed")
+    (feed,) = storage.list_article_feeds()
+    articles = [
+        (storage.Article("Solver", "https://example.test/solver"), "The release adds a solver API."),
+        (storage.Article("Safeguards", "https://example.test/safeguards"), "The API now redacts secrets."),
+        (storage.Article("Brand", "https://example.test/brand"), "The release changes the brand."),
+    ]
+    storage.save_discovered_articles(feed, [])
+    storage.save_discovered_articles(feed, [article for article, _ in articles])
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+
+    def scored(title: str, text: str, note: TeamInterests) -> ArticleAnalysisResult:
+        match = TeamDecision(relevant=True, reason="Matches the note", quote=text)
+        research_matches = title == "Safeguards" or (title == "Solver" and note == interests)
+        return ArticleAnalysisResult(
+            summary=text,
+            change_quote=text if title != "Brand" else None,
+            marketing=held,
+            product=match if title == "Solver" else held,
+            research_and_development=match if research_matches else held,
+        )
+
+    for article, text in articles:
+        assert storage.save_article_evidence(source.id, article.article_url, text) == text
+        storage.save_article_analysis(source.id, article.article_url, scored(article.title, text, interests))
+    solver, solver_text = articles[0]
+    storage.save_feedback(
+        storage.FeedbackInput(
+            id=uuid4(),
+            team=team,
+            judgment="noisy",
+            source_id=source.id,
+            url=solver.article_url,
+        )
+    )
+    seen = []
+    rate_limited = False
+
+    def propose(inputs: storage.SuggestionInputs, model: str) -> str:
+        assert inputs.interests == interests and inputs.team == team and model == "test-model"
+        assert inputs.cases[0].publisher_text == solver_text and inputs.cases[0].judgment == "noisy"
+        return proposed
+
+    def compare(
+        *, title: str, publisher_text: str, interests: TeamInterests, model: str, logger: Any
+    ) -> ArticleAnalysisResult:
+        nonlocal rate_limited
+        assert model == "test-model"
+        seen.append((title, publisher_text, interests))
+        if title == "Safeguards" and not rate_limited:
+            rate_limited = True
+            raise analysis_worker._TransientModelError("Provider returned HTTP 429")
+        return scored(title, publisher_text, interests)
+
+    monkeypatch.setattr(analysis_worker, "_suggest_interest", propose)
+    monkeypatch.setattr(analysis_worker, "analyze_article", compare)
+    queued = storage.start_suggestion(team)
+    stop = Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker = executor.submit(analysis_worker.run_worker, stop)
+        try:
+            _wait_until(lambda: storage.get_suggestion(team).status != "queued")
+        finally:
+            stop.set()
+            worker.result(timeout=15)
+
+    result = storage.get_suggestion(team)
+    assert result is not None and result.id == queued.id and result.status == "ready"
+    assert result.proposed_interest == proposed
+    expected_calls = [(article.title, text, note) for article, text in articles for note in (interests, draft)]
+    assert seen == expected_calls[:2] + [expected_calls[2]] + expected_calls[2:]
+    assert [(case.expected, case.current, case.proposed) for case in result.cases] == [
+        (False, [storage.DigestTeam.PRODUCT, team], [storage.DigestTeam.PRODUCT]),
+        (None, [team], [team]),
+        (None, [], []),
+    ]
+    assert storage.get_team_interests() == interests
+
+
+def test_suggestion_poll_fails_cancelled_job_without_reenqueuing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.setattr(storage, "list_queued_suggestions", lambda: ["cancelled", "waiting"])
+    finish = Mock()
+    monkeypatch.setattr(storage, "finish_suggestion", finish)
+    queue = analysis_worker._start_dbos()
+    try:
+        for suggestion_id in ("cancelled", "waiting"):
+            with SetWorkflowID(f"feedback-suggestion:{suggestion_id}"), SetEnqueueOptions(delay_seconds=60):
+                queue.enqueue(analysis_worker.suggest_team_interest, suggestion_id)
+        DBOS.cancel_workflow("feedback-suggestion:cancelled")
+        enqueue = Mock(wraps=queue.enqueue)
+        monkeypatch.setattr(queue, "enqueue", enqueue)
+        analysis_worker._enqueue_suggestions(queue)
+    finally:
+        DBOS.destroy()
+
+    finish.assert_called_once_with("cancelled", None, [], "The suggestion stopped before it finished. Try again.")
+    enqueue.assert_not_called()
+
+
+def test_interest_draft_uses_plain_string_schema_and_validates_locally() -> None:
+    draft = analysis_worker._InterestDraft
+    schema = draft.model_json_schema()["properties"]["interest"]
+    assert schema["type"] == "string" and "maxLength" not in schema
+    assert draft(interest="  Security safeguards  ").interest == "Security safeguards"
+    with pytest.raises(ValidationError):
+        draft(interest="a" * 1001)
 
 
 def test_worker_retries_handoff_and_limits_model_calls(

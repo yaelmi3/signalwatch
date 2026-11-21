@@ -472,16 +472,97 @@ function SiteNavigation({ active, nested }: {
   );
 }
 
+const feedbackPath = "/api/feedback";
+const suggestionPath = `${feedbackPath}/suggestion`;
+const feedbackJudgments = { useful: "Useful", noisy: "Noisy", missed: "Should have seen this" } as const;
+type FeedbackRow = {
+  id: string; team: TeamKey; judgment: keyof typeof feedbackJudgments; url: string; created_at: string;
+  note?: string | null; page_id?: number | null; version?: string | null; occurred_on?: string | null;
+};
+
+function FeedbackForm({ entry, pending }: { entry?: DigestEntry; pending: { current: Map<string, string> } }) {
+  const [team, setTeam] = useState<TeamKey | "">("");
+  const [status, setStatus] = useState<"saving" | "saved" | { error: string } | null>(null);
+  const shown = team !== "" && entry?.relevant_teams.includes(team);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const fields = new FormData(form);
+    const target = entry?.kind === "article" ? { url: entry.article_url, source_id: entry.source_id } : entry
+      ? { url: entry.page_url, page_id: entry.page_id, version: entry.version }
+      : { url: fields.get("url"), occurred_on: fields.get("occurred_on") || undefined };
+    const draft = { ...target, team, judgment: entry ? fields.get("judgment") : "missed", note: fields.get("note") };
+    const content = JSON.stringify(draft);
+    const submissions = pending.current;
+    const id = submissions.get(content) ?? crypto.randomUUID();
+    submissions.set(content, id);
+    setStatus("saving");
+    try {
+      await request<void>(feedbackPath, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...draft, id }), signal: AbortSignal.timeout(8000),
+      });
+      if (!form.isConnected) return;
+      submissions.delete(content);
+      form.reset();
+      setTeam("");
+      setStatus("saved");
+    } catch (cause) {
+      setStatus({ error: cause instanceof DOMException && cause.name === "TimeoutError"
+        ? "Could not confirm the save. Send again to retry." : message(cause) });
+    }
+  }
+
+  return (
+    <form onSubmit={submit} aria-label={entry ? "Give feedback" : "Report a missed update"}>
+      <fieldset disabled={status === "saving"}>
+        <label>Team
+          <select value={team} required onChange={(event) => {
+            setTeam(analysisTeams.find(([key]) => key === event.currentTarget.value)?.[0] ?? "");
+          }}>
+            <option value="">Choose a team</option>
+            {analysisTeams.map(([key, name]) => <option key={key} value={key}>{name}</option>)}
+          </select>
+        </label>
+        {entry ? (
+          <label>Feedback
+            <select key={team} name="judgment" defaultValue="" required disabled={!team}>
+              <option value="">Choose feedback</option>
+              {shown ? <><option value="useful">Useful</option><option value="noisy">Noisy</option></>
+                : <option value="missed">Should have seen this</option>}
+            </select>
+          </label>
+        ) : (
+          <>
+            <label>Update URL<input name="url" type="url" required /></label>
+            <label>Approximate date (optional)<input name="occurred_on" type="date" /></label>
+          </>
+        )}
+        <label>Note (optional)<input name="note" maxLength={1000} /></label>
+        <button type="submit" disabled={!team}>{status === "saving" ? "Saving…" : "Send feedback"}</button>
+      </fieldset>
+      {status === "saved" && <p role="status">Feedback saved.</p>}
+      {status && typeof status === "object" && <p role="alert">{status.error}</p>}
+    </form>
+  );
+}
+
 function Digest({ held }: { held: boolean }) {
   const [entries, setEntries] = useState<DigestEntry[] | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [error, setError] = useState(false);
+  const [feedbackEnabled, setFeedbackEnabled] = useState(false);
+  const [feedbackTarget, setFeedbackTarget] = useState<DigestEntry | "missing" | null>(null);
+  const pendingFeedback = useRef(new Map<string, string>());
 
   useEffect(() => {
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
     setError(false);
-    request<DigestEntry[]>(held ? "/api/digest?view=held" : "/api/digest", { signal })
+    request<DigestEntry[]>(held ? "/api/digest?view=held" : "/api/digest", { signal }, (headers) => {
+      if (!controller.signal.aborted) setFeedbackEnabled(headers.get("X-Feedback-Enabled") === "true");
+    })
       .then((entries) => { if (!controller.signal.aborted) setEntries(entries); })
       .catch(() => { if (!controller.signal.aborted) setError(true); });
     return () => controller.abort();
@@ -497,7 +578,16 @@ function Digest({ held }: { held: boolean }) {
             ? "Review analysis status and updates held from the digest."
             : "Updates that match your team interests."}</p>
         </div>
+        {feedbackEnabled && !held && (
+          <button type="button" aria-expanded={feedbackTarget === "missing"}
+            onClick={() => setFeedbackTarget(feedbackTarget === "missing" ? null : "missing")}>
+            Report a missed update
+          </button>
+        )}
       </div>
+      {feedbackEnabled && feedbackTarget === "missing" && (
+        <div className="panel feedback-report"><FeedbackForm pending={pendingFeedback} /></div>
+      )}
       {error ? (
         <div className="panel view-state">
           <p role="alert">{held ? "Could not load held items." : "Could not load the digest."}</p>
@@ -522,6 +612,7 @@ function Digest({ held }: { held: boolean }) {
             const completed = entry.status === "completed";
             const summary = completed ? entry.summary?.trim() : null;
             const takeaway = summary ? changeHeadline(summary) : null;
+            const title = isArticle ? entry.title : takeaway ?? "Page changed";
             const showAllReasons = held && isArticle;
             const teams = completed ? analysisTeams.filter(([key]) => showAllReasons
               ? entry.team_reasons[key] !== undefined : entry.relevant_teams.includes(key)) : [];
@@ -535,7 +626,7 @@ function Digest({ held }: { held: boolean }) {
                       <span>{isArticle ? `Via ${entry.source_name}` : entry.source_name}</span>
                       <ChangeTime version={entry.version} />
                     </div>
-                    <h2>{isArticle ? entry.title : takeaway ?? "Page changed"}</h2>
+                    <h2>{title}</h2>
                     {isArticle && takeaway && <p>{takeaway}</p>}
                     {!takeaway && !holdReason && (
                       <p className={entry.status === "failed" ? "error-text" : "muted"}>
@@ -565,7 +656,12 @@ function Digest({ held }: { held: boolean }) {
                     <a href={sourceUrl}>
                       {isArticle ? `Open article on ${sourceLocation}` : `Open source page · ${sourceLocation}`}
                     </a>
+                    {feedbackEnabled && (
+                      <button type="button" aria-expanded={feedbackTarget === entry} aria-label={`Give feedback on ${title}`}
+                        onClick={() => setFeedbackTarget(feedbackTarget === entry ? null : entry)}>Give feedback</button>
+                    )}
                   </footer>
+                  {feedbackEnabled && feedbackTarget === entry && <FeedbackForm entry={entry} pending={pendingFeedback} />}
                 </article>
               </li>
             );
@@ -669,8 +765,164 @@ function MaintainerSettings({ slackCallback }: { slackCallback: string | null })
         <AnalysisQualitySettings />
         <SlackSettings callback={slackCallback} />
         <ArticleDiscoverySettings />
+        <FeedbackReview />
       </div>
     </main>
+  );
+}
+
+type RuleSuggestion = {
+  id: string; team: TeamKey; status: "queued" | "ready" | "failed" | "applied";
+  current_interest: string; proposed_interest: string | null; error: string | null;
+  cases: {
+    title: string; url: string; expected: boolean | null; current: TeamKey[] | null; proposed: TeamKey[] | null;
+  }[];
+};
+
+function ArticleSuggestion() {
+  const [team, setTeam] = useState<TeamKey>(analysisTeams[0][0]);
+  const [checked, setChecked] = useState<{ team: TeamKey; suggestion: RuleSuggestion | null; error?: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [attempt, setAttempt] = useState(0);
+  const suggestion = checked?.team === team ? checked.suggestion : undefined;
+  const readError = checked?.team === team ? checked.error : undefined;
+  const teamName = analysisTeams.find(([key]) => key === team)?.[1];
+
+  useEffect(() => {
+    if (busy) return;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    async function check() {
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+      try {
+        const result = await request<RuleSuggestion | null>(`${suggestionPath}?team=${team}`, { signal, cache: "no-store" });
+        if (controller.signal.aborted) return;
+        setChecked({ team, suggestion: result });
+        if (result?.status === "queued") timer = window.setTimeout(check, 2000);
+      } catch (cause) {
+        if (!controller.signal.aborted) setChecked({ team, suggestion: null, error: message(cause) });
+      }
+    }
+    void check();
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [team, busy, attempt]);
+
+  async function act(endpoint: string, method: "POST" | "DELETE", body?: object) {
+    if (busy) return;
+    setBusy(true);
+    setActionError("");
+    try {
+      const result = await request<RuleSuggestion | undefined>(endpoint, {
+        method, signal: AbortSignal.timeout(8000),
+        headers: body ? { "Content-Type": "application/json" } : undefined, body: JSON.stringify(body),
+      });
+      setChecked({ team, suggestion: result ?? null });
+    } catch (cause) {
+      setActionError(message(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <h3>Article rule suggestions</h3>
+      <fieldset disabled={busy}>
+        <label>Team
+          <select value={team} onChange={(event) => {
+            const selected = analysisTeams.find(([key]) => key === event.currentTarget.value);
+            if (selected) { setTeam(selected[0]); setChecked(null); setActionError(""); }
+          }}>
+            {analysisTeams.map(([key, name]) => <option key={key} value={key}>{name}</option>)}
+          </select>
+        </label>
+        {!readError && (suggestion === null || suggestion?.status === "failed" || suggestion?.status === "applied") && (
+          <button type="button" className="button-primary" onClick={() => void act(suggestionPath, "POST", { team })}>
+            {suggestion?.status === "failed" ? "Retry suggestion" : "Suggest change"}
+          </button>
+        )}
+      </fieldset>
+      {busy ? <p role="status">Working…</p> : suggestion === undefined && <p role="status">Checking for a suggestion…</p>}
+      {suggestion?.status === "queued" && <p role="status">Preparing a suggestion and checking the article examples…</p>}
+      {readError && <>
+        <p role="alert">Could not check the suggestion. {readError}</p>
+        <button type="button" onClick={() => { setChecked(null); setAttempt((value) => value + 1); }}>Retry loading</button>
+      </>}
+      {actionError && <p role="alert">{actionError}</p>}
+      {suggestion?.status === "failed" && <p role="alert">{suggestion.error || "Could not prepare a suggestion."}</p>}
+      {suggestion?.status === "applied" && <p role="status">Suggestion applied to team interests.</p>}
+      {(suggestion?.status === "ready" || suggestion?.status === "applied") && <>
+        <dl className="suggestion-wording">
+          <dt>{suggestion.status === "applied" ? "Before" : "Current wording"}</dt>
+          <dd>{suggestion.current_interest || "No note set."}</dd>
+          <dt>{suggestion.status === "applied" ? "After" : "Suggested wording"}</dt>
+          <dd>{suggestion.proposed_interest}</dd>
+        </dl>
+        <table aria-label="Article decisions before and after the suggested change">
+          <thead><tr><th scope="col">Article</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
+          <tbody>{suggestion.cases.map((example) => (
+            <tr key={example.url}>
+              <th scope="row">
+                <a href={example.url}>{example.title}</a>
+                {example.expected !== null && <div>Expected for {teamName} · {example.expected ? "Show" : "Hold"}</div>}
+              </th>
+              {[example.current, example.proposed].map((teams, index) => (
+                <td key={index}>{teams === null ? "Unavailable" : analysisTeams.map(([key, name]) => (
+                  <div key={key}>{name} · {teams.includes(key) ? "Show" : "Hold"}</div>
+                ))}</td>
+              ))}
+            </tr>
+          ))}</tbody>
+        </table>
+        {suggestion.status === "ready" && <div className="button-row suggestion-actions">
+          <button type="button" className="button-primary" disabled={busy}
+            onClick={() => void act(`${suggestionPath}/${encodeURIComponent(suggestion.id)}/apply`, "POST")}>Apply</button>
+          <button type="button" disabled={busy}
+            onClick={() => void act(`${suggestionPath}/${encodeURIComponent(suggestion.id)}`, "DELETE")}>Dismiss</button>
+        </div>}
+      </>}
+    </>
+  );
+}
+
+function FeedbackReview() {
+  const [rows, setRows] = useState<FeedbackRow[] | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    fetch(feedbackPath, { signal, cache: "no-store" }).then(async (response) => {
+      if (response.status === 404) return;
+      if (!response.ok) throw new Error();
+      const feedback: FeedbackRow[] = await response.json();
+      if (!controller.signal.aborted) setRows(feedback);
+    }).catch(() => { if (!controller.signal.aborted) setError(true); });
+    return () => controller.abort();
+  }, []);
+
+  if (rows === null && !error) return null;
+
+  return (
+    <section className="panel feedback-review" aria-labelledby="feedback-review-title">
+      <h2 id="feedback-review-title">Feedback</h2>
+      {error && <p role="alert">Could not load feedback. Refresh to try again.</p>}
+      {rows && <>
+        <ArticleSuggestion />
+        <h3>Latest feedback</h3>
+        {rows.length === 0 ? <p>No feedback yet.</p> : <ul>{rows.map((row) => (
+          <li key={row.id}>
+            <strong>{analysisTeams.find(([key]) => key === row.team)?.[1]} · {feedbackJudgments[row.judgment]}</strong>
+            {" · "}<a href={row.url}>{row.url}</a>
+            {row.page_id && row.version && <> · <a
+              href={`/?view=history&page=${row.page_id}&version=${encodeURIComponent(row.version)}`}>History</a></>}
+            {" · "}<time dateTime={row.created_at}>{new Date(row.created_at).toLocaleDateString()}</time>
+            {row.occurred_on && <p>Occurred around {row.occurred_on}</p>}
+            {row.note && <p>{row.note}</p>}
+          </li>
+        ))}</ul>}
+      </>}
+    </section>
   );
 }
 
@@ -1067,6 +1319,7 @@ function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
 function TeamInterestsSettings() {
   const settingsPath = "/api/team-interests";
   const [interests, setInterests] = useState<TeamInterests | null>(null);
+  const savedInterests = useRef<TeamInterests | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [saveState, setSaveState] = useState<"saving" | "saved" | null>(null);
   const [error, setError] = useState("");
@@ -1076,7 +1329,11 @@ function TeamInterestsSettings() {
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
     setError("");
     request<TeamInterests>(settingsPath, { signal })
-      .then((interests) => { if (!controller.signal.aborted) setInterests(interests); })
+      .then((loaded) => {
+        if (controller.signal.aborted) return;
+        savedInterests.current = loaded;
+        setInterests(loaded);
+      })
       .catch(() => { if (!controller.signal.aborted) setError("Could not load team interests."); });
     return () => controller.abort();
   }, [loadAttempt]);
@@ -1089,14 +1346,21 @@ function TeamInterestsSettings() {
 
   async function saveInterests(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (interests === null || saveState === "saving") return;
+    const saved = savedInterests.current;
+    if (interests === null || saved === null || saveState === "saving") return;
+    const changes: Partial<TeamInterests> = {};
+    for (const key of ["business_context", ...analysisTeams.map(([key]) => key)] as const) {
+      if (interests[key].trim() !== saved[key]) changes[key] = interests[key];
+    }
     setSaveState("saving");
     setError("");
     try {
-      setInterests(await request<TeamInterests>(settingsPath, {
-        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(interests),
+      const updated = await request<TeamInterests>(settingsPath, {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(changes),
         signal: AbortSignal.timeout(8000),
-      }));
+      });
+      savedInterests.current = updated;
+      setInterests(updated);
       setSaveState("saved");
     } catch (cause) {
       setError(`Could not save team interests. ${message(cause)}`);

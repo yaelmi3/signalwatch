@@ -1,8 +1,9 @@
+import os
 from http import HTTPStatus
 from ipaddress import ip_address
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import AfterValidator, BaseModel, BeforeValidator, HttpUrl, StringConstraints
 
 from signalwatch import article_content, changedetection, storage
@@ -59,14 +60,86 @@ def _page(page_id: int) -> Page:
     return page
 
 
+def _feedback_origin() -> str:
+    return os.getenv("SIGNALWATCH_FEEDBACK_ORIGIN", "").strip()
+
+
+def _require_feedback_enabled() -> str:
+    if origin := _feedback_origin():
+        return origin
+    raise HTTPException(HTTPStatus.NOT_FOUND, "Feedback is unavailable.")
+
+
+def _require_feedback_origin(request: Request) -> None:
+    if request.headers.get("origin") != _require_feedback_enabled():
+        raise HTTPException(HTTPStatus.FORBIDDEN, "Use the SignalWatch site to submit feedback.")
+
+
 @router.get("/competitors")
 def list_competitors() -> list[Competitor]:
     return storage.list_competitors()
 
 
 @router.get("/digest")
-def digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | DigestArticle]:
+def digest(response: Response, view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | DigestArticle]:
+    if _feedback_origin():
+        response.headers["X-Feedback-Enabled"] = "true"
     return storage.list_digest(view)
+
+
+@router.get("/feedback", response_model_exclude_none=True, dependencies=[Depends(_require_feedback_enabled)])
+def list_feedback(response: Response) -> list[storage.Feedback]:
+    response.headers["Cache-Control"] = "no-store"
+    return storage.list_feedback()
+
+
+@router.post("/feedback", status_code=HTTPStatus.NO_CONTENT, dependencies=[Depends(_require_feedback_origin)])
+def submit_feedback(payload: storage.FeedbackInput) -> Response:
+    try:
+        storage.save_feedback(payload)
+    except LookupError as error:
+        raise HTTPException(HTTPStatus.NOT_FOUND, str(error)) from None
+    except ValueError as error:
+        raise HTTPException(HTTPStatus.CONFLICT, str(error)) from None
+    return Response(status_code=HTTPStatus.NO_CONTENT)
+
+
+class SuggestionRequest(BaseModel):
+    team: storage.DigestTeam
+
+
+@router.get("/feedback/suggestion", dependencies=[Depends(_require_feedback_enabled)])
+def get_suggestion(team: storage.DigestTeam, response: Response) -> storage.Suggestion | None:
+    response.headers["Cache-Control"] = "no-store"
+    return storage.get_suggestion(team)
+
+
+@router.post("/feedback/suggestion", dependencies=[Depends(_require_feedback_origin)])
+def start_suggestion(payload: SuggestionRequest) -> storage.Suggestion:
+    try:
+        return storage.start_suggestion(payload.team)
+    except ValueError as error:
+        raise HTTPException(HTTPStatus.CONFLICT, str(error)) from None
+
+
+@router.post("/feedback/suggestion/{suggestion_id}/apply", dependencies=[Depends(_require_feedback_origin)])
+def apply_suggestion(suggestion_id: str) -> storage.Suggestion:
+    try:
+        return storage.apply_suggestion(suggestion_id)
+    except LookupError as error:
+        raise HTTPException(HTTPStatus.NOT_FOUND, str(error)) from None
+    except ValueError as error:
+        raise HTTPException(HTTPStatus.CONFLICT, str(error)) from None
+
+
+@router.delete(
+    "/feedback/suggestion/{suggestion_id}",
+    status_code=HTTPStatus.NO_CONTENT,
+    dependencies=[Depends(_require_feedback_origin)],
+)
+def dismiss_suggestion(suggestion_id: str) -> Response:
+    storage.dismiss_suggestion(suggestion_id)
+    return Response(status_code=HTTPStatus.NO_CONTENT)
 
 
 @router.get("/team-interests")
@@ -78,6 +151,11 @@ def get_team_interests() -> TeamInterests:
 def set_team_interests(interests: TeamInterests) -> TeamInterests:
     storage.save_team_interests(interests)
     return interests
+
+
+@router.patch("/team-interests")
+def patch_team_interests(changes: TeamInterests) -> TeamInterests:
+    return storage.patch_team_interests(changes)
 
 
 @router.post("/competitors", status_code=HTTPStatus.CREATED)
