@@ -4,14 +4,15 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
 from time import time
-from typing import Literal
+from typing import Annotated, Literal, Self
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field, HttpUrl, StringConstraints, model_validator
 
 from signalwatch.analysis_models import AnalysisQuality, ChangeAnalysisResult, PageChangeAnalysis, TeamInterests
 
@@ -61,6 +62,11 @@ _DISCOVERED_ARTICLE_ANALYSES_SCHEMA = """(
     status TEXT NOT NULL CHECK (status IN ('queued', 'completed', 'failed')), result TEXT,
     PRIMARY KEY (source_id, article_url),
     FOREIGN KEY (source_id, article_url) REFERENCES discovered_articles(source_id, article_url) ON DELETE CASCADE
+)"""
+_FEEDBACK_SCHEMA = """(
+    id TEXT PRIMARY KEY NOT NULL, team TEXT NOT NULL, judgment TEXT NOT NULL, url TEXT NOT NULL, note TEXT,
+    page_id INTEGER, version TEXT, source_id INTEGER, occurred_on TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 )"""
 _SLACK_DELIVERIES_SCHEMA = """(
     id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL,
@@ -139,6 +145,42 @@ class DigestArticle(_DigestAnalysis):
     hold_reason: Literal["business_fit_unverified"] | None = Field(
         default=None, exclude_if=lambda reason: reason is None
     )
+
+
+type FeedbackItemId = Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
+
+
+class FeedbackInput(BaseModel):
+    id: UUID
+    team: DigestTeam
+    judgment: Literal["useful", "noisy", "missed"]
+    url: Annotated[str, StringConstraints(strip_whitespace=True)]
+    note: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)] | None = None
+    page_id: FeedbackItemId | None = None
+    version: Annotated[str, StringConstraints(pattern=r"^(0|-?[1-9][0-9]{0,18})$")] | None = None
+    source_id: FeedbackItemId | None = None
+    occurred_on: Annotated[str, StringConstraints(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")] | None = None
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        has_item_reference = self.page_id is not None or self.source_id is not None
+        # Saved page URLs can grow during percent encoding.
+        url = AnyHttpUrl(self.url) if has_item_reference else HttpUrl(self.url)
+        if not self.url.lower().startswith(("http://", "https://")) or url.username or url.password:
+            raise ValueError("Use a plain HTTP(S) URL without credentials.")
+        if (self.page_id is None) != (self.version is None) or (
+            self.page_id is not None and self.source_id is not None
+        ):
+            raise ValueError("Use either a page and version or an article source.")
+        if not has_item_reference and self.judgment != "missed":
+            raise ValueError("Only missed updates can be reported by URL alone.")
+        if self.occurred_on is not None:
+            date.fromisoformat(self.occurred_on)
+        return self
+
+
+class Feedback(FeedbackInput):
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -334,6 +376,40 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
     )
     model = DigestArticle if is_article else DigestEntry
     return model.model_validate(item)
+
+
+def list_feedback() -> list[Feedback]:
+    with _database() as database:
+        rows = database.execute("SELECT * FROM feedback ORDER BY rowid DESC LIMIT 50").fetchall()
+    return [Feedback.model_validate(dict(row)) for row in rows]
+
+
+def save_feedback(feedback: FeedbackInput) -> None:
+    fields = feedback.model_dump(mode="json")
+    with _database() as database:
+        if database.execute(
+            """INSERT INTO feedback (id, team, judgment, url, note, page_id, version, source_id, occurred_on)
+            SELECT :id, :team, :judgment, :url, :note, :page_id, :version, :source_id, :occurred_on
+            WHERE CASE
+                WHEN :page_id IS NOT NULL THEN EXISTS (
+                    SELECT 1 FROM page_changes AS changes JOIN pages ON pages.id = changes.page_id
+                    WHERE changes.page_id = :page_id AND changes.version = :version
+                        AND changes.before IS NOT NULL AND pages.url = :url
+                )
+                WHEN :source_id IS NOT NULL THEN EXISTS (
+                    SELECT 1 FROM discovered_articles WHERE source_id = :source_id AND article_url = :url
+                        AND discovered_at IS NOT NULL
+                )
+                ELSE 1
+            END ON CONFLICT (id) DO NOTHING""",
+            fields,
+        ).rowcount:
+            return
+        existing = database.execute("SELECT * FROM feedback WHERE id = ?", (fields["id"],)).fetchone()
+        if existing is None:
+            raise LookupError("The saved update was not found.")
+        if any(existing[key] != value for key, value in fields.items()):
+            raise ValueError("This feedback ID is already in use.")
 
 
 def claim_slack_delivery(
@@ -901,6 +977,7 @@ def _database() -> Iterator[sqlite3.Connection]:
         database.execute(
             f"CREATE TABLE IF NOT EXISTS discovered_article_analyses {_DISCOVERED_ARTICLE_ANALYSES_SCHEMA}"
         )
+        database.execute(f"CREATE TABLE IF NOT EXISTS feedback {_FEEDBACK_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_deliveries {_SLACK_DELIVERIES_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_connection {_SLACK_CONNECTION_SCHEMA}")
         _migrate_slack_tables(database)

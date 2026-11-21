@@ -472,16 +472,93 @@ function SiteNavigation({ active, nested }: {
   );
 }
 
+const feedbackPath = "/api/feedback";
+const feedbackJudgments = { useful: "Useful", noisy: "Noisy", missed: "Should have seen this" } as const;
+type FeedbackRow = {
+  id: string; team: TeamKey; judgment: keyof typeof feedbackJudgments; url: string; created_at: string;
+  note?: string | null; page_id?: number | null; version?: string | null; occurred_on?: string | null;
+};
+
+function FeedbackForm({ entry }: { entry?: DigestEntry }) {
+  const [team, setTeam] = useState<TeamKey | "">("");
+  const [status, setStatus] = useState<"saving" | "saved" | { error: string } | null>(null);
+  const submission = useRef<{ id: string; content: string } | null>(null);
+  const shown = team !== "" && entry?.relevant_teams.includes(team);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const fields = new FormData(form);
+    const target = entry?.kind === "article" ? { url: entry.article_url, source_id: entry.source_id } : entry
+      ? { url: entry.page_url, page_id: entry.page_id, version: entry.version }
+      : { url: fields.get("url"), occurred_on: fields.get("occurred_on") || undefined };
+    const draft = { ...target, team, judgment: entry ? fields.get("judgment") : "missed", note: fields.get("note") };
+    const content = JSON.stringify(draft);
+    if (submission.current?.content !== content) submission.current = { id: crypto.randomUUID(), content };
+    setStatus("saving");
+    try {
+      await request<void>(feedbackPath, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...draft, id: submission.current.id }), signal: AbortSignal.timeout(8000),
+      });
+      submission.current = null;
+      form.reset();
+      setTeam("");
+      setStatus("saved");
+    } catch (cause) {
+      setStatus({ error: cause instanceof DOMException && cause.name === "TimeoutError"
+        ? "Could not confirm the save. Send again to retry." : message(cause) });
+    }
+  }
+
+  return (
+    <form onSubmit={submit} aria-label={entry ? "Give feedback" : "Report a missed update"}>
+      <fieldset disabled={status === "saving"}>
+        <label>Team
+          <select value={team} required onChange={(event) => {
+            setTeam(analysisTeams.find(([key]) => key === event.currentTarget.value)?.[0] ?? "");
+          }}>
+            <option value="">Choose a team</option>
+            {analysisTeams.map(([key, name]) => <option key={key} value={key}>{name}</option>)}
+          </select>
+        </label>
+        {entry ? (
+          <label>Feedback
+            <select key={team} name="judgment" defaultValue="" required disabled={!team}>
+              <option value="">Choose feedback</option>
+              {shown ? <><option value="useful">Useful</option><option value="noisy">Noisy</option></>
+                : <option value="missed">Should have seen this</option>}
+            </select>
+          </label>
+        ) : (
+          <>
+            <label>Update URL<input name="url" type="url" required /></label>
+            <label>Approximate date (optional)<input name="occurred_on" type="date" /></label>
+          </>
+        )}
+        <label>Note (optional)<input name="note" maxLength={1000} /></label>
+        <button type="submit" disabled={!team}>{status === "saving" ? "Saving…" : "Send feedback"}</button>
+      </fieldset>
+      {status === "saved" && <p role="status">Feedback saved.</p>}
+      {status && typeof status === "object" && <p role="alert">{status.error}</p>}
+    </form>
+  );
+}
+
 function Digest({ held }: { held: boolean }) {
   const [entries, setEntries] = useState<DigestEntry[] | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [error, setError] = useState(false);
+  const [feedbackEnabled, setFeedbackEnabled] = useState(false);
+  const [feedbackTarget, setFeedbackTarget] = useState<DigestEntry | "missing" | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
     setError(false);
-    request<DigestEntry[]>(held ? "/api/digest?view=held" : "/api/digest", { signal })
+    request<DigestEntry[]>(held ? "/api/digest?view=held" : "/api/digest", { signal }, (headers) => {
+      if (!controller.signal.aborted) setFeedbackEnabled(headers.get("X-Feedback-Enabled") === "true");
+    })
       .then((entries) => { if (!controller.signal.aborted) setEntries(entries); })
       .catch(() => { if (!controller.signal.aborted) setError(true); });
     return () => controller.abort();
@@ -497,7 +574,16 @@ function Digest({ held }: { held: boolean }) {
             ? "Review analysis status and updates held from the digest."
             : "Updates that match your team interests."}</p>
         </div>
+        {feedbackEnabled && !held && (
+          <button type="button" aria-expanded={feedbackTarget === "missing"}
+            onClick={() => setFeedbackTarget(feedbackTarget === "missing" ? null : "missing")}>
+            Report a missed update
+          </button>
+        )}
       </div>
+      {feedbackEnabled && feedbackTarget === "missing" && (
+        <div className="panel feedback-report"><FeedbackForm /></div>
+      )}
       {error ? (
         <div className="panel view-state">
           <p role="alert">{held ? "Could not load held items." : "Could not load the digest."}</p>
@@ -522,6 +608,7 @@ function Digest({ held }: { held: boolean }) {
             const completed = entry.status === "completed";
             const summary = completed ? entry.summary?.trim() : null;
             const takeaway = summary ? changeHeadline(summary) : null;
+            const title = isArticle ? entry.title : takeaway ?? "Page changed";
             const showAllReasons = held && isArticle;
             const teams = completed ? analysisTeams.filter(([key]) => showAllReasons
               ? entry.team_reasons[key] !== undefined : entry.relevant_teams.includes(key)) : [];
@@ -535,7 +622,7 @@ function Digest({ held }: { held: boolean }) {
                       <span>{isArticle ? `Via ${entry.source_name}` : entry.source_name}</span>
                       <ChangeTime version={entry.version} />
                     </div>
-                    <h2>{isArticle ? entry.title : takeaway ?? "Page changed"}</h2>
+                    <h2>{title}</h2>
                     {isArticle && takeaway && <p>{takeaway}</p>}
                     {!takeaway && !holdReason && (
                       <p className={entry.status === "failed" ? "error-text" : "muted"}>
@@ -565,7 +652,12 @@ function Digest({ held }: { held: boolean }) {
                     <a href={sourceUrl}>
                       {isArticle ? `Open article on ${sourceLocation}` : `Open source page · ${sourceLocation}`}
                     </a>
+                    {feedbackEnabled && (
+                      <button type="button" aria-expanded={feedbackTarget === entry} aria-label={`Give feedback on ${title}`}
+                        onClick={() => setFeedbackTarget(feedbackTarget === entry ? null : entry)}>Give feedback</button>
+                    )}
                   </footer>
+                  {feedbackEnabled && feedbackTarget === entry && <FeedbackForm entry={entry} />}
                 </article>
               </li>
             );
@@ -669,8 +761,60 @@ function MaintainerSettings({ slackCallback }: { slackCallback: string | null })
         <AnalysisQualitySettings />
         <SlackSettings callback={slackCallback} />
         <ArticleDiscoverySettings />
+        <FeedbackReview />
       </div>
     </main>
+  );
+}
+
+function FeedbackReview() {
+  const [rows, setRows] = useState<FeedbackRow[] | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    fetch(feedbackPath, { signal, cache: "no-store" }).then(async (response) => {
+      if (response.status === 404) return;
+      if (!response.ok) throw new Error();
+      const feedback: FeedbackRow[] = await response.json();
+      if (!controller.signal.aborted) setRows(feedback);
+    }).catch(() => { if (!controller.signal.aborted) setError(true); });
+    return () => controller.abort();
+  }, []);
+
+  return (
+    <section className="panel feedback-review" aria-labelledby="feedback-review-title">
+      <h2 id="feedback-review-title">Feedback and replay</h2>
+      {error && <p role="alert">Could not load feedback. Refresh to try again.</p>}
+      {rows && <>
+        <h3>Latest feedback</h3>
+        {rows.length === 0 ? <p>No feedback yet.</p> : <ul>{rows.map((row) => (
+          <li key={row.id}>
+            <strong>{analysisTeams.find(([key]) => key === row.team)?.[1]} · {feedbackJudgments[row.judgment]}</strong>
+            {" · "}<a href={row.url}>{row.url}</a>
+            {row.page_id && row.version && <> · <a
+              href={`/?view=history&page=${row.page_id}&version=${encodeURIComponent(row.version)}`}>History</a></>}
+            {" · "}<time dateTime={row.created_at}>{new Date(row.created_at).toLocaleDateString()}</time>
+            {row.occurred_on && <p>Occurred around {row.occurred_on}</p>}
+            {row.note && <p>{row.note}</p>}
+          </li>
+        ))}</ul>}
+      </>}
+      <h3>Recorded R&D replay</h3>
+      <p className="muted">Nov 21, 2026 · Two passes with the same article excerpts, scorer, and GPT-5.4 mini.
+        The draft counts stronger safeguards on existing APIs and holds solver-only changes.</p>
+      <table aria-label="R&D relevance across two passes">
+        <thead><tr><th scope="col">Article</th><th scope="col">Baseline note</th><th scope="col">Draft note</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><a href="https://openai.com/index/combatting-adversarial-distillation/">OpenAI</a></th>
+            <td>Held, shown</td><td>Shown, shown</td></tr>
+          <tr><th scope="row"><a href="https://github.com/neoma-pcam/pcam-live">Neoma</a></th>
+            <td>Shown, shown</td><td>Held, held</td></tr>
+          <tr><th scope="row"><a href="https://github.com/diggerhq/opencomputer">OpenComputer</a></th>
+            <td>Held, held</td><td>Held, held</td></tr>
+        </tbody>
+      </table>
+    </section>
   );
 }
 
