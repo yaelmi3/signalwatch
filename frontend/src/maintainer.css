@@ -100,13 +100,19 @@
   min-width: 0;
 }
 
+.feedback-report { margin-bottom: 1rem; }
+.feedback-review h3 { margin-top: 0.85rem; }
+.feedback-review table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+.feedback-review :is(th, td) { border-bottom: 1px solid var(--rule); padding: 0.45rem 0.3rem; text-align: left; }
+
 @container maintainer (min-width: 45rem) {
   .maintainer-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .slack-settings,
-  .article-discovery-settings {
+  .article-discovery-settings,
+  .feedback-review {
     grid-column: 1 / -1;
   }
 

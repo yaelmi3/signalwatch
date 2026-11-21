@@ -199,6 +199,7 @@ def _request_analysis(page_id: int, version: int) -> ChangeAnalysisResult | None
         interests=storage.get_team_interests(),
         instructions=_PAGE_INSTRUCTIONS,
         logger=logger,
+        model=_configured_model(),
         result_type=ChangeAnalysisResult,
     )
 
@@ -217,12 +218,19 @@ def _request_article_analysis(source_id: int, article_url: str) -> ArticleAnalys
         return None
     interests = storage.get_team_interests()
     logger = analysis_logger.bind(article_id=_article_workflow_id(source_id, article_url))
+    return analyze_article(article.title, publisher_text, interests, _configured_model(), logger)
+
+
+def analyze_article(
+    title: str, publisher_text: str, interests: TeamInterests, model: str, logger: FilteringBoundLogger
+) -> ArticleAnalysisResult | None:
     draft = _request_model(
-        evidence={"headline": article.title, "publisher_text": publisher_text},
+        evidence={"headline": title, "publisher_text": publisher_text},
         passages=[publisher_text],
         interests=interests,
         instructions=_ARTICLE_DRAFT_INSTRUCTIONS,
         logger=logger,
+        model=model,
         result_type=ChangeAnalysisResult,
     )
     if draft is None or not draft.summary.strip():
@@ -245,11 +253,16 @@ def _request_article_analysis(source_id: int, article_url: str) -> ArticleAnalys
         interests=interests,
         instructions=_ARTICLE_VERIFY_INSTRUCTIONS,
         logger=logger,
+        model=model,
         result_type=ArticleAnalysisResult,
     )
     if verified is not None:
         verified.summary = draft.summary
     return verified
+
+
+def _configured_model() -> str:
+    return os.environ[_MODEL_ENV_BY_QUALITY[storage.get_analysis_quality()]]
 
 
 def _request_model[Result: ChangeAnalysisResult](
@@ -259,9 +272,9 @@ def _request_model[Result: ChangeAnalysisResult](
     interests: TeamInterests,
     instructions: str,
     logger: FilteringBoundLogger,
+    model: str,
     result_type: type[Result],
 ) -> Result | None:
-    model_env = _MODEL_ENV_BY_QUALITY[storage.get_analysis_quality()]
     payload = {
         **evidence,
         "business_context": interests.business_context,
@@ -270,7 +283,7 @@ def _request_model[Result: ChangeAnalysisResult](
     try:
         with OpenAI(max_retries=0, timeout=30) as client:
             response = client.responses.parse(
-                model=os.environ[model_env],
+                model=model,
                 instructions=instructions,
                 input=json.dumps(payload, ensure_ascii=False),
                 text_format=result_type,

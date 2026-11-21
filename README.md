@@ -72,6 +72,37 @@ Open **Digest** for updates that match at least one team. Each match includes a 
 Select an edit to open its saved details. **Maintainer settings** links to **Held items** for skipped updates and
 analysis status.
 
+### Team feedback and replay
+
+On a private, access-controlled installation, set `SIGNALWATCH_FEEDBACK_ORIGIN` to the exact browser origin
+(for example, `http://127.0.0.1:8001`). Use HTTPS or localhost. Set it in the app environment, or in the Compose
+environment before starting the app. Only enable this on an installation whose private ingress already restricts
+access. Leave it unset on the public demo.
+
+Use **Give feedback** on a saved update and pick the team. Use **Report a missed update** if the update is absent
+from both lists. **Maintainer settings** shows recent reports and a recorded comparison. Confirm the team's
+expected decision before turning a report into a replay example.
+
+Run `uv run python -m signalwatch.replay < examples.json` with a configured `OPENAI_API_KEY`. Each article needs the
+saved publisher text consumed by the scorer, up to 12,000 characters. The command compares one team's two notes
+on that text and prints the expected decision, both decisions, and both reasons. Treat text recovered later as a
+reconstruction. The command runs outside the worker and makes no writes to the app database or Slack.
+
+```json
+{
+  "model": "gpt-5.4-mini",
+  "team": "research_and_development",
+  "interests": {
+    "business_context": "We build AI security tools.",
+    "research_and_development": "API or integration changes."
+  },
+  "proposed_interest": "API changes that add or strengthen AI security protections.",
+  "articles": [
+    {"title": "Solver update", "publisher_text": "The release adds an API for matrix optimization.", "expected": "hold"}
+  ]
+}
+```
+
 ### Article discovery
 
 Open **Maintainer settings → Article discovery** and give a source a public RSS 2.0 feed URL. The worker checks the feed

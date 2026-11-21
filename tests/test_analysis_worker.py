@@ -16,8 +16,69 @@ import pytest
 from dbos import DBOS
 from openai import OpenAI
 
-from signalwatch import analysis_worker, article_content, article_feeds, slack_delivery, storage
-from signalwatch.analysis_models import ChangeAnalysisResult, TeamDecision, TeamInterests
+from signalwatch import analysis_worker, article_content, article_feeds, replay, slack_delivery, storage
+from signalwatch.analysis_models import ArticleAnalysisResult, ChangeAnalysisResult, TeamDecision, TeamInterests
+
+
+def test_article_replay_changes_one_interest_without_opening_app_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    publisher_text = "The release adds a new solver API."
+    interests = TeamInterests(
+        business_context="AI security tools", marketing="Positioning", research_and_development="New APIs"
+    )
+    proposed = "Changes to API safeguards"
+    settings = replay.Replay(
+        model="test-model", team=storage.DigestTeam.RESEARCH_AND_DEVELOPMENT, interests=interests,
+        proposed_interest=proposed,
+        articles=[replay.ArticleCase(title="Solver", publisher_text=publisher_text, expected="hold")],
+    )
+    seen = []
+
+    def respond(**kwargs: Any) -> ChangeAnalysisResult:
+        seen.append((kwargs["evidence"], kwargs["interests"], kwargs["model"]))
+        match = kwargs["interests"].research_and_development == "New APIs"
+        decision = TeamDecision(relevant=match, reason="Solver API", quote=publisher_text if match else None)
+        held = TeamDecision(relevant=False, reason="No match", quote=None)
+        data = ChangeAnalysisResult(summary="New solver", marketing=held, product=held,
+                                    research_and_development=decision)
+        if kwargs["result_type"] is ArticleAnalysisResult:
+            return ArticleAnalysisResult(**data.model_dump(), change_quote=publisher_text)
+        return data
+
+    monkeypatch.setattr(analysis_worker, "_request_model", respond)
+    assert replay.compare(settings) == 0
+    assert seen == [
+        ({"headline": "Solver", "publisher_text": publisher_text}, interests, "test-model"),
+        ({"candidate_passages": [publisher_text]}, interests, "test-model"),
+        ({"headline": "Solver", "publisher_text": publisher_text},
+         interests.model_copy(update={"research_and_development": proposed}), "test-model"),
+    ]
+    output = capsys.readouterr().out
+    assert "Current · show" in output and "Proposed · hold" in output
+    assert not db_path.exists()
+
+
+def test_article_replay_reports_transient_failure_and_continues(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = replay.Replay(
+        model="test-model", team=storage.DigestTeam.PRODUCT, interests=TeamInterests(product="Current note"),
+        proposed_interest="Proposed note",
+        articles=[replay.ArticleCase(title="API release", publisher_text="New API.", expected="show")],
+    )
+
+    def respond(title: str, evidence: str, interests: TeamInterests, model: str, logger: Any) -> None:
+        if interests.product == "Current note":
+            raise analysis_worker._TransientModelError("Provider returned HTTP 429")
+
+    monkeypatch.setattr(replay, "analyze_article", respond)
+    assert replay.compare(settings) == 1
+    output = capsys.readouterr().out
+    assert "Current · Provider returned HTTP 429" in output
+    assert "Proposed · no completed analysis" in output
 
 
 def test_worker_retries_handoff_and_limits_model_calls(

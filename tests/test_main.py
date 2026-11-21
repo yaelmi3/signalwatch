@@ -9,10 +9,12 @@ from pathlib import Path
 from threading import Barrier, Event
 from time import monotonic, sleep
 from unittest.mock import Mock
+from uuid import uuid4
 
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import HttpUrl
 
 from signalwatch import storage
 from signalwatch.analysis_models import ArticleAnalysisResult, ChangeAnalysisResult, TeamDecision, TeamInterests
@@ -105,6 +107,77 @@ def test_team_interests_default_trim_and_persist(tmp_path: Path, monkeypatch: py
     assert storage.get_team_interests().model_dump() == expected
     with TestClient(app) as client:
         assert client.get(settings_url).json() == expected
+
+
+def test_feedback_is_private_team_specific_and_retry_safe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.delenv("SIGNALWATCH_FEEDBACK_ORIGIN", raising=False)
+    saved_url = str(HttpUrl(f"https://example.com/{'é' * 350}"))
+    assert len(saved_url) > 2083
+    source = storage.save_competitor("Example", saved_url)
+    page = source.pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    assert storage.save_page_version(page_id=page.id, watch_id=_WATCH_ID, version=10, before="before", after="after")
+    article = storage.Article("New article", "https://EXAMPLE.com/article?ref=RSS")
+    feed = storage.ArticleFeed(source.id, "https://example.com/feed.xml")
+    storage.set_article_feed(source_id=feed.source_id, url=feed.url)
+    storage.save_discovered_articles(feed, [])
+    storage.save_discovered_articles(feed, [article])
+
+    useful = {
+        "id": str(uuid4()),
+        "team": "marketing",
+        "judgment": "useful",
+        "url": page.url,
+        "page_id": page.id,
+        "version": "10",
+    }
+    missed = {**useful, "id": str(uuid4()), "team": "product", "judgment": "missed"}
+    noisy = {
+        "id": str(uuid4()),
+        "team": "research_and_development",
+        "judgment": "noisy",
+        "url": article.article_url,
+        "source_id": source.id,
+    }
+    missing = {
+        "id": str(uuid4()),
+        "team": "product",
+        "judgment": "missed",
+        "url": "https://example.com/not-discovered",
+        "occurred_on": "2026-11-20",
+        "note": "  Why it matters  ",
+    }
+    origin = "http://127.0.0.1:8001"
+    headers = {"Origin": origin}
+    with TestClient(app) as client:
+        assert "X-Feedback-Enabled" not in client.get("/api/digest").headers
+        assert client.get("/api/feedback").status_code == HTTPStatus.NOT_FOUND
+        assert client.post("/api/feedback", json=useful, headers=headers).status_code == HTTPStatus.NOT_FOUND
+        monkeypatch.setenv("SIGNALWATCH_FEEDBACK_ORIGIN", origin)
+        assert client.get("/api/digest?view=held").headers["X-Feedback-Enabled"] == "true"
+        assert client.post("/api/feedback", json=useful).status_code == HTTPStatus.FORBIDDEN
+        wrong_origin = {"Origin": "https://other.example/"}
+        assert client.post("/api/feedback", json=useful, headers=wrong_origin).status_code == HTTPStatus.FORBIDDEN
+        for feedback in (useful, missed, noisy, missing, useful):
+            assert client.post("/api/feedback", json=feedback, headers=headers).status_code == HTTPStatus.NO_CONTENT
+        conflict = client.post("/api/feedback", json={**useful, "judgment": "noisy"}, headers=headers)
+        assert conflict.status_code == HTTPStatus.CONFLICT
+        unknown_version = {**useful, "id": str(uuid4()), "version": "11"}
+        assert client.post("/api/feedback", json=unknown_version, headers=headers).status_code == HTTPStatus.NOT_FOUND
+        for url in ("ftp://example.com/", saved_url):
+            bad_url = {**missing, "url": url, "id": str(uuid4())}
+            rejected = client.post("/api/feedback", json=bad_url, headers=headers)
+            assert rejected.status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+
+        linked_page = storage.get_page(page.id)
+        assert linked_page is not None and storage.delete_page(linked_page)
+        assert client.post("/api/feedback", json=useful, headers=headers).status_code == HTTPStatus.NO_CONTENT
+        response = client.get("/api/feedback")
+        assert response.status_code == HTTPStatus.OK
+        rows = response.json()
+        assert all(row.pop("created_at").endswith("Z") for row in rows)
+        assert rows == [{**missing, "note": "Why it matters"}, noisy, missed, useful]
 
 
 def test_digest_returns_recent_edits_across_linked_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
