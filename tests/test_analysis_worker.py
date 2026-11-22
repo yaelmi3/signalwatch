@@ -161,6 +161,8 @@ def test_worker_retries_handoff_and_limits_model_calls(
     monkeypatch.setenv("SIGNALWATCH_ANALYSIS_HIGHER_QUALITY_MODEL", "test-alternate-model")
     monkeypatch.setenv("SIGNALWATCH_SLACK_BOT_TOKEN", "fake-slack-token")
     monkeypatch.setenv("SIGNALWATCH_SLACK_CHANNEL_ID", "C_TEST")
+    feedback_origin = "https://signalwatch.example.test"
+    monkeypatch.setenv("SIGNALWATCH_FEEDBACK_ORIGIN", feedback_origin)
     storage.save_team_interests(
         TeamInterests(
             marketing="Customer stories", product="Product releases", business_context="We build marine instruments."
@@ -371,7 +373,20 @@ def test_worker_retries_handoff_and_limits_model_calls(
             f"{relevant_articles[0].source_name} · New sensor",
         ]
     )
-    assert {post.splitlines()[-1] for post in slack_posts} == {page.url, article.article_url}
+    with sqlite3.connect(app_db) as db:
+        deliveries = db.execute(
+            "SELECT feedback_token, version, article_url FROM slack_deliveries WHERE status = 'sent'"
+        )
+        expected_links = {
+            (
+                f"Release {version}" if version is not None else publisher_text.splitlines()[0],
+                article_url or page.url,
+                f"Give feedback: {feedback_origin}/?feedback={feedback_token}",
+            )
+            for feedback_token, version, article_url in deliveries
+        }
+    posts = [post.splitlines() for post in slack_posts]
+    assert {(post[1], post[-2], post[-1]) for post in posts} == expected_links
     assert all("Product: An updated release is described." in post and "Archived" not in post for post in slack_posts)
     captured = capfd.readouterr()
     assert "private provider error text" not in captured.out + captured.err
@@ -429,6 +444,7 @@ def test_slack_rejections_and_ambiguous_outcomes_are_terminal(
 def test_slack_migrates_saved_channel_and_groups_team_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app_db = tmp_path / "app.sqlite3"
     monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(app_db))
+    monkeypatch.delenv("SIGNALWATCH_FEEDBACK_ORIGIN", raising=False)
     page = storage.save_competitor("Example", "https://example.test/").pages[0]
     storage.link_watch(page.id, "test-watch")
     result = ChangeAnalysisResult(
@@ -475,6 +491,7 @@ def test_slack_migrates_saved_channel_and_groups_team_messages(tmp_path: Path, m
     assert [channel for channel, _ in posts] == ["C_OLD", "C_SHARED", "C_RD"]
     assert posts[1][1].splitlines()[3:-2] == ["Marketing: New positioning.", "Product: New feature."]
     assert posts[2][1].splitlines()[3:-2] == ["R&D: New API."]
+    assert all(post.endswith(f"\n\n{page.url}") for _, post in posts)
     with sqlite3.connect(app_db) as db:
         assert db.execute("SELECT id, status FROM slack_deliveries ORDER BY id").fetchall() == [
             (1, "sent"), (2, "sent"), (3, "sent"), (4, "sent"),

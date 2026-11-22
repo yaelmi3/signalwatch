@@ -87,7 +87,7 @@ _SLACK_DELIVERIES_SCHEMA = """(
     id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL,
     page_id INTEGER, version INTEGER, source_id INTEGER, article_url TEXT, teams TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed', 'uncertain', 'skipped')),
-    error TEXT,
+    error TEXT, feedback_token TEXT,
     CHECK ((page_id IS NOT NULL AND version IS NOT NULL AND source_id IS NULL AND article_url IS NULL)
         OR (source_id IS NOT NULL AND article_url IS NOT NULL AND page_id IS NULL AND version IS NULL)),
     UNIQUE (channel_id, page_id, version), UNIQUE (channel_id, source_id, article_url),
@@ -262,6 +262,7 @@ class SlackDelivery:
     channel_id: str
     item: DigestEntry | DigestArticle
     teams: list[DigestTeam]
+    feedback_token: str
 
 
 @dataclass(frozen=True)
@@ -375,8 +376,8 @@ def list_page_changes(page_id: int) -> list[PageChange]:
     return [PageChange.model_validate(dict(row)) for row in rows]
 
 
-_DIGEST_ITEMS_SQL = """WITH items AS (
-    SELECT changes.page_id, changes.version, competitors.id AS source_id, competitors.name AS source_name,
+_DIGEST_PAGE_SQL = """SELECT changes.page_id, changes.version, competitors.id AS source_id,
+           competitors.name AS source_name,
            pages.url AS page_url,
            NULL AS title, NULL AS article_url, analyses.status, analyses.result,
            1 AS business_fit
@@ -385,18 +386,21 @@ _DIGEST_ITEMS_SQL = """WITH items AS (
     JOIN competitors ON competitors.id = pages.competitor_id
     LEFT JOIN change_analyses AS analyses
         ON analyses.page_id = changes.page_id AND analyses.version = changes.version
-    WHERE changes.before IS NOT NULL AND pages.state = :linked AND pages.watch_id IS NOT NULL
-    UNION ALL
-    SELECT NULL, articles.discovered_at, articles.source_id, competitors.name, NULL, articles.title,
+    WHERE changes.before IS NOT NULL AND (:delivered OR (pages.state = :linked AND pages.watch_id IS NOT NULL))"""
+
+_DIGEST_ARTICLE_SQL = """SELECT NULL AS page_id, articles.discovered_at AS version, articles.source_id,
+           competitors.name AS source_name, NULL AS page_url, articles.title,
            articles.article_url, analyses.status, analyses.result,
            COALESCE(json_type(analyses.result, '$.change_quote') = 'text'
                AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
-               AND EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> ''), 0)
+               AND (:delivered OR EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> '')), 0)
+               AS business_fit
     FROM discovered_articles AS articles
     JOIN competitors ON competitors.id = articles.source_id
     LEFT JOIN discovered_article_analyses AS analyses USING (source_id, article_url)
-    WHERE articles.discovered_at IS NOT NULL
-)"""
+    WHERE articles.discovered_at IS NOT NULL"""
+
+_DIGEST_ITEMS_SQL = f"WITH items AS ({_DIGEST_PAGE_SQL} UNION ALL {_DIGEST_ARTICLE_SQL})"
 
 _DIGEST_RELEVANCE_SQL = """COALESCE(business_fit AND status = 'completed' AND (
     json_extract(result, '$.marketing.relevant') OR json_extract(result, '$.product.relevant')
@@ -410,7 +414,8 @@ def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | Di
             f"""{_DIGEST_ITEMS_SQL} SELECT * FROM items
             WHERE {_DIGEST_RELEVANCE_SQL} = :relevant
             ORDER BY version DESC, article_url IS NOT NULL, page_id, source_id, article_url LIMIT :limit""",
-            {"linked": PageState.LINKED, "relevant": view == DigestView.RELEVANT, "limit": _DIGEST_LIMIT},
+            {"linked": PageState.LINKED, "delivered": False, "relevant": view == DigestView.RELEVANT,
+             "limit": _DIGEST_LIMIT},
         ).fetchall()
     return [_digest_entry(row, view) for row in rows]
 
@@ -437,6 +442,21 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
     )
     model = DigestArticle if is_article else DigestEntry
     return model.model_validate(item)
+
+
+def get_feedback_item(feedback_token: str) -> DigestEntry | DigestArticle | None:
+    with _database() as database:
+        row = database.execute(
+            f"""WITH delivery AS (
+                SELECT page_id, version, source_id, article_url FROM slack_deliveries
+                WHERE feedback_token = :token AND status IN ('sent', 'uncertain')
+            ), page_item AS ({_DIGEST_PAGE_SQL}), article_item AS ({_DIGEST_ARTICLE_SQL})
+            SELECT page_item.* FROM delivery JOIN page_item USING (page_id, version)
+            UNION ALL
+            SELECT article_item.* FROM delivery JOIN article_item USING (source_id, article_url)""",
+            {"token": feedback_token, "linked": PageState.LINKED, "delivered": True},
+        ).fetchone()
+    return _digest_entry(row, DigestView.RELEVANT) if row is not None else None
 
 
 def list_feedback() -> list[Feedback]:
@@ -661,16 +681,16 @@ def claim_slack_delivery(
             current = _slack_connection(database.execute("SELECT * FROM slack_connection WHERE id = 1").fetchone())
             if not connection.enabled or current != connection:
                 return None
-        # Persist an uncertain outcome before the request so a restart cannot repeat a possibly accepted post.
+        # Persist the outcome and link before sending because Slack may accept the message before we record success.
         claim = database.execute(
-            """UPDATE slack_deliveries SET status = 'uncertain', error = 'result_not_recorded'
+            """UPDATE slack_deliveries SET status = 'uncertain', error = 'result_not_recorded', feedback_token = ?
             WHERE id = (
                 SELECT id FROM slack_deliveries WHERE status = 'pending'
                 AND channel_id IN (SELECT value FROM json_each(?))
                 ORDER BY id LIMIT 1
             )
-            RETURNING id, channel_id, page_id, version, source_id, article_url, teams""",
-            (json.dumps(team_channels),),
+            RETURNING id, channel_id, page_id, version, source_id, article_url, teams, feedback_token""",
+            (uuid4().hex, json.dumps(team_channels)),
         ).fetchone()
         if claim is None:
             return None
@@ -687,7 +707,7 @@ def claim_slack_delivery(
             queued_teams = set(json.loads(claim["teams"]))
             if teams := [team for team in item.relevant_teams
                          if team in queued_teams and team_channels.get(team) == channel_id]:
-                return SlackDelivery(claim["id"], channel_id, item, teams)
+                return SlackDelivery(claim["id"], channel_id, item, teams, claim["feedback_token"])
         database.execute(
             "UPDATE slack_deliveries SET status = 'skipped', error = 'no_longer_eligible' WHERE id = ?",
             (claim["id"],),
@@ -751,6 +771,7 @@ def _relevant_digest_item(
         AND ((page_id = :page_id AND version = :version) OR (source_id = :source_id AND article_url = :article_url))""",
         {
             "linked": PageState.LINKED,
+            "delivered": False,
             "page_id": page_id,
             "version": version,
             "source_id": source_id,
@@ -1151,7 +1172,12 @@ def link_watch(page_id: int, watch_id: str) -> None:
 def _migrate_slack_tables(database: sqlite3.Connection) -> None:
     legacy_connection = "SELECT 1 FROM pragma_table_info('slack_connection') WHERE name = 'channel_id'"
     new_deliveries = "SELECT 1 FROM pragma_table_info('slack_deliveries') WHERE name = 'teams'"
-    if database.execute(legacy_connection).fetchone() is None and database.execute(new_deliveries).fetchone():
+    feedback_tokens = "SELECT 1 FROM pragma_table_info('slack_deliveries') WHERE name = 'feedback_token'"
+    if (
+        database.execute(legacy_connection).fetchone() is None
+        and database.execute(new_deliveries).fetchone() is not None
+        and database.execute(feedback_tokens).fetchone() is not None
+    ):
         return
     database.execute("BEGIN IMMEDIATE")
     if database.execute(legacy_connection).fetchone() is not None:
@@ -1176,6 +1202,8 @@ def _migrate_slack_tables(database: sqlite3.Connection) -> None:
         )
         database.execute("DROP TABLE slack_deliveries")
         database.execute("ALTER TABLE slack_deliveries_upgraded RENAME TO slack_deliveries")
+    elif database.execute(feedback_tokens).fetchone() is None:
+        database.execute("ALTER TABLE slack_deliveries ADD COLUMN feedback_token TEXT")
     database.commit()
 
 
@@ -1257,4 +1285,6 @@ def _database() -> Iterator[sqlite3.Connection]:
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_deliveries {_SLACK_DELIVERIES_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_connection {_SLACK_CONNECTION_SCHEMA}")
         _migrate_slack_tables(database)
+        database.execute("""CREATE UNIQUE INDEX IF NOT EXISTS slack_delivery_feedback_token
+            ON slack_deliveries(feedback_token) WHERE feedback_token IS NOT NULL""")
         yield database

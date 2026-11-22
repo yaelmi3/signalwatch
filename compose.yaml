@@ -49,6 +49,7 @@ services:
     command: ["python", "-m", "signalwatch.analysis_worker"]
     stop_grace_period: 90s
     environment:
+      SIGNALWATCH_FEEDBACK_ORIGIN: ${SIGNALWATCH_FEEDBACK_ORIGIN:-}
       SIGNALWATCH_DB_PATH: /state/configuration.sqlite3
       OPENAI_API_KEY: ${OPENAI_API_KEY:?Set the analysis API key}
       SIGNALWATCH_ANALYSIS_MODEL: ${SIGNALWATCH_ANALYSIS_MODEL:?Set the analysis model}

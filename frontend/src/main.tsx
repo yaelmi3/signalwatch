@@ -548,6 +548,57 @@ function FeedbackForm({ entry, pending }: { entry?: DigestEntry; pending: { curr
   );
 }
 
+function SlackFeedback({ feedbackToken }: { feedbackToken: string }) {
+  const [entry, setEntry] = useState<DigestEntry | "unavailable" | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const pendingFeedback = useRef(new Map<string, string>());
+  const validToken = /^[0-9a-f]{32}$/.test(feedbackToken);
+
+  useEffect(() => {
+    if (!validToken) return;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    request<DigestEntry>(`${feedbackPath}/items/${encodeURIComponent(feedbackToken)}`, { signal, cache: "no-store" })
+      .then((item) => { if (!controller.signal.aborted) setEntry(item); })
+      .catch(() => { if (!controller.signal.aborted) setEntry("unavailable"); });
+    return () => controller.abort();
+  }, [feedbackToken, validToken, loadAttempt]);
+
+  return (
+    <main id="main-content" tabIndex={-1} className="configuration">
+      <a className="back-link" href="/">← Digest</a>
+      <div className="page-heading"><h1>Give feedback</h1></div>
+      {!validToken || entry === "unavailable" ? (
+        <div className="panel view-state">
+          <p role="alert">This feedback link is unavailable.</p>
+          {validToken && <button type="button" onClick={() => {
+            setEntry(null);
+            setLoadAttempt((attempt) => attempt + 1);
+          }}>Retry loading</button>}
+        </div>
+      ) : entry === null ? (
+        <div className="panel view-state"><p role="status">Loading update…</p></div>
+      ) : (
+        <article className="panel digest-entry">
+          <header>
+            <div className="digest-entry-meta">
+              <span>{entry.source_name}</span>
+              <ChangeTime version={entry.version} />
+            </div>
+            <h2>{entry.kind === "article" ? entry.title : changeHeadline(entry.summary ?? "") || "Page changed"}</h2>
+            {entry.kind === "article" && entry.summary && <p>{entry.summary}</p>}
+          </header>
+          <div className="digest-entry-links">
+            {entry.kind === "article" ? <a href={entry.article_url}>Open article</a> :
+              <a href={entry.page_url}>Open source page</a>}
+          </div>
+          <FeedbackForm entry={entry} pending={pendingFeedback} />
+        </article>
+      )}
+    </main>
+  );
+}
+
 function Digest({ held }: { held: boolean }) {
   const [entries, setEntries] = useState<DigestEntry[] | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -1514,7 +1565,8 @@ if (!root) {
 }
 
 const search = new URLSearchParams(window.location.search);
-const view = search.get("view");
+const feedbackToken = search.get("feedback");
+const view = feedbackToken === null ? search.get("view") : "feedback";
 const requestedVersion = search.get("version");
 const held = view === "held";
 const fromHeld = view === "history" && search.get("from") === "held";
@@ -1524,8 +1576,9 @@ createRoot(root).render(
   <StrictMode>
     <a className="skip-link" href="#main-content">Skip to content</a>
     <div className="app-layout">
-      <SiteNavigation active={active} nested={view === "history" || held} />
-      {view === "maintainer" ? <MaintainerSettings slackCallback={search.get("slack")} /> : view === "history" ? (
+      <SiteNavigation active={active} nested={feedbackToken !== null || view === "history" || held} />
+      {feedbackToken !== null ? <SlackFeedback feedbackToken={feedbackToken} /> :
+        view === "maintainer" ? <MaintainerSettings slackCallback={search.get("slack")} /> : view === "history" ? (
         <PageHistory pageId={search.get("page") ?? ""} requestedVersion={requestedVersion} fromHeld={fromHeld} />
       ) : view === "configuration" ? <Configuration /> : <Digest held={held} />}
     </div>
