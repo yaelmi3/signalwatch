@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import HttpUrl
 
-from signalwatch import storage
+from signalwatch import article_feeds, changedetection, storage
 from signalwatch.analysis_models import (
     AnalysisQuality,
     ArticleAnalysisResult,
@@ -25,7 +25,8 @@ from signalwatch.analysis_models import (
     TeamDecision,
     TeamInterests,
 )
-from signalwatch.catchup import catchup_lifespan
+from signalwatch.article_content import PublicContent
+from signalwatch.catchup import _catch_up_once, catchup_lifespan
 from signalwatch.main import app
 
 _WEBHOOK = "/api/webhooks/changedetection"
@@ -655,6 +656,10 @@ def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypat
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
+        if path == f"/api/v1/watch/{_WATCH_ID}":
+            return httpx2.Response(
+                HTTPStatus.OK, json={"paused": False, "last_checked": 0, "check_count": 0, "last_error": False}
+            )
         if path == history_path:
             versions = {"1": "a.txt", "2": "b.txt", "3": "c.txt"}
             if new_version.is_set():
@@ -693,6 +698,101 @@ def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypat
         wait_for_changes(client, [recovered, baseline])
         new_version.set()
         wait_for_changes(client, [{"version": "4", "before": "C", "after": "D"}, recovered, baseline])
+
+
+def test_monitoring_tracks_successful_watches_and_feeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.delenv("SIGNALWATCH_PAGE_STALE_SECONDS", raising=False)
+    now = 20_000
+    monkeypatch.setattr(storage, "time", lambda: now)
+    source = storage.save_competitor("Example", "https://example.com/")
+    page = source.pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    feed_url = "https://example.com/feed.xml"
+    storage.set_article_feed(source_id=source.id, url=feed_url)
+
+    watch = changedetection.WatchStatus(available=True, check_count=3, last_checked=now)
+    monkeypatch.setattr(changedetection, "read_watch", lambda _watch_id: watch)
+    monkeypatch.setattr(changedetection, "read_history", lambda _watch_id: [])
+    empty_feed = b'<rss version="2.0"><channel></channel></rss>'
+    feed_body = empty_feed
+    monkeypatch.setattr(
+        article_feeds, "read_public_content", lambda _url: PublicContent(feed_body, "text/xml", "utf-8")
+    )
+
+    with TestClient(app) as client:
+        health = "/api/monitoring-health"
+        detail = "/api/maintainer/monitoring"
+        assert client.get(health).status_code == HTTPStatus.OK
+        asyncio.run(_catch_up_once(Event()))
+
+        now += 10
+        watch = watch.model_copy(update={"check_count": 4, "last_checked": now})
+        asyncio.run(_catch_up_once(Event()))
+        article_feeds.sync_feeds()
+        last_success = now
+
+        now += 20 * 60
+        feed_body = b"<html></html>"
+        article_feeds.sync_feeds()
+        stale_feed = {
+            "id": source.id,
+            "kind": "feed",
+            "url": feed_url,
+            "source_name": source.name,
+            "last_success_at": last_success,
+        }
+        response = client.get(health)
+        assert response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+        assert response.content == b"" and response.headers["Cache-Control"] == "no-store"
+        assert client.get(detail).json() == [stale_feed]
+
+        now += 4 * 60 * 60
+        watch = watch.model_copy(update={"check_count": 5, "last_checked": now, "error": "Last page fetch failed."})
+        asyncio.run(_catch_up_once(Event()))
+        # A failed completed check and a new attempt with the same counter are both stale.
+        watch = watch.model_copy(update={"last_checked": now + 0.5, "error": None})
+        asyncio.run(_catch_up_once(Event()))
+        stale_page = {
+            "id": page.id,
+            "kind": "page",
+            "url": page.url,
+            "source_name": source.name,
+            "last_success_at": last_success,
+        }
+        assert client.get(detail).json() == [stale_feed, stale_page]
+
+        now += 1
+        watch = watch.model_copy(update={"check_count": 6, "last_checked": now})
+        asyncio.run(_catch_up_once(Event()))
+        feed_body = empty_feed
+        article_feeds.sync_feeds()
+        assert client.get(health).status_code == HTTPStatus.OK
+        response = client.get(detail)
+        assert response.headers["Cache-Control"] == "no-store" and response.json() == []
+
+
+def test_monitoring_grace_for_existing_and_paused_watches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    monkeypatch.delenv("SIGNALWATCH_PAGE_STALE_SECONDS", raising=False)
+    now = 20_000
+    monkeypatch.setattr(storage, "time", lambda: now)
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    with closing(sqlite3.connect(db_path)) as database:
+        database.executescript("DROP TABLE page_monitoring; DROP TABLE feed_monitoring;")
+
+    assert storage.list_stale_sources() == []
+    now += 4 * 60 * 60
+    assert [source.last_success_at for source in storage.list_stale_sources()] == [None]
+    watch = storage.LinkedWatch(page.id, _WATCH_ID)
+    storage.record_page_check(watch, 4, None, True)
+    assert storage.list_stale_sources() == []
+    now += 4 * 60 * 60
+    assert [source.id for source in storage.list_stale_sources()] == [page.id]
+    storage.record_page_check(watch, 4, None, False)
+    assert storage.list_stale_sources() == []
 
 
 def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(

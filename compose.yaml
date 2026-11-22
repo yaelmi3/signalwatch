@@ -20,6 +20,7 @@ services:
     <<: *signalwatch
     environment:
       SIGNALWATCH_FEEDBACK_ORIGIN: ${SIGNALWATCH_FEEDBACK_ORIGIN:-}
+      SIGNALWATCH_PAGE_STALE_SECONDS: ${SIGNALWATCH_PAGE_STALE_SECONDS:-14400}
       SIGNALWATCH_DB_PATH: /state/configuration.sqlite3
       CHANGEDETECTION_URL: http://changedetection:5000
       SIGNALWATCH_WEBHOOK_URL: http://signalwatch-hook:8000/api/webhooks/changedetection

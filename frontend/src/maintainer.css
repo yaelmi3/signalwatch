@@ -114,6 +114,7 @@
   }
 
   .slack-settings,
+  .monitoring-settings,
   .article-discovery-settings,
   .feedback-review {
     grid-column: 1 / -1;

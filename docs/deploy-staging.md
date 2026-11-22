@@ -140,6 +140,20 @@ SIGNALWATCH_SLACK_ENCRYPTION_KEY=<private Fernet key>
 
 After deploying from `main`, check that `GET /api/maintainer/slack` reports `available: true`. To connect a workspace, open **Maintainer settings → Slack delivery** and use the setup passphrase. Once connected, anyone who can open the site can select public Slack channels, enable delivery, and send test messages.
 
+## 6. Alert when monitoring goes stale
+
+In Cloud Monitoring, create an HTTPS uptime check for the SignalWatch hostname and path `/api/monitoring-health`.
+Set the check interval to five minutes and require HTTP 200. Enable an alert policy for failed checks and select
+the maintainer's email notification channel. [Uptime check setup](https://cloud.google.com/monitoring/uptime-checks)
+
+The status URL returns 503 when a watched page or RSS feed is stale. It returns only an HTTP status, so the
+checker can use the public gateway. An unreachable app also fails the check. Open **Maintainer settings →
+Source monitoring** to see which sources are stale and when they last checked successfully.
+
+RSS feeds become stale after 20 minutes without a successful check. Watched pages get four hours, which allows for
+changedetection.io's default three-hour schedule. If you extend that schedule, set `SIGNALWATCH_PAGE_STALE_SECONDS`
+in `staging.env` to a window longer than your slowest watch interval.
+
 ## Back up and roll back
 
 Clear `GCP_VM` and let any active deployment finish before maintenance. For upgrades that change DBOS or its workflows, follow the [worker upgrade procedure](../README.md#worker-upgrades-and-retention) using the previous release. The deploy script checks for unfinished jobs and saves SQLite backups under `/var/lib/signalwatch/backups` before switching releases.

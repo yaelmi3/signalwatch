@@ -63,8 +63,19 @@ async def _catch_up_once(stop: Event) -> None:
         if stop.is_set():
             return
         try:
-            await asyncio.to_thread(save_new_changes, watch.page_id, watch.watch_id, stop=stop)
+            await asyncio.to_thread(_catch_up_watch, watch, stop)
         except (changedetection.EngineError, sqlite3.OperationalError, OSError) as error:
             catchup_logger.warning(
                 "Could not catch up page changes.", page_id=watch.page_id, error_type=type(error).__name__
             )
+
+
+def _catch_up_watch(watch: storage.LinkedWatch, stop: Event) -> None:
+    save_new_changes(watch.page_id, watch.watch_id, stop=stop)
+    if stop.is_set():
+        return
+    status = changedetection.read_watch(watch.watch_id)
+    if status.check_count is not None:
+        # last_checked is the time an attempt started. The counter confirms completion.
+        success_at = status.last_checked if not status.error and not status.paused else None
+        storage.record_page_check(watch, status.check_count, success_at, bool(status.paused))
