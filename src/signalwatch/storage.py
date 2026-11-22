@@ -385,13 +385,13 @@ _DIGEST_ITEMS_SQL = """WITH items AS (
     JOIN competitors ON competitors.id = pages.competitor_id
     LEFT JOIN change_analyses AS analyses
         ON analyses.page_id = changes.page_id AND analyses.version = changes.version
-    WHERE changes.before IS NOT NULL AND pages.state = :linked AND pages.watch_id IS NOT NULL
+    WHERE changes.before IS NOT NULL AND (:delivered OR (pages.state = :linked AND pages.watch_id IS NOT NULL))
     UNION ALL
     SELECT NULL, articles.discovered_at, articles.source_id, competitors.name, NULL, articles.title,
            articles.article_url, analyses.status, analyses.result,
            COALESCE(json_type(analyses.result, '$.change_quote') = 'text'
                AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
-               AND EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> ''), 0)
+               AND (:delivered OR EXISTS (SELECT 1 FROM team_interests WHERE TRIM(business_context) <> '')), 0)
     FROM discovered_articles AS articles
     JOIN competitors ON competitors.id = articles.source_id
     LEFT JOIN discovered_article_analyses AS analyses USING (source_id, article_url)
@@ -410,7 +410,8 @@ def list_digest(view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | Di
             f"""{_DIGEST_ITEMS_SQL} SELECT * FROM items
             WHERE {_DIGEST_RELEVANCE_SQL} = :relevant
             ORDER BY version DESC, article_url IS NOT NULL, page_id, source_id, article_url LIMIT :limit""",
-            {"linked": PageState.LINKED, "relevant": view == DigestView.RELEVANT, "limit": _DIGEST_LIMIT},
+            {"linked": PageState.LINKED, "delivered": False, "relevant": view == DigestView.RELEVANT,
+             "limit": _DIGEST_LIMIT},
         ).fetchall()
     return [_digest_entry(row, view) for row in rows]
 
@@ -437,6 +438,18 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
     )
     model = DigestArticle if is_article else DigestEntry
     return model.model_validate(item)
+
+
+def get_feedback_item(delivery_id: int) -> DigestEntry | DigestArticle | None:
+    with _database() as database:
+        row = database.execute(
+            f"""{_DIGEST_ITEMS_SQL} SELECT items.* FROM slack_deliveries AS delivery
+            JOIN items ON (items.page_id = delivery.page_id AND items.version = delivery.version)
+                OR (items.source_id = delivery.source_id AND items.article_url = delivery.article_url)
+            WHERE delivery.id = :delivery_id AND delivery.status IN ('sent', 'uncertain')""",
+            {"delivery_id": delivery_id, "linked": PageState.LINKED, "delivered": True},
+        ).fetchone()
+    return _digest_entry(row, DigestView.RELEVANT) if row is not None else None
 
 
 def list_feedback() -> list[Feedback]:
@@ -751,6 +764,7 @@ def _relevant_digest_item(
         AND ((page_id = :page_id AND version = :version) OR (source_id = :source_id AND article_url = :article_url))""",
         {
             "linked": PageState.LINKED,
+            "delivered": False,
             "page_id": page_id,
             "version": version,
             "source_id": source_id,

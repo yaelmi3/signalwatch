@@ -102,7 +102,10 @@ def _delivery_message(delivery: storage.SlackDelivery) -> str:
         heading = f"{heading} · {item.title[:180]}"
     reasons = "\n".join(f"{_TEAM_NAMES[team]}: {item.team_reasons[team][:220]}" for team in delivery.teams)
     summary = (item.summary or "Change detected.")[:800]
-    return f"{heading}\n{summary}\n\n{reasons}\n\n{source_url}"
+    message = f"{heading}\n{summary}\n\n{reasons}\n\n{source_url}"
+    if origin := os.getenv("SIGNALWATCH_FEEDBACK_ORIGIN", "").strip():
+        message += f"\nGive feedback: {origin}/?feedback={delivery.id}"
+    return message
 
 
 def post_message(channel_id: str, bot_token: str, message: str) -> None:

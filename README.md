@@ -78,6 +78,8 @@ Set `SIGNALWATCH_FEEDBACK_ORIGIN` in the app or Compose environment to the exact
 installation. Use HTTPS or localhost (`http://127.0.0.1:8001`). Leave it unset on the public demo.
 
 Use **Give feedback** on a saved update or **Report a missed update** if you can't find it. Choose the team.
+Slack alerts sent with feedback enabled also include a **Give feedback** link that opens the saved update directly.
+Recipients need access to the configured private origin. A loopback origin requires a tunnel on the same port.
 In **Maintainer settings**, select that team and click **Suggest change**. The worker proposes one edit to its
 interest note and compares the current and draft notes on up to three saved articles. Review the wording and
 each team's results. **Apply** saves the note for future analyses. **Dismiss** leaves the current note in place.

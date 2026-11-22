@@ -186,6 +186,60 @@ def test_feedback_is_private_team_specific_and_retry_safe(tmp_path: Path, monkey
         assert rows == [{**missing, "note": "Why it matters"}, noisy, missed, useful]
 
 
+def test_slack_feedback_links_open_saved_items_outside_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(tmp_path / "configuration.sqlite3"))
+    monkeypatch.delenv("SIGNALWATCH_FEEDBACK_ORIGIN", raising=False)
+    monkeypatch.setattr(storage, "_DIGEST_LIMIT", 1)
+    product = storage.DigestTeam.PRODUCT
+    channels = {product: "C_ALERTS"}
+    source = storage.save_competitor("Example", "https://example.com/")
+    page = source.pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+    shown = TeamDecision(relevant=True, reason="API change", quote="Evidence")
+    analysis = ChangeAnalysisResult(
+        summary="Page changed", marketing=held, product=shown, research_and_development=held
+    )
+    for version in (10, 11):
+        assert storage.save_page_version(page_id=page.id, watch_id=_WATCH_ID, version=version,
+                                         before="Old text", after="Evidence")
+        storage.save_change_analysis(page.id, version, analysis, slack_channels=channels if version == 10 else None)
+    page_delivery = storage.claim_slack_delivery(channels)
+    assert page_delivery is not None and page_delivery.item.version == "10"
+    storage.finish_slack_delivery(page_delivery.id, "sent")
+
+    storage.save_team_interests(TeamInterests(product="APIs", business_context="Enterprise controls"))
+    feed = storage.ArticleFeed(source.id, "https://example.com/feed.xml")
+    storage.set_article_feed(source_id=feed.source_id, url=feed.url)
+    storage.save_discovered_articles(feed, [])
+    article = storage.Article("API release", "https://example.com/release?ref=feed")
+    storage.save_discovered_articles(feed, [article])
+    storage.save_article_analysis(source.id, article.article_url,
+                                  ArticleAnalysisResult(**analysis.model_dump(), change_quote="Evidence"),
+                                  slack_channels=channels)
+    article_delivery = storage.claim_slack_delivery(channels)
+    assert article_delivery is not None  # An uncertain send may already be visible in Slack.
+    storage.save_team_interests(TeamInterests(product="APIs"))
+
+    with TestClient(app) as client:
+        page_path = f"/api/feedback/items/{page_delivery.id}"
+        assert client.get(page_path).status_code == HTTPStatus.NOT_FOUND
+        monkeypatch.setenv("SIGNALWATCH_FEEDBACK_ORIGIN", "http://127.0.0.1:8001")
+        assert [item["version"] for item in client.get("/api/digest").json()] == ["11"]
+        for delivery in (page_delivery, article_delivery):
+            response = client.get(f"/api/feedback/items/{delivery.id}")
+            assert response.status_code == HTTPStatus.OK and response.headers["Cache-Control"] == "no-store"
+            assert response.json() == delivery.item.model_dump(mode="json")
+        assert client.get(f"/api/feedback/items/{2**63}").status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+        storage.finish_slack_delivery(article_delivery.id, "failed")
+        assert client.get(f"/api/feedback/items/{article_delivery.id}").status_code == HTTPStatus.NOT_FOUND
+        storage.record_watch_error(page_id=page.id, state=storage.PageState.PENDING, error="Watch unavailable")
+        assert client.get(page_path).json() == page_delivery.item.model_dump(mode="json")
+        linked_page = storage.get_page(page.id)
+        assert linked_page is not None and storage.delete_page(linked_page)
+        assert client.get(page_path).status_code == HTTPStatus.NOT_FOUND
+
+
 def test_feedback_suggestion_requires_evidence_and_applies_to_one_team(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -3,7 +3,7 @@ from http import HTTPStatus
 from ipaddress import ip_address
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response
 from pydantic import AfterValidator, BaseModel, BeforeValidator, HttpUrl, StringConstraints
 
 from signalwatch import article_content, changedetection, storage
@@ -91,6 +91,17 @@ def digest(response: Response, view: DigestView = DigestView.RELEVANT) -> list[D
 def list_feedback(response: Response) -> list[storage.Feedback]:
     response.headers["Cache-Control"] = "no-store"
     return storage.list_feedback()
+
+
+@router.get("/feedback/items/{delivery_id}", dependencies=[Depends(_require_feedback_enabled)])
+def get_feedback_item(
+    delivery_id: Annotated[int, Path(gt=0, le=2**63 - 1)], response: Response
+) -> DigestEntry | DigestArticle:
+    item = storage.get_feedback_item(delivery_id)
+    if item is None:
+        raise HTTPException(HTTPStatus.NOT_FOUND, "The saved alert is no longer available.")
+    response.headers["Cache-Control"] = "no-store"
+    return item
 
 
 @router.post("/feedback", status_code=HTTPStatus.NO_CONTENT, dependencies=[Depends(_require_feedback_origin)])
