@@ -80,6 +80,12 @@ def list_competitors() -> list[Competitor]:
     return storage.list_competitors()
 
 
+@router.get("/monitoring-health")
+def monitoring_health() -> Response:
+    status = HTTPStatus.SERVICE_UNAVAILABLE if storage.list_stale_sources() else HTTPStatus.OK
+    return Response(status_code=status, headers={"Cache-Control": "no-store"})
+
+
 @router.get("/digest")
 def digest(response: Response, view: DigestView = DigestView.RELEVANT) -> list[DigestEntry | DigestArticle]:
     if _feedback_origin():
@@ -278,6 +284,12 @@ def set_analysis_settings(settings: AnalysisSettings) -> AnalysisSettings:
 @router.get("/maintainer/article-feeds")
 def list_article_feeds() -> list[ArticleFeedSettings]:
     return storage.list_article_feed_settings()
+
+
+@router.get("/maintainer/monitoring")
+def list_stale_sources(response: Response) -> list[storage.StaleSource]:
+    response.headers["Cache-Control"] = "no-store"
+    return storage.list_stale_sources()
 
 
 @router.put("/maintainer/article-feeds/{source_id}")

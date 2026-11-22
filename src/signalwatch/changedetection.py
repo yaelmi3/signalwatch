@@ -54,6 +54,15 @@ class WatchStatus(BaseModel):
     error: str | None = None
 
 
+class RunningWatch(BaseModel):
+    uuid: str
+
+
+class EngineSystemInfo(BaseModel):
+    all_paused: bool
+    checking_now: list[RunningWatch]
+
+
 def webhook_secret() -> str | None:
     secret = os.getenv(WEBHOOK_SECRET_ENV)
     if secret is None or not re.fullmatch(r"[A-Za-z0-9._~-]+", secret):
@@ -124,6 +133,14 @@ def read_watch(watch_id: str) -> WatchStatus:
         check_count=watch.check_count,
         error="Last page fetch failed." if watch.last_error else None,
     )
+
+
+def read_system_info() -> EngineSystemInfo:
+    data = _request(method=HTTPMethod.GET, path="systeminfo")
+    try:
+        return EngineSystemInfo.model_validate(data)
+    except ValidationError:
+        raise EngineError("The engine returned invalid system information.") from None
 
 
 def read_history(watch_id: str) -> list[int]:

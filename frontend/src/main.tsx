@@ -41,6 +41,13 @@ type ArticleFeedSettings = {
   source_name: string;
   url: string | null;
 };
+type StaleSource = {
+  id: number;
+  kind: "page" | "feed";
+  url: string;
+  source_name: string;
+  last_success_at: number | null;
+};
 type WatchStatus = {
   available: boolean;
   paused: boolean | null;
@@ -796,6 +803,7 @@ function MaintainerSettings({ slackCallback }: { slackCallback: string | null })
         </div>
       </header>
       <div className="maintainer-grid">
+        <SourceMonitoring />
         <section className="panel" aria-labelledby="webhooks-title">
           <h2 id="webhooks-title">changedetection webhooks</h2>
           {status ? (
@@ -819,6 +827,46 @@ function MaintainerSettings({ slackCallback }: { slackCallback: string | null })
         <FeedbackReview />
       </div>
     </main>
+  );
+}
+
+function SourceMonitoring() {
+  const [sources, setSources] = useState<StaleSource[] | "error" | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
+    request<StaleSource[]>("/api/maintainer/monitoring", { signal, cache: "no-store" })
+      .then((sources) => { if (!controller.signal.aborted) setSources(sources); })
+      .catch(() => { if (!controller.signal.aborted) setSources("error"); });
+    return () => controller.abort();
+  }, [loadAttempt]);
+
+  return (
+    <section className="panel monitoring-settings" aria-labelledby="monitoring-title">
+      <header className="panel-heading">
+        <h2 id="monitoring-title">Source monitoring</h2>
+        <button type="button" disabled={sources === null} onClick={() => {
+          setSources(null);
+          setLoadAttempt((attempt) => attempt + 1);
+        }}>Refresh status</button>
+      </header>
+      {sources === null ? <p role="status">Loading monitoring status…</p> :
+        sources === "error" ? <p role="alert">Could not load monitoring status.</p> :
+        sources.length === 0 ? <p role="status">No stale sources.</p> : (
+          <ul className="page-list" aria-label="Stale sources">
+            {sources.map((source) => (
+              <li className="page-item" key={`${source.kind}:${source.id}`}>
+                <p><strong>{source.source_name}</strong> · {source.kind === "page" ? "Watched page" : "Article feed"}</p>
+                <p><a href={source.url}>{source.url}</a></p>
+                <p className="muted">Last successful check: {source.last_success_at === null
+                  ? "None yet" : new Date(source.last_success_at * 1000).toLocaleString()}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+    </section>
   );
 }
 

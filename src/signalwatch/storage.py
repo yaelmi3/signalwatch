@@ -58,6 +58,14 @@ _ARTICLE_FEEDS_SCHEMA = """(
     url TEXT NOT NULL,
     seeded INTEGER NOT NULL DEFAULT 0 CHECK (seeded IN (0, 1))
 )"""
+_PAGE_MONITORING_SCHEMA = """(
+    page_id INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL, last_success_at INTEGER, check_count INTEGER, paused_seen_at INTEGER
+)"""
+_FEED_MONITORING_SCHEMA = """(
+    source_id INTEGER PRIMARY KEY REFERENCES article_feeds(source_id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL, last_success_at INTEGER
+)"""
 _DISCOVERED_ARTICLES_SCHEMA = """(
     source_id INTEGER NOT NULL REFERENCES competitors(id) ON DELETE CASCADE,
     article_url TEXT NOT NULL, title TEXT NOT NULL, discovered_at INTEGER,
@@ -285,6 +293,14 @@ class ArticleFeedSettings(BaseModel):
     url: str | None
 
 
+class StaleSource(BaseModel):
+    id: int
+    kind: Literal["page", "feed"]
+    url: str
+    source_name: str
+    last_success_at: int | None
+
+
 @dataclass(frozen=True)
 class PageSnapshot:
     version: int
@@ -301,6 +317,7 @@ class ChangeToAnalyze:
 class LinkedWatch:
     page_id: int
     watch_id: str
+    check_count: int | None = None
 
 
 class Competitor(BaseModel):
@@ -361,9 +378,65 @@ def get_linked_page_id(watch_id: str) -> int | None:
 def list_linked_watches() -> list[LinkedWatch]:
     with _database() as database:
         rows = database.execute(
-            "SELECT id, watch_id FROM pages WHERE state = ? AND watch_id IS NOT NULL ORDER BY id", (PageState.LINKED,)
+            """SELECT pages.id AS page_id, pages.watch_id, checks.check_count
+            FROM pages LEFT JOIN page_monitoring AS checks ON checks.page_id = pages.id
+            WHERE pages.state = ? AND pages.watch_id IS NOT NULL ORDER BY pages.id""",
+            (PageState.LINKED,),
         ).fetchall()
-    return [LinkedWatch(page_id=row["id"], watch_id=row["watch_id"]) for row in rows]
+    return [LinkedWatch(**row) for row in rows]
+
+
+def record_page_check(watch: LinkedWatch, check_count: int | None, success_at: float | None, paused: bool) -> None:
+    now = int(time())
+    with _database() as database:
+        database.execute(
+            """INSERT INTO page_monitoring (page_id, started_at, check_count, last_success_at, paused_seen_at)
+            SELECT id, :now, :count, :success_at, :paused_seen_at FROM pages
+            WHERE id = :page_id AND watch_id = :watch_id AND state = 'linked'
+            ON CONFLICT (page_id) DO UPDATE SET
+                started_at = CASE WHEN paused_seen_at IS NOT NULL AND excluded.paused_seen_at IS NULL
+                    THEN excluded.started_at ELSE page_monitoring.started_at END,
+                last_success_at = CASE WHEN excluded.check_count IS NOT page_monitoring.check_count
+                    AND excluded.last_success_at IS NOT NULL
+                    THEN MAX(COALESCE(page_monitoring.last_success_at, 0), excluded.last_success_at)
+                    ELSE page_monitoring.last_success_at END,
+                check_count = COALESCE(excluded.check_count, page_monitoring.check_count),
+                paused_seen_at = excluded.paused_seen_at
+            WHERE (excluded.check_count IS NOT NULL AND excluded.check_count IS NOT page_monitoring.check_count)
+                OR excluded.paused_seen_at IS NOT page_monitoring.paused_seen_at""",
+            {
+                "now": now,
+                "count": check_count,
+                "paused_seen_at": now if paused else None,
+                "page_id": watch.page_id,
+                "watch_id": watch.watch_id,
+                "success_at": int(success_at) if success_at is not None and 0 < success_at <= now + 1 else None,
+            },
+        )
+
+
+def list_stale_sources() -> list[StaleSource]:
+    page_stale_after = int(os.getenv("SIGNALWATCH_PAGE_STALE_SECONDS", "14400"))
+    if page_stale_after <= 0:
+        raise ValueError("SIGNALWATCH_PAGE_STALE_SECONDS must be a positive integer.")
+    now = int(time())
+    with _database() as database:
+        rows = database.execute(
+            """SELECT pages.id AS id, 'page' AS kind, pages.url, competitors.name AS source_name, checks.last_success_at
+            FROM pages JOIN competitors ON competitors.id = pages.competitor_id
+            LEFT JOIN page_monitoring AS checks ON checks.page_id = pages.id
+            WHERE pages.state = 'linked' AND pages.watch_id IS NOT NULL
+                AND MAX(COALESCE(checks.last_success_at, 0), COALESCE(checks.started_at, 0),
+                    COALESCE(checks.paused_seen_at, 0)) <= :page_cutoff
+            UNION ALL
+            SELECT feeds.source_id AS id, 'feed', feeds.url, competitors.name, checks.last_success_at
+            FROM article_feeds AS feeds JOIN competitors ON competitors.id = feeds.source_id
+            LEFT JOIN feed_monitoring AS checks ON checks.source_id = feeds.source_id
+            WHERE COALESCE(checks.last_success_at, checks.started_at, 0) <= :feed_cutoff
+            ORDER BY source_name, kind, id""",
+            {"page_cutoff": now - page_stale_after, "feed_cutoff": now - 20 * 60},
+        ).fetchall()
+    return [StaleSource.model_validate(dict(row)) for row in rows]
 
 
 def list_page_changes(page_id: int) -> list[PageChange]:
@@ -855,7 +928,8 @@ def save_discovered_articles(feed: ArticleFeed, articles: list[Article]) -> None
         ).fetchone()
         if current is None:
             return
-        discovered_at = int(time()) if current["seeded"] else None
+        now = int(time())
+        discovered_at = now if current["seeded"] else None
         database.executemany(
             """INSERT INTO discovered_articles (source_id, article_url, title, discovered_at) VALUES (?, ?, ?, ?)
             ON CONFLICT (source_id, article_url) DO NOTHING""",
@@ -863,6 +937,11 @@ def save_discovered_articles(feed: ArticleFeed, articles: list[Article]) -> None
         )
         if not current["seeded"]:
             database.execute("UPDATE article_feeds SET seeded = 1 WHERE source_id = ?", (feed.source_id,))
+        database.execute(
+            """INSERT INTO feed_monitoring (source_id, started_at, last_success_at) VALUES (?, ?, ?)
+            ON CONFLICT (source_id) DO UPDATE SET last_success_at = excluded.last_success_at""",
+            (feed.source_id, now, now),
+        )
 
 
 def list_unqueued_articles(limit: int = 100) -> list[tuple[int, str]]:
@@ -1164,9 +1243,46 @@ def record_watch_error(*, page_id: int, state: PageState, error: str) -> None:
 def link_watch(page_id: int, watch_id: str) -> None:
     with _database() as database:
         database.execute(
+            "DELETE FROM page_monitoring WHERE page_id IN (SELECT id FROM pages WHERE id = ? AND watch_id IS NOT ?)",
+            (page_id, watch_id),
+        )
+        database.execute(
             "UPDATE pages SET watch_id = ?, state = ?, error = NULL WHERE id = ?",
             (watch_id, PageState.LINKED, page_id),
         )
+        database.execute(
+            "INSERT OR IGNORE INTO page_monitoring (page_id, started_at) SELECT id, ? FROM pages WHERE id = ?",
+            (int(time()), page_id),
+        )
+
+
+def _migrate_monitoring(database: sqlite3.Connection) -> None:
+    schema_query = "SELECT 1 FROM sqlite_schema WHERE name = 'page_monitoring' AND type = 'table'"
+    if database.execute(schema_query).fetchone() is not None:
+        return
+    database.execute("BEGIN IMMEDIATE")
+    if database.execute(schema_query).fetchone() is None:
+        now = int(time())
+        database.execute(f"CREATE TABLE page_monitoring {_PAGE_MONITORING_SCHEMA}")
+        database.execute(f"CREATE TABLE feed_monitoring {_FEED_MONITORING_SCHEMA}")
+        database.execute(
+            """INSERT INTO page_monitoring (page_id, started_at) SELECT id, ? FROM pages
+            WHERE state = 'linked' AND watch_id IS NOT NULL""",
+            (now,),
+        )
+        database.execute(
+            "INSERT INTO feed_monitoring (source_id, started_at) SELECT source_id, ? FROM article_feeds",
+            (now,),
+        )
+        # A rollback can reuse this database with a version unaware of feed freshness.
+        database.execute("""CREATE TRIGGER start_feed_monitoring AFTER INSERT ON article_feeds BEGIN
+            INSERT INTO feed_monitoring (source_id, started_at) VALUES (NEW.source_id, unixepoch());
+        END""")
+        database.execute("""CREATE TRIGGER reset_feed_monitoring AFTER UPDATE OF url ON article_feeds
+        WHEN NEW.url <> OLD.url BEGIN
+            UPDATE feed_monitoring SET started_at = unixepoch(), last_success_at = NULL WHERE source_id = NEW.source_id;
+        END""")
+    database.commit()
 
 
 def _migrate_slack_tables(database: sqlite3.Connection) -> None:
@@ -1274,6 +1390,7 @@ def _database() -> Iterator[sqlite3.Connection]:
             if database.execute(schema_query).fetchone() is not None:
                 database.execute("ALTER TABLE article_feeds DROP COLUMN discovery_only")
             database.commit()
+        _migrate_monitoring(database)
         database.execute(f"CREATE TABLE IF NOT EXISTS discovered_articles {_DISCOVERED_ARTICLES_SCHEMA}")
         database.execute(
             f"CREATE TABLE IF NOT EXISTS discovered_article_analyses {_DISCOVERED_ARTICLE_ANALYSES_SCHEMA}"
