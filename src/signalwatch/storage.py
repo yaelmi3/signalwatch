@@ -4,16 +4,23 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
 from time import time
-from typing import Literal
+from typing import Annotated, Literal, Self
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field, HttpUrl, StringConstraints, model_validator
 
-from signalwatch.analysis_models import AnalysisQuality, ChangeAnalysisResult, PageChangeAnalysis, TeamInterests
+from signalwatch.analysis_models import (
+    AnalysisQuality,
+    ChangeAnalysisResult,
+    PageChangeAnalysis,
+    TeamInterest,
+    TeamInterests,
+)
 
 _COMPETITORS_SCHEMA = "(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, website TEXT NOT NULL)"
 _PAGES_SCHEMA = """(
@@ -61,6 +68,20 @@ _DISCOVERED_ARTICLE_ANALYSES_SCHEMA = """(
     status TEXT NOT NULL CHECK (status IN ('queued', 'completed', 'failed')), result TEXT,
     PRIMARY KEY (source_id, article_url),
     FOREIGN KEY (source_id, article_url) REFERENCES discovered_articles(source_id, article_url) ON DELETE CASCADE
+)"""
+_FEEDBACK_SCHEMA = """(
+    id TEXT PRIMARY KEY NOT NULL, team TEXT NOT NULL, judgment TEXT NOT NULL, url TEXT NOT NULL, note TEXT,
+    page_id INTEGER, version TEXT, source_id INTEGER, occurred_on TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)"""
+_APPLIED_FEEDBACK_SCHEMA = "(feedback_id TEXT PRIMARY KEY NOT NULL REFERENCES feedback(id) ON DELETE CASCADE)"
+_ARTICLE_EVIDENCE_SCHEMA = """(
+    source_id INTEGER NOT NULL, article_url TEXT NOT NULL, publisher_text TEXT NOT NULL,
+    PRIMARY KEY (source_id, article_url),
+    FOREIGN KEY (source_id, article_url) REFERENCES discovered_articles(source_id, article_url) ON DELETE CASCADE
+)"""
+_SUGGESTIONS_SCHEMA = """(
+    id TEXT PRIMARY KEY NOT NULL, team TEXT NOT NULL UNIQUE, baseline TEXT NOT NULL, result TEXT NOT NULL
 )"""
 _SLACK_DELIVERIES_SCHEMA = """(
     id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT NOT NULL,
@@ -139,6 +160,88 @@ class DigestArticle(_DigestAnalysis):
     hold_reason: Literal["business_fit_unverified"] | None = Field(
         default=None, exclude_if=lambda reason: reason is None
     )
+
+
+type FeedbackItemId = Annotated[int, Field(strict=True, gt=0, le=2**63 - 1)]
+
+
+class FeedbackInput(BaseModel):
+    id: UUID
+    team: DigestTeam
+    judgment: Literal["useful", "noisy", "missed"]
+    url: Annotated[str, StringConstraints(strip_whitespace=True)]
+    note: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)] | None = None
+    page_id: FeedbackItemId | None = None
+    version: Annotated[str, StringConstraints(pattern=r"^(0|-?[1-9][0-9]{0,18})$")] | None = None
+    source_id: FeedbackItemId | None = None
+    occurred_on: Annotated[str, StringConstraints(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")] | None = None
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        has_item_reference = self.page_id is not None or self.source_id is not None
+        # Saved page URLs can grow during percent encoding.
+        url = AnyHttpUrl(self.url) if has_item_reference else HttpUrl(self.url)
+        if not self.url.lower().startswith(("http://", "https://")) or url.username or url.password:
+            raise ValueError("Use a plain HTTP(S) URL without credentials.")
+        if (self.page_id is None) != (self.version is None) or (
+            self.page_id is not None and self.source_id is not None
+        ):
+            raise ValueError("Use either a page and version or an article source.")
+        if not has_item_reference and self.judgment != "missed":
+            raise ValueError("Only missed updates can be reported by URL alone.")
+        if self.occurred_on is not None:
+            date.fromisoformat(self.occurred_on)
+        return self
+
+
+class Feedback(FeedbackInput):
+    created_at: str
+
+
+class SuggestionCase(BaseModel):
+    title: str
+    url: str
+    expected: bool | None = None
+    current: list[DigestTeam] | None = None
+    proposed: list[DigestTeam] | None = None
+
+
+class Suggestion(BaseModel):
+    id: str
+    team: DigestTeam
+    status: Literal["queued", "ready", "failed", "applied"]
+    current_interest: TeamInterest
+    proposed_interest: TeamInterest | None = None
+    error: str | None = None
+    cases: list[SuggestionCase]
+
+
+class _SuggestionArticle(BaseModel):
+    source_id: int
+    title: str
+    url: str
+    expected: bool | None
+    note: str | None
+    judgment: str | None
+
+
+class SuggestionCaseInput(_SuggestionArticle):
+    publisher_text: str
+
+
+class _SuggestionBaseline(BaseModel):
+    interests: TeamInterests
+    quality: AnalysisQuality
+    cases: list[_SuggestionArticle]
+    feedback_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SuggestionInputs:
+    team: DigestTeam
+    interests: TeamInterests
+    quality: AnalysisQuality
+    cases: list[SuggestionCaseInput]
 
 
 @dataclass(frozen=True)
@@ -334,6 +437,219 @@ def _digest_entry(row: sqlite3.Row, view: DigestView) -> DigestEntry | DigestArt
     )
     model = DigestArticle if is_article else DigestEntry
     return model.model_validate(item)
+
+
+def list_feedback() -> list[Feedback]:
+    with _database() as database:
+        rows = database.execute("SELECT * FROM feedback ORDER BY rowid DESC LIMIT 50").fetchall()
+    return [Feedback.model_validate(dict(row)) for row in rows]
+
+
+def save_feedback(feedback: FeedbackInput) -> None:
+    fields = feedback.model_dump(mode="json")
+    with _database() as database:
+        if database.execute(
+            """INSERT INTO feedback (id, team, judgment, url, note, page_id, version, source_id, occurred_on)
+            SELECT :id, :team, :judgment, :url, :note, :page_id, :version, :source_id, :occurred_on
+            WHERE CASE
+                WHEN :page_id IS NOT NULL THEN EXISTS (
+                    SELECT 1 FROM page_changes AS changes JOIN pages ON pages.id = changes.page_id
+                    WHERE changes.page_id = :page_id AND changes.version = :version
+                        AND changes.before IS NOT NULL AND pages.url = :url
+                )
+                WHEN :source_id IS NOT NULL THEN EXISTS (
+                    SELECT 1 FROM discovered_articles WHERE source_id = :source_id AND article_url = :url
+                        AND discovered_at IS NOT NULL
+                )
+                ELSE 1
+            END ON CONFLICT (id) DO NOTHING""",
+            fields,
+        ).rowcount:
+            return
+        existing = database.execute("SELECT * FROM feedback WHERE id = ?", (fields["id"],)).fetchone()
+        if existing is None:
+            raise LookupError("The saved update was not found.")
+        if any(existing[key] != value for key, value in fields.items()):
+            raise ValueError("This feedback ID is already in use.")
+
+
+_SUGGESTION_CASES_SQL = """WITH votes AS (
+    SELECT source_id, url, COALESCE(
+        MAX(feedback.rowid) FILTER (WHERE applied.feedback_id IS NULL AND judgment <> 'useful'),
+        MAX(feedback.rowid) FILTER (WHERE applied.feedback_id IS NULL)
+    ) AS latest,
+           CASE WHEN MIN(judgment <> 'noisy') = MAX(judgment <> 'noisy') THEN MAX(judgment <> 'noisy') END AS expected
+    FROM feedback LEFT JOIN applied_feedback AS applied ON applied.feedback_id = feedback.id
+    WHERE team = :team AND source_id IS NOT NULL GROUP BY source_id, url
+), cases AS (
+    SELECT articles.source_id, articles.title, articles.article_url AS url, articles.discovered_at, votes.latest,
+           votes.expected, feedback.id AS feedback_id, feedback.note, feedback.judgment,
+           COALESCE(:business_fit AND json_type(analyses.result, '$.change_quote') = 'text'
+                    AND TRIM(json_extract(analyses.result, '$.change_quote')) <> ''
+                    AND json_extract(analyses.result, :team_path), 0) AS shown
+    FROM article_evidence AS evidence JOIN discovered_articles AS articles USING (source_id, article_url)
+    JOIN discovered_article_analyses AS analyses USING (source_id, article_url)
+    LEFT JOIN votes ON votes.source_id = articles.source_id AND votes.url = articles.article_url
+    LEFT JOIN feedback ON feedback.rowid = votes.latest
+    WHERE articles.discovered_at IS NOT NULL AND analyses.status = 'completed'
+)"""
+
+
+def get_suggestion(team: DigestTeam) -> Suggestion | None:
+    with _database() as database:
+        row = database.execute("SELECT result FROM suggestions WHERE team = ?", (team,)).fetchone()
+    return Suggestion.model_validate_json(row["result"]) if row is not None else None
+
+
+def start_suggestion(team: DigestTeam) -> Suggestion:
+    with _database() as database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute("SELECT result FROM suggestions WHERE team = ?", (team,)).fetchone()
+        if row is not None:
+            existing = Suggestion.model_validate_json(row["result"])
+            if existing.status in ("queued", "ready"):
+                return existing
+
+        baseline = _suggestion_baseline(database, team)
+        suggestion = Suggestion(
+            id=str(uuid4()),
+            team=team,
+            status="queued",
+            current_interest=getattr(baseline.interests, team.value),
+            cases=[SuggestionCase(title=case.title, url=case.url, expected=case.expected) for case in baseline.cases],
+        )
+        database.execute(
+            """INSERT INTO suggestions (id, team, baseline, result) VALUES (?, ?, ?, ?)
+            ON CONFLICT (team) DO UPDATE SET
+                id = excluded.id, baseline = excluded.baseline, result = excluded.result""",
+            (suggestion.id, team, baseline.model_dump_json(), suggestion.model_dump_json()),
+        )
+        return suggestion
+
+
+def _suggestion_baseline(database: sqlite3.Connection, team: DigestTeam) -> _SuggestionBaseline:
+    interests = _team_interests(database)
+    bindings = {"team": team, "team_path": f"$.{team.value}.relevant", "business_fit": bool(interests.business_context)}
+    seed = database.execute(
+        f"""{_SUGGESTION_CASES_SQL} SELECT * FROM cases WHERE latest IS NOT NULL
+        ORDER BY expected IS NULL, judgment = 'useful', latest DESC LIMIT 1""",
+        bindings,
+    ).fetchone()
+    if seed is None:
+        raise ValueError("Give new feedback on a completed article with saved evidence before suggesting a change.")
+    if seed["expected"] is None:
+        raise ValueError("The team’s feedback disagrees on whether to show the available articles.")
+    cases = [_SuggestionArticle.model_validate(dict(seed))]
+    for shown in (True, False):
+        row = database.execute(
+            f"""{_SUGGESTION_CASES_SQL} SELECT * FROM cases WHERE shown = :shown AND url NOT IN (:seed, :last)
+            ORDER BY expected IS TRUE DESC, discovered_at DESC, url, source_id LIMIT 1""",
+            {**bindings, "shown": shown, "seed": cases[0].url, "last": cases[-1].url},
+        ).fetchone()
+        if row is not None:
+            cases.append(_SuggestionArticle.model_validate(dict(row)))
+    return _SuggestionBaseline(
+        interests=interests, quality=_analysis_quality(database), cases=cases, feedback_id=seed["feedback_id"]
+    )
+
+
+def list_queued_suggestions() -> list[str]:
+    with _database() as database:
+        rows = database.execute("SELECT id FROM suggestions WHERE json_extract(result, '$.status') = 'queued'")
+        return [row["id"] for row in rows]
+
+
+def _case_evidence(database: sqlite3.Connection, case: _SuggestionArticle) -> str | None:
+    row = database.execute(
+        "SELECT publisher_text FROM article_evidence WHERE source_id = ? AND article_url = ?",
+        (case.source_id, case.url),
+    ).fetchone()
+    return row["publisher_text"] if row is not None else None
+
+
+def get_suggestion_inputs(suggestion_id: str) -> SuggestionInputs | None:
+    with _database() as database:
+        row = database.execute(
+            "SELECT team, baseline FROM suggestions WHERE id = ? AND json_extract(result, '$.status') = 'queued'",
+            (suggestion_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        baseline = _SuggestionBaseline.model_validate_json(row["baseline"])
+        cases = []
+        for case in baseline.cases:
+            publisher_text = _case_evidence(database, case)
+            if publisher_text is None:
+                break
+            cases.append(SuggestionCaseInput(**case.model_dump(), publisher_text=publisher_text))
+        else:
+            return SuggestionInputs(DigestTeam(row["team"]), baseline.interests, baseline.quality, cases)
+    finish_suggestion(suggestion_id, None, [], "Saved article evidence is unavailable.")
+    return None
+
+
+def finish_suggestion(
+    suggestion_id: str, proposed_interest: str | None, cases: list[SuggestionCase], error: str | None
+) -> None:
+    with _database() as database:
+        row = database.execute(
+            "SELECT result FROM suggestions WHERE id = ? AND json_extract(result, '$.status') = 'queued'",
+            (suggestion_id,),
+        ).fetchone()
+        if row is None:
+            return
+        suggestion = Suggestion.model_validate_json(row["result"])
+        if [(case.url, case.expected) for case in cases] != [(case.url, case.expected) for case in suggestion.cases]:
+            cases = suggestion.cases
+        if not error and (
+            proposed_interest is None or any(case.current is None or case.proposed is None for case in cases)
+        ):
+            error = "The comparison is incomplete."
+        fields = {
+            "status": "failed" if error else "ready",
+            "proposed_interest": proposed_interest,
+            "error": error,
+            "cases": cases,
+        }
+        result = Suggestion.model_validate(suggestion.model_dump() | fields)
+        database.execute(
+            "UPDATE suggestions SET result = ? WHERE id = ? AND json_extract(result, '$.status') = 'queued'",
+            (result.model_dump_json(), suggestion_id),
+        )
+
+
+def apply_suggestion(suggestion_id: str) -> Suggestion:
+    with _database() as database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute("SELECT baseline, result FROM suggestions WHERE id = ?", (suggestion_id,)).fetchone()
+        if row is None:
+            raise LookupError("The suggestion is no longer available.")
+        suggestion = Suggestion.model_validate_json(row["result"])
+        if suggestion.status == "applied":
+            return suggestion
+        if (
+            suggestion.status != "ready"
+            or suggestion.proposed_interest is None
+            or any(case.current is None or case.proposed is None for case in suggestion.cases)
+        ):
+            raise ValueError("Complete the comparison before applying the suggestion.")
+        baseline = _SuggestionBaseline.model_validate_json(row["baseline"])
+        if baseline.interests != _team_interests(database) or baseline.quality != _analysis_quality(database):
+            raise ValueError("Settings changed since this suggestion started. Dismiss it and request another.")
+        if any(_case_evidence(database, case) is None for case in baseline.cases):
+            raise ValueError("Saved article evidence is unavailable. Dismiss this suggestion and request another.")
+        interests = baseline.interests.model_copy(update={suggestion.team.value: suggestion.proposed_interest})
+        _save_team_interests(database, interests)
+        if baseline.feedback_id is not None:
+            database.execute("INSERT INTO applied_feedback (feedback_id) VALUES (?)", (baseline.feedback_id,))
+        applied = suggestion.model_copy(update={"status": "applied"})
+        database.execute("UPDATE suggestions SET result = ? WHERE id = ?", (applied.model_dump_json(), suggestion_id))
+        return applied
+
+
+def dismiss_suggestion(suggestion_id: str) -> None:
+    with _database() as database:
+        database.execute("DELETE FROM suggestions WHERE id = ?", (suggestion_id,))
 
 
 def claim_slack_delivery(
@@ -563,6 +879,19 @@ def mark_article_analysis_queued(source_id: int, article_url: str) -> None:
         )
 
 
+def save_article_evidence(source_id: int, article_url: str, publisher_text: str) -> str | None:
+    with _database() as database:
+        row = database.execute(
+            """INSERT INTO article_evidence (source_id, article_url, publisher_text)
+            SELECT source_id, article_url, ? FROM discovered_articles
+            WHERE source_id = ? AND article_url = ? AND discovered_at IS NOT NULL
+            ON CONFLICT (source_id, article_url) DO UPDATE SET publisher_text = article_evidence.publisher_text
+            RETURNING publisher_text""",
+            (publisher_text, source_id, article_url),
+        ).fetchone()
+    return row["publisher_text"] if row is not None else None
+
+
 def save_article_analysis(
     source_id: int, article_url: str, result: ChangeAnalysisResult | None,
     *, slack_channels: dict[DigestTeam, str] | None = None,
@@ -651,28 +980,48 @@ def list_page_analyses(page_id: int) -> dict[str, PageChangeAnalysis]:
 
 def get_analysis_quality() -> AnalysisQuality:
     with _database() as database:
-        row = database.execute("SELECT quality FROM analysis_settings WHERE id = 1").fetchone()
+        return _analysis_quality(database)
+
+
+def _analysis_quality(database: sqlite3.Connection) -> AnalysisQuality:
+    row = database.execute("SELECT quality FROM analysis_settings WHERE id = 1").fetchone()
     return AnalysisQuality(row["quality"]) if row is not None else AnalysisQuality.ECONOMY
 
 
 def get_team_interests() -> TeamInterests:
     with _database() as database:
-        row = database.execute(
-            "SELECT marketing, product, research_and_development, business_context FROM team_interests WHERE id = 1"
-        ).fetchone()
+        return _team_interests(database)
+
+
+def _team_interests(database: sqlite3.Connection) -> TeamInterests:
+    row = database.execute(
+        "SELECT marketing, product, research_and_development, business_context FROM team_interests WHERE id = 1"
+    ).fetchone()
     return TeamInterests.model_validate(dict(row)) if row is not None else TeamInterests()
 
 
 def save_team_interests(interests: TeamInterests) -> None:
     with _database() as database:
-        database.execute(
-            """INSERT INTO team_interests (id, marketing, product, research_and_development, business_context)
-            VALUES (1, ?, ?, ?, ?)
-            ON CONFLICT (id) DO UPDATE SET marketing = excluded.marketing, product = excluded.product,
-                research_and_development = excluded.research_and_development,
-                business_context = excluded.business_context""",
-            (interests.marketing, interests.product, interests.research_and_development, interests.business_context),
-        )
+        _save_team_interests(database, interests)
+
+
+def patch_team_interests(changes: TeamInterests) -> TeamInterests:
+    with _database() as database:
+        database.execute("BEGIN IMMEDIATE")
+        interests = _team_interests(database).model_copy(update=changes.model_dump(exclude_unset=True))
+        _save_team_interests(database, interests)
+        return interests
+
+
+def _save_team_interests(database: sqlite3.Connection, interests: TeamInterests) -> None:
+    database.execute(
+        """INSERT INTO team_interests (id, marketing, product, research_and_development, business_context)
+        VALUES (1, :marketing, :product, :research_and_development, :business_context)
+        ON CONFLICT (id) DO UPDATE SET marketing = excluded.marketing, product = excluded.product,
+            research_and_development = excluded.research_and_development,
+            business_context = excluded.business_context""",
+        interests.model_dump(),
+    )
 
 
 def save_analysis_quality(quality: AnalysisQuality) -> None:
@@ -901,6 +1250,10 @@ def _database() -> Iterator[sqlite3.Connection]:
         database.execute(
             f"CREATE TABLE IF NOT EXISTS discovered_article_analyses {_DISCOVERED_ARTICLE_ANALYSES_SCHEMA}"
         )
+        database.execute(f"CREATE TABLE IF NOT EXISTS feedback {_FEEDBACK_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS applied_feedback {_APPLIED_FEEDBACK_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS article_evidence {_ARTICLE_EVIDENCE_SCHEMA}")
+        database.execute(f"CREATE TABLE IF NOT EXISTS suggestions {_SUGGESTIONS_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_deliveries {_SLACK_DELIVERIES_SCHEMA}")
         database.execute(f"CREATE TABLE IF NOT EXISTS slack_connection {_SLACK_CONNECTION_SCHEMA}")
         _migrate_slack_tables(database)
