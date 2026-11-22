@@ -104,7 +104,7 @@ def _delivery_message(delivery: storage.SlackDelivery) -> str:
     summary = (item.summary or "Change detected.")[:800]
     message = f"{heading}\n{summary}\n\n{reasons}\n\n{source_url}"
     if origin := os.getenv("SIGNALWATCH_FEEDBACK_ORIGIN", "").strip():
-        message += f"\nGive feedback: {origin}/?feedback={delivery.id}"
+        message += f"\nGive feedback: {origin}/?feedback={delivery.feedback_token}"
     return message
 
 

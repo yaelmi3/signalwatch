@@ -548,30 +548,30 @@ function FeedbackForm({ entry, pending }: { entry?: DigestEntry; pending: { curr
   );
 }
 
-function SlackFeedback({ deliveryId }: { deliveryId: string }) {
+function SlackFeedback({ feedbackToken }: { feedbackToken: string }) {
   const [entry, setEntry] = useState<DigestEntry | "unavailable" | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const pendingFeedback = useRef(new Map<string, string>());
-  const validDelivery = /^[1-9][0-9]*$/.test(deliveryId);
+  const validToken = /^[0-9a-f]{32}$/.test(feedbackToken);
 
   useEffect(() => {
-    if (!validDelivery) return;
+    if (!validToken) return;
     const controller = new AbortController();
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]);
-    request<DigestEntry>(`${feedbackPath}/items/${encodeURIComponent(deliveryId)}`, { signal, cache: "no-store" })
+    request<DigestEntry>(`${feedbackPath}/items/${encodeURIComponent(feedbackToken)}`, { signal, cache: "no-store" })
       .then((item) => { if (!controller.signal.aborted) setEntry(item); })
       .catch(() => { if (!controller.signal.aborted) setEntry("unavailable"); });
     return () => controller.abort();
-  }, [deliveryId, validDelivery, loadAttempt]);
+  }, [feedbackToken, validToken, loadAttempt]);
 
   return (
     <main id="main-content" tabIndex={-1} className="configuration">
       <a className="back-link" href="/">← Digest</a>
       <div className="page-heading"><h1>Give feedback</h1></div>
-      {!validDelivery || entry === "unavailable" ? (
+      {!validToken || entry === "unavailable" ? (
         <div className="panel view-state">
           <p role="alert">This feedback link is unavailable.</p>
-          {validDelivery && <button type="button" onClick={() => {
+          {validToken && <button type="button" onClick={() => {
             setEntry(null);
             setLoadAttempt((attempt) => attempt + 1);
           }}>Retry loading</button>}
@@ -1565,8 +1565,8 @@ if (!root) {
 }
 
 const search = new URLSearchParams(window.location.search);
-const feedbackDelivery = search.get("feedback");
-const view = feedbackDelivery === null ? search.get("view") : "feedback";
+const feedbackToken = search.get("feedback");
+const view = feedbackToken === null ? search.get("view") : "feedback";
 const requestedVersion = search.get("version");
 const held = view === "held";
 const fromHeld = view === "history" && search.get("from") === "held";
@@ -1576,8 +1576,8 @@ createRoot(root).render(
   <StrictMode>
     <a className="skip-link" href="#main-content">Skip to content</a>
     <div className="app-layout">
-      <SiteNavigation active={active} nested={feedbackDelivery !== null || view === "history" || held} />
-      {feedbackDelivery !== null ? <SlackFeedback deliveryId={feedbackDelivery} /> :
+      <SiteNavigation active={active} nested={feedbackToken !== null || view === "history" || held} />
+      {feedbackToken !== null ? <SlackFeedback feedbackToken={feedbackToken} /> :
         view === "maintainer" ? <MaintainerSettings slackCallback={search.get("slack")} /> : view === "history" ? (
         <PageHistory pageId={search.get("page") ?? ""} requestedVersion={requestedVersion} fromHeld={fromHeld} />
       ) : view === "configuration" ? <Configuration /> : <Digest held={held} />}

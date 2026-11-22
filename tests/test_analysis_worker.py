@@ -374,14 +374,16 @@ def test_worker_retries_handoff_and_limits_model_calls(
         ]
     )
     with sqlite3.connect(app_db) as db:
-        deliveries = db.execute("SELECT id, version, article_url FROM slack_deliveries WHERE status = 'sent'")
+        deliveries = db.execute(
+            "SELECT feedback_token, version, article_url FROM slack_deliveries WHERE status = 'sent'"
+        )
         expected_links = {
             (
                 f"Release {version}" if version is not None else publisher_text.splitlines()[0],
                 article_url or page.url,
-                f"Give feedback: {feedback_origin}/?feedback={delivery_id}",
+                f"Give feedback: {feedback_origin}/?feedback={feedback_token}",
             )
-            for delivery_id, version, article_url in deliveries
+            for feedback_token, version, article_url in deliveries
         }
     posts = [post.splitlines() for post in slack_posts]
     assert {(post[1], post[-2], post[-1]) for post in posts} == expected_links

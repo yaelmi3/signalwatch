@@ -74,8 +74,9 @@ analysis status.
 
 ### Team feedback and suggested changes
 
-Set `SIGNALWATCH_FEEDBACK_ORIGIN` in the app or Compose environment to the exact origin of a private, access-controlled
-installation. Use HTTPS or localhost (`http://127.0.0.1:8001`). Leave it unset on the public demo.
+Set `SIGNALWATCH_FEEDBACK_ORIGIN` to the exact origin of a private, access-controlled installation. Set it in the
+Compose environment, or on both the app and worker if running them separately. Use HTTPS or localhost
+(`http://127.0.0.1:8001`). Leave it unset on the public demo.
 
 Use **Give feedback** on a saved update or **Report a missed update** if you can't find it. Choose the team.
 Slack alerts sent with feedback enabled also include a **Give feedback** link that opens the saved update directly.

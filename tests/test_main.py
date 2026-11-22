@@ -3,6 +3,7 @@ import json
 import sqlite3
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from functools import partial
 from http import HTTPMethod, HTTPStatus
 from pathlib import Path
@@ -222,22 +223,61 @@ def test_slack_feedback_links_open_saved_items_outside_digest(tmp_path: Path, mo
     storage.save_team_interests(TeamInterests(product="APIs"))
 
     with TestClient(app) as client:
-        page_path = f"/api/feedback/items/{page_delivery.id}"
+        page_path = f"/api/feedback/items/{page_delivery.feedback_token}"
         assert client.get(page_path).status_code == HTTPStatus.NOT_FOUND
         monkeypatch.setenv("SIGNALWATCH_FEEDBACK_ORIGIN", "http://127.0.0.1:8001")
         assert [item["version"] for item in client.get("/api/digest").json()] == ["11"]
         for delivery in (page_delivery, article_delivery):
-            response = client.get(f"/api/feedback/items/{delivery.id}")
+            response = client.get(f"/api/feedback/items/{delivery.feedback_token}")
             assert response.status_code == HTTPStatus.OK and response.headers["Cache-Control"] == "no-store"
             assert response.json() == delivery.item.model_dump(mode="json")
-        assert client.get(f"/api/feedback/items/{2**63}").status_code == HTTPStatus.UNPROCESSABLE_CONTENT
+        assert client.get(f"/api/feedback/items/{page_delivery.id}").status_code == HTTPStatus.UNPROCESSABLE_CONTENT
         storage.finish_slack_delivery(article_delivery.id, "failed")
-        assert client.get(f"/api/feedback/items/{article_delivery.id}").status_code == HTTPStatus.NOT_FOUND
+        assert client.get(f"/api/feedback/items/{article_delivery.feedback_token}").status_code == HTTPStatus.NOT_FOUND
         storage.record_watch_error(page_id=page.id, state=storage.PageState.PENDING, error="Watch unavailable")
         assert client.get(page_path).json() == page_delivery.item.model_dump(mode="json")
         linked_page = storage.get_page(page.id)
         assert linked_page is not None and storage.delete_page(linked_page)
         assert client.get(page_path).status_code == HTTPStatus.NOT_FOUND
+
+
+def test_slack_feedback_link_cannot_retarget_after_restore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_db = tmp_path / "configuration.sqlite3"
+    backup_db = tmp_path / "backup.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(app_db))
+    monkeypatch.setenv("SIGNALWATCH_FEEDBACK_ORIGIN", "http://127.0.0.1:8001")
+    channels = {storage.DigestTeam.PRODUCT: "C_ALERTS"}
+    page = storage.save_competitor("Example", "https://example.com/").pages[0]
+    storage.link_watch(page.id, _WATCH_ID)
+    decision = TeamDecision(relevant=True, reason="API change", quote="Evidence")
+    analysis = ChangeAnalysisResult(
+        summary="Page changed", marketing=decision, product=decision, research_and_development=decision
+    )
+    for version in (10, 11):
+        assert storage.save_page_version(
+            page_id=page.id, watch_id=_WATCH_ID, version=version, before="Old text", after="Evidence"
+        )
+    with closing(sqlite3.connect(app_db)) as database, closing(sqlite3.connect(backup_db)) as backup:
+        database.backup(backup)
+
+    storage.save_change_analysis(page.id, 10, analysis, slack_channels=channels)
+    with closing(sqlite3.connect(app_db)) as database, database:
+        # Keep a queued delivery from before the feedback token column existed.
+        database.execute("DROP INDEX slack_delivery_feedback_token")
+        database.execute("ALTER TABLE slack_deliveries DROP COLUMN feedback_token")
+    original = storage.claim_slack_delivery(channels)
+    assert original is not None
+    storage.finish_slack_delivery(original.id, "sent")
+    original_path = f"/api/feedback/items/{original.feedback_token}"
+    with TestClient(app) as client:
+        assert client.get(original_path).json()["version"] == "10"
+
+        monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(backup_db))
+        storage.save_change_analysis(page.id, 11, analysis, slack_channels=channels)
+        replacement = storage.claim_slack_delivery(channels)
+        assert replacement is not None and replacement.id == original.id
+        assert client.get(original_path).status_code == HTTPStatus.NOT_FOUND
+        assert client.get(f"/api/feedback/items/{replacement.feedback_token}").json()["version"] == "11"
 
 
 def test_feedback_suggestion_requires_evidence_and_applies_to_one_team(

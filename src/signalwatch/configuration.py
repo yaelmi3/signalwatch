@@ -93,11 +93,11 @@ def list_feedback(response: Response) -> list[storage.Feedback]:
     return storage.list_feedback()
 
 
-@router.get("/feedback/items/{delivery_id}", dependencies=[Depends(_require_feedback_enabled)])
+@router.get("/feedback/items/{feedback_token}", dependencies=[Depends(_require_feedback_enabled)])
 def get_feedback_item(
-    delivery_id: Annotated[int, Path(gt=0, le=2**63 - 1)], response: Response
+    feedback_token: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")], response: Response
 ) -> DigestEntry | DigestArticle:
-    item = storage.get_feedback_item(delivery_id)
+    item = storage.get_feedback_item(feedback_token)
     if item is None:
         raise HTTPException(HTTPStatus.NOT_FOUND, "The saved alert is no longer available.")
     response.headers["Cache-Control"] = "no-store"
