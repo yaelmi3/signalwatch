@@ -59,23 +59,57 @@ async def _catch_up_once(stop: Event) -> None:
         catchup_logger.warning("Could not list watches for page change catch-up.", error_type=type(error).__name__)
         return
 
+    observed: dict[int, changedetection.WatchStatus] = {}
     for watch in watches:
         if stop.is_set():
             return
         try:
-            await asyncio.to_thread(_catch_up_watch, watch, stop)
+            await asyncio.to_thread(save_new_changes, watch.page_id, watch.watch_id, stop=stop)
+            if stop.is_set():
+                return
+            observed[watch.page_id] = await asyncio.to_thread(changedetection.read_watch, watch.watch_id)
         except (changedetection.EngineError, sqlite3.OperationalError, OSError) as error:
             catchup_logger.warning(
                 "Could not catch up page changes.", page_id=watch.page_id, error_type=type(error).__name__
             )
 
-
-def _catch_up_watch(watch: storage.LinkedWatch, stop: Event) -> None:
-    save_new_changes(watch.page_id, watch.watch_id, stop=stop)
-    if stop.is_set():
+    if not watches or stop.is_set():
         return
-    status = changedetection.read_watch(watch.watch_id)
-    if status.check_count is not None:
-        # last_checked is the time an attempt started. The counter confirms completion.
-        success_at = status.last_checked if not status.error and not status.paused else None
-        storage.record_page_check(watch, status.check_count, success_at, bool(status.paused))
+    try:
+        system = await asyncio.to_thread(changedetection.read_system_info)
+    except changedetection.EngineError as error:
+        catchup_logger.warning("Could not read watch system information.", error_type=type(error).__name__)
+        return
+
+    running = {item.uuid for item in system.checking_now}
+    for watch in watches:
+        if stop.is_set():
+            return
+        status = observed.get(watch.page_id)
+        try:
+            if system.all_paused:
+                await asyncio.to_thread(storage.record_page_check, watch, None, None, True)
+            elif status is not None:
+                await asyncio.to_thread(_record_watch_health, watch, status, watch.watch_id in running)
+        except (changedetection.EngineError, sqlite3.OperationalError, OSError) as error:
+            catchup_logger.warning(
+                "Could not record page monitoring status.", page_id=watch.page_id, error_type=type(error).__name__
+            )
+
+
+def _record_watch_health(watch: storage.LinkedWatch, status: changedetection.WatchStatus, running: bool) -> None:
+    completed_count = None
+    success_at = None
+    # The start time can belong to a newer fetch than the completed count.
+    # Require unchanged status on both sides of the idle observation.
+    if (
+        not running
+        and not status.paused
+        and status.check_count is not None
+        and status.check_count != watch.check_count
+        and changedetection.read_watch(watch.watch_id) == status
+    ):
+        completed_count = status.check_count
+        if completed_count > 0 and not status.error:
+            success_at = status.last_checked
+    storage.record_page_check(watch, completed_count, success_at, bool(status.paused))

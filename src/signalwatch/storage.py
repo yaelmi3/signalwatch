@@ -317,6 +317,7 @@ class ChangeToAnalyze:
 class LinkedWatch:
     page_id: int
     watch_id: str
+    check_count: int | None = None
 
 
 class Competitor(BaseModel):
@@ -377,26 +378,31 @@ def get_linked_page_id(watch_id: str) -> int | None:
 def list_linked_watches() -> list[LinkedWatch]:
     with _database() as database:
         rows = database.execute(
-            "SELECT id, watch_id FROM pages WHERE state = ? AND watch_id IS NOT NULL ORDER BY id", (PageState.LINKED,)
+            """SELECT pages.id AS page_id, pages.watch_id, checks.check_count
+            FROM pages LEFT JOIN page_monitoring AS checks ON checks.page_id = pages.id
+            WHERE pages.state = ? AND pages.watch_id IS NOT NULL ORDER BY pages.id""",
+            (PageState.LINKED,),
         ).fetchall()
-    return [LinkedWatch(page_id=row["id"], watch_id=row["watch_id"]) for row in rows]
+    return [LinkedWatch(**row) for row in rows]
 
 
-def record_page_check(watch: LinkedWatch, check_count: int, success_at: float | None, paused: bool) -> None:
+def record_page_check(watch: LinkedWatch, check_count: int | None, success_at: float | None, paused: bool) -> None:
     now = int(time())
     with _database() as database:
         database.execute(
-            """INSERT INTO page_monitoring (page_id, started_at, check_count, paused_seen_at)
-            SELECT id, :now, :count, :paused_seen_at FROM pages
+            """INSERT INTO page_monitoring (page_id, started_at, check_count, last_success_at, paused_seen_at)
+            SELECT id, :now, :count, :success_at, :paused_seen_at FROM pages
             WHERE id = :page_id AND watch_id = :watch_id AND state = 'linked'
             ON CONFLICT (page_id) DO UPDATE SET
                 started_at = CASE WHEN paused_seen_at IS NOT NULL AND excluded.paused_seen_at IS NULL
                     THEN excluded.started_at ELSE page_monitoring.started_at END,
-                last_success_at = CASE WHEN excluded.check_count > page_monitoring.check_count
-                    AND :success_at IS NOT NULL THEN MAX(COALESCE(page_monitoring.last_success_at, 0), :success_at)
+                last_success_at = CASE WHEN excluded.check_count IS NOT page_monitoring.check_count
+                    AND excluded.last_success_at IS NOT NULL
+                    THEN MAX(COALESCE(page_monitoring.last_success_at, 0), excluded.last_success_at)
                     ELSE page_monitoring.last_success_at END,
-                check_count = excluded.check_count, paused_seen_at = excluded.paused_seen_at
-            WHERE excluded.check_count IS NOT page_monitoring.check_count
+                check_count = COALESCE(excluded.check_count, page_monitoring.check_count),
+                paused_seen_at = excluded.paused_seen_at
+            WHERE (excluded.check_count IS NOT NULL AND excluded.check_count IS NOT page_monitoring.check_count)
                 OR excluded.paused_seen_at IS NOT page_monitoring.paused_seen_at""",
             {
                 "now": now,
@@ -893,15 +899,12 @@ def set_article_feed(*, source_id: int, url: str | None) -> ArticleFeedSettings 
             return None
         if url is None:
             database.execute("DELETE FROM article_feeds WHERE source_id = ?", (source_id,))
-        elif database.execute(
-            """INSERT INTO article_feeds (source_id, url) VALUES (?, ?)
-            ON CONFLICT (source_id) DO UPDATE SET url = excluded.url, seeded = 0
-            WHERE article_feeds.url <> excluded.url""",
-            (source_id, url),
-        ).rowcount:
+        else:
             database.execute(
-                "INSERT OR REPLACE INTO feed_monitoring (source_id, started_at) VALUES (?, ?)",
-                (source_id, int(time())),
+                """INSERT INTO article_feeds (source_id, url) VALUES (?, ?)
+                ON CONFLICT (source_id) DO UPDATE SET url = excluded.url,
+                    seeded = CASE WHEN article_feeds.url = excluded.url THEN article_feeds.seeded ELSE 0 END""",
+                (source_id, url),
             )
     return ArticleFeedSettings(
         source_id=source_id,
@@ -1271,6 +1274,14 @@ def _migrate_monitoring(database: sqlite3.Connection) -> None:
             "INSERT INTO feed_monitoring (source_id, started_at) SELECT source_id, ? FROM article_feeds",
             (now,),
         )
+        # A rollback can reuse this database with a version unaware of feed freshness.
+        database.execute("""CREATE TRIGGER start_feed_monitoring AFTER INSERT ON article_feeds BEGIN
+            INSERT INTO feed_monitoring (source_id, started_at) VALUES (NEW.source_id, unixepoch());
+        END""")
+        database.execute("""CREATE TRIGGER reset_feed_monitoring AFTER UPDATE OF url ON article_feeds
+        WHEN NEW.url <> OLD.url BEGIN
+            UPDATE feed_monitoring SET started_at = unixepoch(), last_success_at = NULL WHERE source_id = NEW.source_id;
+        END""")
     database.commit()
 
 

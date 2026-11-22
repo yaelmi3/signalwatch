@@ -656,6 +656,8 @@ def test_catchup_imports_versions_on_startup_and_timer(tmp_path: Path, monkeypat
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
+        if path == "/api/v1/systeminfo":
+            return httpx2.Response(HTTPStatus.SERVICE_UNAVAILABLE)
         if path == f"/api/v1/watch/{_WATCH_ID}":
             return httpx2.Response(
                 HTTPStatus.OK, json={"paused": False, "last_checked": 0, "check_count": 0, "last_error": False}
@@ -712,7 +714,9 @@ def test_monitoring_tracks_successful_watches_and_feeds(tmp_path: Path, monkeypa
     storage.set_article_feed(source_id=source.id, url=feed_url)
 
     watch = changedetection.WatchStatus(available=True, check_count=3, last_checked=now)
+    system = changedetection.EngineSystemInfo(all_paused=False, checking_now=[])
     monkeypatch.setattr(changedetection, "read_watch", lambda _watch_id: watch)
+    monkeypatch.setattr(changedetection, "read_system_info", lambda: system)
     monkeypatch.setattr(changedetection, "read_history", lambda _watch_id: [])
     empty_feed = b'<rss version="2.0"><channel></channel></rss>'
     feed_body = empty_feed
@@ -747,12 +751,6 @@ def test_monitoring_tracks_successful_watches_and_feeds(tmp_path: Path, monkeypa
         assert response.content == b"" and response.headers["Cache-Control"] == "no-store"
         assert client.get(detail).json() == [stale_feed]
 
-        now += 4 * 60 * 60
-        watch = watch.model_copy(update={"check_count": 5, "last_checked": now, "error": "Last page fetch failed."})
-        asyncio.run(_catch_up_once(Event()))
-        # A failed completed check and a new attempt with the same counter are both stale.
-        watch = watch.model_copy(update={"last_checked": now + 0.5, "error": None})
-        asyncio.run(_catch_up_once(Event()))
         stale_page = {
             "id": page.id,
             "kind": "page",
@@ -760,10 +758,34 @@ def test_monitoring_tracks_successful_watches_and_feeds(tmp_path: Path, monkeypa
             "source_name": source.name,
             "last_success_at": last_success,
         }
+        now += 4 * 60 * 60
+        # A missed completion can advance the counter while the timestamp belongs to a running check.
+        watch = watch.model_copy(update={"check_count": 5, "last_checked": now})
+        system.checking_now = [changedetection.RunningWatch(uuid=_WATCH_ID)]
+        asyncio.run(_catch_up_once(Event()))
         assert client.get(detail).json() == [stale_feed, stale_page]
 
+        # The running check finishes between the watch read and the idle snapshot.
+        system.checking_now = []
+        failed = watch.model_copy(update={"check_count": 6, "error": "Last page fetch failed."})
+        snapshots = iter((watch, failed))
+        monkeypatch.setattr(changedetection, "read_watch", lambda _watch_id: next(snapshots))
+        asyncio.run(_catch_up_once(Event()))
+        assert client.get(detail).json() == [stale_feed, stale_page]
+
+        monkeypatch.setattr(changedetection, "read_watch", lambda _watch_id: watch)
+        watch = failed
+        asyncio.run(_catch_up_once(Event()))
+        watch = watch.model_copy(update={"last_checked": now + 0.5, "error": None})
+        asyncio.run(_catch_up_once(Event()))
+        assert client.get(detail).json() == [stale_feed, stale_page]
+
+        system.all_paused = True
+        asyncio.run(_catch_up_once(Event()))
+        assert client.get(detail).json() == [stale_feed]
+        system.all_paused = False
         now += 1
-        watch = watch.model_copy(update={"check_count": 6, "last_checked": now})
+        watch = watch.model_copy(update={"check_count": 7, "last_checked": now})
         asyncio.run(_catch_up_once(Event()))
         feed_body = empty_feed
         article_feeds.sync_feeds()
@@ -781,18 +803,75 @@ def test_monitoring_grace_for_existing_and_paused_watches(tmp_path: Path, monkey
     page = storage.save_competitor("Example", "https://example.com/").pages[0]
     storage.link_watch(page.id, _WATCH_ID)
     with closing(sqlite3.connect(db_path)) as database:
-        database.executescript("DROP TABLE page_monitoring; DROP TABLE feed_monitoring;")
+        database.executescript("""
+            DROP TRIGGER start_feed_monitoring;
+            DROP TRIGGER reset_feed_monitoring;
+            DROP TABLE page_monitoring;
+            DROP TABLE feed_monitoring;
+        """)
 
     assert storage.list_stale_sources() == []
-    now += 4 * 60 * 60
-    assert [source.last_success_at for source in storage.list_stale_sources()] == [None]
-    watch = storage.LinkedWatch(page.id, _WATCH_ID)
-    storage.record_page_check(watch, 4, None, True)
+    now += 60
+    first_success = now
+    watch = changedetection.WatchStatus(available=True, check_count=1, last_checked=first_success)
+    system = changedetection.EngineSystemInfo(all_paused=False, checking_now=[])
+    monkeypatch.setattr(changedetection, "read_watch", lambda _watch_id: watch)
+    monkeypatch.setattr(changedetection, "read_system_info", lambda: system)
+    monkeypatch.setattr(changedetection, "read_history", lambda _watch_id: [])
+    asyncio.run(_catch_up_once(Event()))
+
+    now += 4 * 60 * 60 - 60
+    assert storage.list_stale_sources() == []
+    now += 60
+    assert [source.last_success_at for source in storage.list_stale_sources()] == [first_success]
+
+    def fail_history(_watch_id: str) -> list[int]:
+        raise changedetection.EngineError("History unavailable")
+
+    system.all_paused = True
+    monkeypatch.setattr(changedetection, "read_history", fail_history)
+    asyncio.run(_catch_up_once(Event()))
     assert storage.list_stale_sources() == []
     now += 4 * 60 * 60
     assert [source.id for source in storage.list_stale_sources()] == [page.id]
-    storage.record_page_check(watch, 4, None, False)
+
+    system.all_paused = False
+    watch = watch.model_copy(update={"paused": True})
+    monkeypatch.setattr(changedetection, "read_history", lambda _watch_id: [])
+    asyncio.run(_catch_up_once(Event()))
     assert storage.list_stale_sources() == []
+    now += 4 * 60 * 60
+    assert [source.id for source in storage.list_stale_sources()] == [page.id]
+    watch = watch.model_copy(update={"paused": False})
+    asyncio.run(_catch_up_once(Event()))
+    assert storage.list_stale_sources() == []
+
+
+def test_feed_replaced_during_rollback_gets_its_own_freshness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "configuration.sqlite3"
+    monkeypatch.setenv("SIGNALWATCH_DB_PATH", str(db_path))
+    source = storage.save_competitor("Example", "https://example.com/")
+    old_feed = storage.ArticleFeed(source.id, "https://example.com/old.xml")
+    new_url = "https://example.com/new.xml"
+    storage.set_article_feed(source_id=source.id, url=old_feed.url)
+    monkeypatch.setattr(storage, "time", lambda: 20_000)
+    storage.save_discovered_articles(old_feed, [])
+
+    with closing(sqlite3.connect(db_path)) as database, database:
+        database.execute("UPDATE feed_monitoring SET started_at = 20000 WHERE source_id = ?", (source.id,))
+        # The old release changes the feed in place without updating monitoring tables.
+        database.execute("UPDATE article_feeds SET url = ?, seeded = 0 WHERE source_id = ?", (new_url, source.id))
+        replaced_at = database.execute("SELECT started_at FROM feed_monitoring").fetchone()[0]
+
+    assert replaced_at > 20_000
+    now = replaced_at + 20 * 60 - 1
+    monkeypatch.setattr(storage, "time", lambda: now)
+    assert storage.list_stale_sources() == []
+    storage.save_discovered_articles(old_feed, [])
+    storage.set_article_feed(source_id=source.id, url=new_url)
+    now += 1
+    (stale,) = storage.list_stale_sources()
+    assert stale.url == new_url and stale.last_success_at is None
 
 
 def test_changedetection_webhook_saves_one_change_for_duplicate_deliveries(
