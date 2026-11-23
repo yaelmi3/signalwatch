@@ -356,6 +356,17 @@ a:hover { color: var(--ink); }
 .configuration .delete-confirm { border-color: var(--danger); color: #fff; background: var(--danger); }
 .configuration .delete-confirm:hover:enabled { background: #7e251f; color: #fff; }
 
+.demo-video { margin-bottom: 1rem; }
+.demo-video summary { color: var(--link); cursor: pointer; font-weight: 650; }
+.demo-video video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  margin: 0.75rem 0 0.5rem;
+  border-radius: 0.5rem;
+  background: var(--rail);
+}
+
 .digest-feed { margin: 0; padding: 0; list-style: none; }
 .digest-entry { display: grid; gap: 0.9rem; }
 .digest-entry-meta, .digest-entry-links, .history-meta {

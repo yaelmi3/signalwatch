@@ -90,6 +90,7 @@ const configurationPath = "/?view=configuration";
 const articleFeedsPath = "/api/maintainer/article-feeds";
 const slackPath = "/api/maintainer/slack";
 const summarySentences = new Intl.Segmenter(undefined, { granularity: "sentence" });
+const demoVideoUrl = "https://storage.googleapis.com/signalwatch-staging-007321-demo/signalwatch-demo.mp4";
 
 function request<T>(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<T>;
 async function request(path: string, options?: RequestInit, readHeaders?: (headers: Headers) => void): Promise<unknown> {
@@ -643,6 +644,13 @@ function Digest({ held }: { held: boolean }) {
           </button>
         )}
       </div>
+      {!held && (
+        <details className="panel demo-video">
+          <summary>Watch demo</summary>
+          <video src={demoVideoUrl} controls preload="none" playsInline aria-label="SignalWatch demo video" />
+          <a href={demoVideoUrl}>Open video directly</a>
+        </details>
+      )}
       {feedbackEnabled && feedbackTarget === "missing" && (
         <div className="panel feedback-report"><FeedbackForm pending={pendingFeedback} /></div>
       )}
