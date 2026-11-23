@@ -1,73 +1,35 @@
-# SignalWatch: competitor content monitoring
+# SignalWatch design
 
-Status: **DRAFT FOR DISCUSSION** — a proposed design, not approval to build it.
+SignalWatch watches competitor sites for new articles and quiet page edits. It tells Marketing, Product, and R&D what changed and why it matters to them. Business users add competitors and watched pages and set team interests in the web app. Maintainers have a separate screen for feeds, Slack, analysis, and source health.
 
-## TL;DR
+## Why we chose these tools
 
-Build a Python app with a simple business UI. Propose Trafilatura to find publications and changedetection.io to track page edits. The app decides what matters to each team, sends it through one channel, and collects feedback. Use SQLite and DBOS with one dedicated Python worker for durable background work.
+**[changedetection.io](https://github.com/dgtlmoon/changedetection.io)** already handles scheduled checks, keeps page history, and lets us read saved copies through an API. We reused it to avoid writing and maintaining a page monitoring engine. It checks each configured page on a schedule, saves changed versions, and notifies SignalWatch when it finds a change.
 
-## Goal and scope
+**SQLite** fits one host with one background worker and modest write traffic. It saves state on a persistent disk and needs no database server. The Python app stores settings, results, and feedback in one SQLite file. DBOS, the library that runs background jobs, saves progress in a second file so work can resume after a restart. We considered PostgreSQL with PgQueuer and Temporal. Both would add a service to operate.
 
-Manual checks miss publications and quiet page edits. Sending everything creates noise. Marketing, Product, and R&D need separate judgments about what matters.
+## How a competitor update reaches a team
 
-Business users must add competitors, topics, and interests without technical setup. The system must run unattended and support handover. The deadline is seven days; the design must address two years of operation.
+1. **Collect.** The worker checks configured RSS 2.0 feeds every five minutes. The first successful check records the articles already there so they do not trigger alerts. Later checks pick up new article links, and Trafilatura extracts the text from the publisher's page. For page edits, SignalWatch reads the saved before-and-after versions from changedetection.io. It skips page versions and article links it has already saved for that watch or feed.
+2. **Decide.** The worker asks the model to check the saved evidence against each team's interests. For articles, it checks proposed matches against supporting quotes. It saves each team's decision and the reason. For example, a post about AsterShield's CI integration matched R&D and was held for Marketing and Product.
+3. **Deliver.** The Digest shows matching updates with their source links and reasons. Slack gets one message per matching channel. Maintainers can inspect items that were held and see why each team passed.
 
-Start with supported sources and one delivery channel. Universal website support, extra channels, and automatic model training are outside the first version.
+## How quality improves
 
-## Proposed parts and ownership
+Readers can flag a poor alert or report a missed update. For feedback on a saved article, a maintainer can compare a suggested change to a team's interests against up to three saved articles. Applying it changes future decisions. In one R&D test, the proposed change produced the expected decisions on two labeled articles. Measuring alert quality across all three teams is still open.
 
-Only the server and greeting page exist; full discovery-to-delivery integration is untested. Python is fixed. [Local engine/browser checks](../qa/runs/2026-11-16-changedetection.md) passed. Proposed parts:
+## What happens when something fails
 
-- **Python app:** owns business settings, source/watch links, content versions, team decisions, delivery status, and feedback. Its UI shows coverage, results, and held items with reasons and "should have been sent" feedback.
-- **Trafilatura 2.3.1:** [finds page URLs](https://trafilatura.readthedocs.io/en/latest/crawls.html) and [extracts article text](https://trafilatura.readthedocs.io/en/latest/). Its [feed helper returns article URLs](https://github.com/adbar/trafilatura/blob/v2.3.1/trafilatura/feeds.py), not feed addresses. It does not run JavaScript. The app must schedule discovery and remember seen items.
-- **changedetection.io:** runs separately in Docker. The app uses its [REST API](https://changedetection.io/docs/api_v1/index.html) for page history and stored copies. Its [optional browser](https://github.com/dgtlmoon/changedetection.io/blob/master/docker-compose.yml) handles rendered pages when needed.
-- **SQLite and DBOS:** SQLite holds app data and DBOS execution state on persistent local storage shared by the app and worker on one host. The web app enqueues through [DBOSClient](https://docs.dbos.dev/python/reference/client), without executing jobs. One dedicated Python worker runs the [DBOS runtime](https://docs.dbos.dev/python/programming-guide). Configure retries for network, model, and delivery steps, and show exhausted failures. After a supervised restart, DBOS recovers persisted unfinished work.
+- **A source or model call fails.** Feed checks try again on the next poll. The worker retries temporary analysis errors and records failures when it runs out of retries. A separate cloud monitor emails the maintainer if the app is unreachable or source checks go stale. In staging, feeds go stale after 20 minutes and page checks after four hours. Maintainer settings shows which source needs attention.
+- **Slack fails or times out.** SignalWatch records one send attempt per item and channel, including failed or uncertain outcomes. The maintainer checks the channel before resending, since Slack may have accepted the message even if its reply was lost.
+- **A service or the host goes down.** Docker restarts exited services. On the same disk and release, DBOS can resume saved jobs. If the page detector kept running, SignalWatch catches up from the versions it still holds and flags a gap when its last saved version is missing. RSS can catch up on entries still in the feed. A full host outage pauses collection. Changes the detector never saw and articles that have already dropped off the feed can be missed.
 
-The app creates and retires watch targets. Its separate maintainer area covers discovery rules, prompts, delivery settings, and failed work. The engine dashboard handles per-page fetch/browser settings, selectors, and detection rules. App updates preserve those fields. Use separate business/maintainer roles. Keep credentials server-side. Treat page text as evidence, never instructions.
+## How we deploy and recover
 
-```mermaid
-flowchart LR
-    Business[Business UI] --> App[Python app]
-    App <--> Database[(SQLite: app data and execution state)]
-    Database <--> Worker[One Python worker: DBOS]
-    Worker --> Discovery[Trafilatura]
-    Worker <--> Monitor[changedetection.io]
-    App <--> Monitor[changedetection.io]
-    Maintainer[Technical controls] --> Monitor
-    Maintainer --> App
-    Worker --> Teams[Team judgments and delivery]
-    Teams --> Feedback[Feedback]
-    Feedback --> App
-```
+Docker Compose runs the app, worker, and changedetection.io in separate containers on the same VM. The detector uses a pinned image and keeps watch history on the persistent disk. It checks websites through an outbound proxy and sends change notifications directly to the app over Docker's internal network. Compose waits for the detector to pass its health check before starting the app. [Compose configuration](../../compose.yaml)
 
-## Flow
+GitHub Actions builds the exact revision pushed to `main` and deploys it to a single Google Cloud VM. The deploy stops the worker, checks for unfinished jobs, backs up both databases, and waits for health checks. If jobs are unfinished, the operator finishes them with the old release first. If a rollout fails after switching versions, the operator can use the last healthy revision and restore matching data when needed. A full restore requires both databases and the detector history. Restoring a backup discards changes made after it. [Deployment and recovery runbook](../deploy-staging.md)
 
-1. **Configure monitoring.** Business users add competitors and edit each team's topics and short "what matters" note. These apply to all followed competitors. Default edit watches cover the homepage and main product/pricing pages when available; users can add/remove page URLs. Maintainer policy handles supported source discovery/extraction. Show coverage gaps. JavaScript-only discovery needs a supported fallback.
-2. **Save the starting point.** Remember existing publication IDs and each watched page's first stored copy. Do not announce old material as new. Later unseen articles are candidates; use publication dates to distinguish new posts from older finds and label uncertainty. Page edits carry before/after evidence.
-3. **Collect changes.** A webhook is a wake-up hint. Persist a processing job through DBOS before acknowledging it. The worker reads page history; regular API history jobs catch missed signals. Both use saved watch/version IDs to avoid repeat processing. Read first copies explicitly. An edit that only adds an article link becomes discovery of that article, keyed by its URL, not a separate alert. Other page edits get independent team judgments.
-4. **Judge each team separately.** Use each team's topics and "what matters" note. Ground explanations in the observed content. Compare a competitor with Noma only when the business-provided note supplies the relevant context; otherwise, describe the competitor's change without assuming what Noma lacks. An item can matter to none, one, or several teams. Keep evidence, reasons, and model/prompt/settings versions. Layout noise can be removed; judge relevance separately for each team.
-5. **Send useful results.** Save pending delivery, then send through an existing transport library. Choose Slack or email. Include what changed, why it matters, and source links. Track item version, team, and destination to avoid known repeats. If a send succeeds but its reply is lost, retrying can still duplicate it.
+## Where the design stops
 
-Save processing/delivery state in SQLite so work can resume. Skip disabled sources in app collection jobs and delivery; engine pause stops only scheduling. Before watch deletion, save evidence required by retention policy because engine history becomes inaccessible. Topic edits apply to later discoveries; never automatically recheck or resend past items.
-
-## Operation and quality
-
-Show collection, model, and delivery failures. Configure DBOS step retries and notify operators when help is needed. Derive last success from completed outcomes, never `last_checked` alone; show it separately from last publication. Track source checks separately from item counts; empty or fallback results do not prove source health. Show uncertain coverage when success is unknown. Missing completion heartbeats from scheduled checks must alert maintainers through an outside path independent of team delivery. Handover needs saved state, supervised restarts, backups, protected secrets, and tested pinned releases.
-
-Keep a stable worker identity. Before workflow or DBOS SDK upgrades, finish or recover pending work with matching code and application version; startup recovery does not resume arbitrary changed workflow code.
-
-Each team's business owner supplies expected judgments and reviews samples. The maintainer compares results against saved examples. Sample source material and held items to find misses; add confirmed cases to the examples. Track useful/irrelevant/wrong-team feedback, misses, and false alarms. Show trends. Revise topics, extraction, or prompts deliberately, then compare again. Feedback does not train the model. Numerical quality targets need agreement.
-
-As volume grows, limit concurrent fetches/model calls, respect provider limits, and reuse content across teams. Size concurrency and storage from measured load and cost.
-
-## Tradeoffs and open decisions
-
-Reusing discovery and monitoring avoids building a crawler and page-history engine. It adds a service and history catch-up work.
-
-SQLite fits the expected modest writes on one host; keep writes short. DBOS provides durable jobs, retries, and restart recovery without a queue we must write or a database server to operate. One worker keeps setup small; capacity remains unmeasured. We accept DBOS's workflow/versioning dependency. Its docs recommend PostgreSQL for production; this choice is scoped to the single-host assignment.
-
-PostgreSQL + PgQueuer is a viable durable queue, but adds a database service/container the expected workload does not need. Reconsider PostgreSQL for multiple hosts, high write concurrency, or a broader production deployment.
-
-Temporal adds durable orchestration and operational tools, but requires a separate service or Temporal Cloud setup and cost. The current workflow does not justify that operational burden.
-
-Before building, settle supported sources/fallbacks, numerical quality targets, delivery channel, model/evidence limits, hosting, retention/deletion, and acceptable delay/volume/cost. Define which network addresses user-entered URLs may reach. No scale targets or application behavior are claimed.
+More sources mean more fetches, more topics give the model more to evaluate, and more channels mean more sends. The worker runs up to two analysis jobs at a time. Queue delay, source freshness, and model cost would guide when to add capacity or move to PostgreSQL for multiple hosts. Article discovery is limited to configured RSS feeds. For a business handoff, the remaining work is private access with separate roles, off-host backups with a tested restore, and an owner for credentials and alerts.
