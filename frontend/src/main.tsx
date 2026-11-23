@@ -607,7 +607,7 @@ function SlackFeedback({ feedbackToken }: { feedbackToken: string }) {
   );
 }
 
-function Digest({ held }: { held: boolean }) {
+function Digest({ held, walkthroughOpen }: { held: boolean; walkthroughOpen: boolean }) {
   const [entries, setEntries] = useState<DigestEntry[] | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [error, setError] = useState(false);
@@ -645,7 +645,7 @@ function Digest({ held }: { held: boolean }) {
         )}
       </div>
       {!held && (
-        <details className="panel demo-video">
+        <details className="panel demo-video" open={walkthroughOpen}>
           <summary>Watch the walkthrough</summary>
           <video src={demoVideoUrl} controls preload="none" playsInline aria-label="SignalWatch walkthrough video" />
           <a href={demoVideoUrl}>Open video directly</a>
@@ -1636,7 +1636,9 @@ createRoot(root).render(
       {feedbackToken !== null ? <SlackFeedback feedbackToken={feedbackToken} /> :
         view === "maintainer" ? <MaintainerSettings slackCallback={search.get("slack")} /> : view === "history" ? (
         <PageHistory pageId={search.get("page") ?? ""} requestedVersion={requestedVersion} fromHeld={fromHeld} />
-      ) : view === "configuration" ? <Configuration /> : <Digest held={held} />}
+      ) : view === "configuration" ? <Configuration /> : (
+        <Digest held={held} walkthroughOpen={view === "walkthrough"} />
+      )}
     </div>
   </StrictMode>,
 );
