@@ -320,6 +320,7 @@ a:hover { color: var(--ink); }
 }
 .configuration-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); }
 .source-panels { min-width: 0; }
+.add-source-feed { display: grid; flex: 1 1 100%; gap: 0.3rem; min-width: 0; }
 .configuration .team-interests-fields { display: grid; align-items: start; }
 .team-interests-fields button { justify-self: start; }
 .competitor { padding-top: 0.9rem; border-top: 1px solid var(--rule); scroll-margin-top: 1rem; }

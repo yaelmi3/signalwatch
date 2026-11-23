@@ -325,6 +325,7 @@ class Competitor(BaseModel):
     name: str
     website: str
     pages: list[Page]
+    rss_feed_url: str | None = None
 
 
 @dataclass
@@ -434,7 +435,7 @@ def list_stale_sources() -> list[StaleSource]:
             LEFT JOIN feed_monitoring AS checks ON checks.source_id = feeds.source_id
             WHERE COALESCE(checks.last_success_at, checks.started_at, 0) <= :feed_cutoff
             ORDER BY source_name, kind, id""",
-            {"page_cutoff": now - page_stale_after, "feed_cutoff": now - 20 * 60},
+            {"page_cutoff": now - page_stale_after, "feed_cutoff": now - 2 * 60 * 60},
         ).fetchall()
     return [StaleSource.model_validate(dict(row)) for row in rows]
 
@@ -1173,17 +1174,18 @@ def save_page_version(*, page_id: int, watch_id: str, version: int, before: str 
 def list_competitors() -> list[Competitor]:
     with _database() as database:
         database.execute("BEGIN")
-        competitors = {
-            row["id"]: Competitor(**dict(row), pages=[])
-            for row in database.execute("SELECT * FROM competitors ORDER BY id")
-        }
+        sources = database.execute(
+            """SELECT competitors.*, article_feeds.url AS rss_feed_url FROM competitors
+            LEFT JOIN article_feeds ON competitors.id = article_feeds.source_id ORDER BY competitors.id"""
+        )
+        competitors = {row["id"]: Competitor(**dict(row), pages=[]) for row in sources}
         for row in database.execute("SELECT * FROM pages ORDER BY id"):
             page = Page.model_validate(dict(row))
             competitors[page.competitor_id].pages.append(page)
     return list(competitors.values())
 
 
-def save_competitor(name: str, website: str) -> Competitor:
+def save_competitor(name: str, website: str, *, rss_feed_url: str | None = None) -> Competitor:
     with _database() as database:
         competitor = database.execute(
             "INSERT INTO competitors (name, website) VALUES (?, ?) RETURNING *", (name, website)
@@ -1191,7 +1193,11 @@ def save_competitor(name: str, website: str) -> Competitor:
         page = database.execute(
             "INSERT INTO pages (competitor_id, url) VALUES (?, ?) RETURNING *", (competitor["id"], website)
         ).fetchone()
-    return Competitor(**dict(competitor), pages=[Page.model_validate(dict(page))])
+        if rss_feed_url is not None:
+            database.execute(
+                "INSERT INTO article_feeds (source_id, url) VALUES (?, ?)", (competitor["id"], rss_feed_url)
+            )
+    return Competitor(**dict(competitor), pages=[Page.model_validate(dict(page))], rss_feed_url=rss_feed_url)
 
 
 def save_page(competitor_id: int, url: str) -> Page:

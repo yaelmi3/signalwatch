@@ -1,6 +1,6 @@
 # SignalWatch design
 
-SignalWatch watches competitor sites for new articles and quiet page edits. It tells Marketing, Product, and R&D what changed and why it matters to them. Business users add competitors and watched pages and set team interests in the web app. Maintainers have a separate screen for feeds, Slack, analysis, and source health.
+SignalWatch watches competitor sites for new articles and quiet page edits. It tells Marketing, Product, and R&D what changed and why it matters to them. Business users add competitors with watched pages and optional RSS feeds and set team interests in the web app. They can edit a feed on its source card. Maintainers have a separate screen for feeds, Slack, analysis, and source health.
 
 ## Why we chose these tools
 
@@ -10,7 +10,7 @@ SignalWatch watches competitor sites for new articles and quiet page edits. It t
 
 ## How a competitor update reaches a team
 
-1. **Collect.** The worker checks configured RSS 2.0 feeds every five minutes. The first successful check records the articles already there so they do not trigger alerts. Later checks pick up new article links, and Trafilatura extracts the text from the publisher's page. For page edits, SignalWatch reads the saved before-and-after versions from changedetection.io. It skips page versions and article links it has already saved for that watch or feed.
+1. **Collect.** The worker checks configured RSS 2.0 feeds every 30 minutes. The first successful check records the articles already there so they do not trigger alerts. Later checks pick up new article links, and Trafilatura extracts the text from the publisher's page. For page edits, SignalWatch reads the saved before-and-after versions from changedetection.io. It skips page versions and article links it has already saved for that watch or feed.
 2. **Decide.** The worker asks the model to check the saved evidence against each team's interests. For articles, it checks proposed matches against supporting quotes. It saves each team's decision and the reason. For example, a post about AsterShield's CI integration matched R&D and was held for Marketing and Product.
 3. **Deliver.** The Digest shows matching updates with their source links and reasons. Slack gets one message per matching channel. Maintainers can inspect items that were held and see why each team passed.
 
@@ -20,7 +20,7 @@ Readers can flag a poor alert or report a missed update. For feedback on a saved
 
 ## What happens when something fails
 
-- **A source or model call fails.** Feed checks try again on the next poll. The worker retries temporary analysis errors and records failures when it runs out of retries. A separate cloud monitor emails the maintainer if the app is unreachable or source checks go stale. In staging, feeds go stale after 20 minutes and page checks after four hours. Maintainer settings shows which source needs attention.
+- **A source or model call fails.** Feed checks try again on the next poll. The worker retries temporary analysis errors and records failures when it runs out of retries. A separate cloud monitor emails the maintainer if the app is unreachable or source checks go stale. In staging, feeds go stale after two hours and page checks after four hours. Maintainer settings shows which source needs attention.
 - **Slack fails or times out.** SignalWatch records one send attempt per item and channel, including failed or uncertain outcomes. The maintainer checks the channel before resending, since Slack may have accepted the message even if its reply was lost.
 - **A service or the host goes down.** Docker restarts exited services. On the same disk and release, DBOS can resume saved jobs. If the page detector kept running, SignalWatch catches up from the versions it still holds and flags a gap when its last saved version is missing. RSS can catch up on entries still in the feed. A full host outage pauses collection. Changes the detector never saw and articles that have already dropped off the feed can be missed.
 

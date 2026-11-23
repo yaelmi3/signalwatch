@@ -40,9 +40,13 @@ def _check_article_feed_url(url: HttpUrl) -> HttpUrl:
     return url
 
 
+type ArticleFeedUrl = Annotated[MonitoredUrl, AfterValidator(_check_article_feed_url)]
+
+
 class CompetitorInput(BaseModel):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     website: MonitoredUrl
+    rss_feed_url: ArticleFeedUrl | None = None
 
 
 class PageInput(BaseModel):
@@ -50,7 +54,7 @@ class PageInput(BaseModel):
 
 
 class ArticleFeedInput(BaseModel):
-    url: Annotated[MonitoredUrl, AfterValidator(_check_article_feed_url)] | None = None
+    url: ArticleFeedUrl | None = None
 
 
 def _page(page_id: int) -> Page:
@@ -177,7 +181,8 @@ def patch_team_interests(changes: TeamInterests) -> TeamInterests:
 
 @router.post("/competitors", status_code=HTTPStatus.CREATED)
 def add_competitor(payload: CompetitorInput) -> Competitor:
-    competitor = storage.save_competitor(payload.name, str(payload.website))
+    feed_url = str(payload.rss_feed_url) if payload.rss_feed_url is not None else None
+    competitor = storage.save_competitor(payload.name, str(payload.website), rss_feed_url=feed_url)
     competitor.pages = [connect_page(competitor.pages[0].id)]
     return competitor
 

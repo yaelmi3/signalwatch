@@ -91,8 +91,9 @@ updates, and page-edit reports still appear in the feedback list.
 
 ### Article discovery
 
-Open **Maintainer settings → Article discovery** and give a source a public RSS 2.0 feed URL. The worker checks the feed
-at startup and every five minutes. The first successful poll records the baseline, even when no articles are eligible.
+Enter an optional public RSS 2.0 feed URL in **Add source**, or edit it on the source card under **Sources**.
+You can also manage feeds in **Maintainer settings → Article discovery**. The worker checks configured feeds at
+startup and every 30 minutes. The first successful poll records the baseline, even when no articles are eligible.
 Later discoveries are analyzed from the original publisher page. Relevant articles link directly to the publisher,
 and Held shows why each team passed on an analyzed article.
 
