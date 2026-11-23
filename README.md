@@ -159,3 +159,14 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 ```
+
+## AI assistance
+
+- **OpenAI Codex** was my main development assistant. I used it to research options, write and revise substantial parts of the code and tests, troubleshoot staging, and prepare the design document and walkthrough.
+- **Ponytail** helped me simplify the design and keep the implementation small while meeting the requirements.
+- **Semantic Code Review** is a private skill I used to group related edits by their purpose and send each group, with its surrounding code and requirements, to reviewers with the relevant expertise.
+- **Claude Code** independently reviewed early drafts of the technical design.
+- **OpenAI Decisions** helped compare specific design choices, including where the logic for deciding what matters to each team should live.
+- **Sourcery** checked Python changes and suggested simplifications.
+
+I made the final design decisions. I used automated tests and a live staging run to verify the core workflow, from a scheduled RSS update to an alert in the R&D Slack channel.
