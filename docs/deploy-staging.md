@@ -150,7 +150,7 @@ The status URL returns 503 when a watched page or RSS feed is stale. It returns 
 checker can use the public gateway. An unreachable app also fails the check. Open **Maintainer settings →
 Source monitoring** to see which sources are stale and when they last checked successfully.
 
-RSS feeds become stale after 20 minutes without a successful check. Watched pages get four hours, which allows for
+RSS feeds become stale after two hours without a successful check. Watched pages get four hours, which allows for
 changedetection.io's default three-hour schedule. If you extend that schedule, set `SIGNALWATCH_PAGE_STALE_SECONDS`
 in `staging.env` to a window longer than your slowest watch interval.
 

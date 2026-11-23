@@ -736,9 +736,12 @@ def test_monitoring_tracks_successful_watches_and_feeds(tmp_path: Path, monkeypa
         article_feeds.sync_feeds()
         last_success = now
 
-        now += 20 * 60
+        now += 2 * 60 * 60 - 1
         feed_body = b"<html></html>"
         article_feeds.sync_feeds()
+        assert client.get(health).status_code == HTTPStatus.OK
+
+        now += 1
         stale_feed = {
             "id": source.id,
             "kind": "feed",
@@ -758,7 +761,7 @@ def test_monitoring_tracks_successful_watches_and_feeds(tmp_path: Path, monkeypa
             "source_name": source.name,
             "last_success_at": last_success,
         }
-        now += 4 * 60 * 60
+        now = last_success + 4 * 60 * 60
         # A missed completion can advance the counter while the timestamp belongs to a running check.
         watch = watch.model_copy(update={"check_count": 5, "last_checked": now})
         system.checking_now = [changedetection.RunningWatch(uuid=_WATCH_ID)]
@@ -864,7 +867,7 @@ def test_feed_replaced_during_rollback_gets_its_own_freshness(tmp_path: Path, mo
         replaced_at = database.execute("SELECT started_at FROM feed_monitoring").fetchone()[0]
 
     assert replaced_at > 20_000
-    now = replaced_at + 20 * 60 - 1
+    now = replaced_at + 2 * 60 * 60 - 1
     monkeypatch.setattr(storage, "time", lambda: now)
     assert storage.list_stale_sources() == []
     storage.save_discovered_articles(old_feed, [])
@@ -1170,10 +1173,15 @@ def test_configuration_persists_and_links_watch(tmp_path: Path, monkeypatch: pyt
     )
     monkeypatch.setattr(httpx2, "Client", partial(httpx2.Client, transport=httpx2.MockTransport(handler)))
 
+    feed_url = "https://example.com/feed.xml"
     with TestClient(app) as client:
-        created = client.post("/api/competitors", json={"name": "Example", "website": "https://example.com/"})
+        created = client.post(
+            "/api/competitors", json={"name": "Example", "website": "https://example.com/", "rss_feed_url": feed_url}
+        )
         assert created.status_code == HTTPStatus.CREATED
         competitor = created.json()
+        assert competitor["rss_feed_url"] == feed_url
+        assert storage.list_article_feeds() == [storage.ArticleFeed(competitor["id"], feed_url)]
         page = competitor["pages"][0]
         assert page["watch_id"] == watch_id
         assert page["state"] == "linked"
@@ -1228,6 +1236,15 @@ def test_unsafe_target_is_rejected_before_engine_request(tmp_path: Path, monkeyp
 
     with TestClient(app) as client:
         rejected = client.post("/api/competitors", json={"name": "Unsafe target", "website": "https://127.0.0.1/"})
+        assert rejected.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
+        rejected = client.post(
+            "/api/competitors",
+            json={
+                "name": "Unsafe feed",
+                "website": "https://example.com/",
+                "rss_feed_url": "https://example.com:444/rss",
+            },
+        )
         assert rejected.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
         assert client.get("/api/competitors").json() == []
 

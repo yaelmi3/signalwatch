@@ -11,7 +11,7 @@ type Page = {
   state: "pending" | "creating" | "linked" | "attention";
   error: string | null;
 };
-type Competitor = { id: number; name: string; website: string; pages: Page[] };
+type Competitor = { id: number; name: string; website: string; rss_feed_url: string | null; pages: Page[] };
 type PageChange = { version: string; before: string; after: string };
 type TeamDecision = { relevant: boolean; reason: string; quote: string | null };
 type ChangeAnalysisResult = {
@@ -450,6 +450,10 @@ function CompetitorSection({ competitor, onPage, onDelete, onRemove }: {
         {error && <p role="alert">{error}</p>}
         {saved && <p role="status">Page saved.</p>}
       </form>
+      <ArticleFeedForm
+        feed={{ source_id: competitor.id, source_name: competitor.name, url: competitor.rss_feed_url }}
+        heading="Article discovery" help="Leave the RSS URL blank to turn off article discovery."
+        disabled={busy === "delete"} />
     </section>
   );
 }
@@ -1380,7 +1384,10 @@ function ArticleDiscoverySettings() {
   );
 }
 
-function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
+function ArticleFeedForm({ feed, heading = feed.source_name, help, disabled = false }: {
+  feed: ArticleFeedSettings; heading?: string; help?: string; disabled?: boolean;
+}) {
+  const helpId = useId();
   const [feedUrl, setFeedUrl] = useState(feed.url ?? "");
   const [saveState, setSaveState] = useState<"saving" | "saved" | null>(null);
   const [error, setError] = useState("");
@@ -1409,14 +1416,15 @@ function ArticleFeedForm({ feed }: { feed: ArticleFeedSettings }) {
       setSaveState(null);
       setError("");
     }}>
-      <fieldset disabled={saveState === "saving"}>
-        <legend>{feed.source_name}</legend>
-        <label>RSS 2.0 URL
-          <input type="url" name="url" value={feedUrl} aria-describedby="article-feed-help"
+      <fieldset disabled={disabled || saveState === "saving"}>
+        <legend>{heading}</legend>
+        <label>RSS feed URL
+          <input type="url" name="url" value={feedUrl} aria-describedby={help ? helpId : "article-feed-help"}
             onChange={(event) => setFeedUrl(event.target.value)} />
         </label>
         <button type="submit" className="button-primary">{saveState === "saving" ? "Saving…" : "Save feed"}</button>
       </fieldset>
+      {help && <p id={helpId} className="muted">{help}</p>}
       {saveState === "saved" && <p role="status">Feed settings saved.</p>}
       {error && <p role="alert">{error}</p>}
     </form>
@@ -1543,6 +1551,7 @@ function Configuration() {
     try {
       const competitor = await post<Competitor>("/api/competitors", {
         name: String(fields.get("name") ?? "").trim(), website: String(fields.get("website") ?? ""),
+        rss_feed_url: String(fields.get("rss_feed_url") ?? "").trim() || null,
       });
       setCompetitors((current) => [...current, competitor]);
       form.reset();
@@ -1588,6 +1597,13 @@ function Configuration() {
                 <label>First page to watch
                   <input name="website" type="url" placeholder="https://example.com" required />
                 </label>
+                <div className="add-source-feed">
+                  <label>RSS feed URL (optional)
+                    <input name="rss_feed_url" type="url" placeholder="https://example.com/feed.xml"
+                      aria-describedby="add-source-feed-help" />
+                  </label>
+                  <small className="muted" id="add-source-feed-help">Find new articles from this source.</small>
+                </div>
                 <button className="button-primary" type="submit">{saving ? "Saving…" : "Add source"}</button>
               </fieldset>
               {saveError && <p role="alert">{saveError}</p>}
