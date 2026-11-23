@@ -646,8 +646,8 @@ function Digest({ held }: { held: boolean }) {
       </div>
       {!held && (
         <details className="panel demo-video">
-          <summary>Watch demo</summary>
-          <video src={demoVideoUrl} controls preload="none" playsInline aria-label="SignalWatch demo video" />
+          <summary>Watch the walkthrough</summary>
+          <video src={demoVideoUrl} controls preload="none" playsInline aria-label="SignalWatch walkthrough video" />
           <a href={demoVideoUrl}>Open video directly</a>
         </details>
       )}
