@@ -12,7 +12,7 @@ from signalwatch import changedetection, storage
 from signalwatch.changes import save_new_changes
 
 _INTERVAL_ENV = "SIGNALWATCH_CATCHUP_INTERVAL_SECONDS"
-_DEFAULT_INTERVAL_SECONDS = 60
+_DEFAULT_INTERVAL_SECONDS = 30 * 60
 catchup_logger = structlog.get_logger()
 
 
