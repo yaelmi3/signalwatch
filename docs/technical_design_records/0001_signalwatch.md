@@ -5,6 +5,7 @@ SignalWatch watches competitor sites for new articles and quiet page edits. It t
 ## Why we chose these tools
 
 **[changedetection.io](https://github.com/dgtlmoon/changedetection.io)** already handles scheduled checks, keeps page history, and lets us read saved copies through an API. We reused it to avoid writing and maintaining a page monitoring engine. It checks each configured page on a schedule, saves changed versions, and notifies SignalWatch when it finds a change.
+We started with HTTP fetching to keep the pilot lightweight, and monitoring JavaScript-rendered pages would require adding a browser service and configuring changedetection.io to use its Playwright fetch backend.
 
 **SQLite** fits one host with one background worker and modest write traffic. It saves state on a persistent disk and needs no database server. The Python app stores settings, results, and feedback in one SQLite file. DBOS, the library that runs background jobs, saves progress in a second file so work can resume after a restart. We considered PostgreSQL with PgQueuer and Temporal. Both would add a service to operate.
 
