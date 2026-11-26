@@ -278,7 +278,7 @@ def analyze_article(
     candidates = [
         paragraph
         for paragraph in publisher_text.splitlines()
-        if paragraph.rstrip().endswith((".", "!", "?")) and any(quote in paragraph for quote in quotes)
+        if paragraph.strip() and any(quote in paragraph for quote in quotes)
     ]
     if not interests.business_context or not candidates:
         held = ArticleAnalysisResult(**draft.model_dump(), change_quote=None)

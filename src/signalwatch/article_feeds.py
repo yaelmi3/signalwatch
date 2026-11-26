@@ -39,9 +39,7 @@ def parse_feed(content: bytes, feed_url: str) -> list[storage.Article]:
         url = public_http_url(link)
         if url is None or _link_identity(url) in listing_links:
             continue
-        comments = public_http_url(item.findtext("comments", "").strip())
-        if comments is None or _link_identity(url) != _link_identity(comments):
-            articles.append(storage.Article(title=title, article_url=link))
+        articles.append(storage.Article(title=title, article_url=link))
     return articles
 
 

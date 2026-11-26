@@ -23,6 +23,41 @@ from signalwatch import analysis_worker, article_content, article_feeds, slack_d
 from signalwatch.analysis_models import ArticleAnalysisResult, ChangeAnalysisResult, TeamDecision, TeamInterests
 
 
+def test_article_verifier_receives_exact_quotes_from_unpunctuated_passages(monkeypatch: pytest.MonkeyPatch) -> None:
+    sso = "Added SAML SSO for Enterprise"
+    integrations = "New integrations: Snowflake and Databricks"
+    interests = TeamInterests(
+        business_context="Enterprise software", marketing="Enterprise access controls", product="Data integrations"
+    )
+    held = TeamDecision(relevant=False, reason="No match", quote=None)
+    access_match = TeamDecision(relevant=True, reason="Compare enterprise login options", quote=sso)
+    integration_match = TeamDecision(relevant=True, reason="Compare supported data integrations", quote=integrations)
+    draft = ChangeAnalysisResult(
+        summary="The release adds access controls and integrations.",
+        marketing=access_match,
+        product=integration_match,
+        research_and_development=held,
+    )
+    verified = ArticleAnalysisResult(
+        summary="", change_quote=sso, marketing=access_match, product=held, research_and_development=held
+    )
+    parse_model = Mock(side_effect=[draft, verified])
+    monkeypatch.setattr(analysis_worker, "_parse_model", parse_model)
+
+    result = analysis_worker.analyze_article(
+        title="Release notes",
+        publisher_text=f"{sso}\n\n{integrations}\nThe vendor redesigned its help page.",
+        interests=interests,
+        model="test-model",
+        logger=analysis_worker.analysis_logger,
+    )
+
+    assert result is not None and result.change_quote == sso
+    assert result.summary == draft.summary
+    assert result.marketing.relevant and not result.product.relevant
+    assert parse_model.call_args.kwargs["payload"]["candidate_passages"] == [sso, integrations]
+
+
 def test_feedback_suggestion_runs_in_worker_with_saved_article_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -212,8 +247,9 @@ def test_worker_retries_handoff_and_limits_model_calls(
     attempts: Counter[int | str] = Counter()
     publisher_reads: Counter[str] = Counter()
     change = "The new tide sensor logs wave height every minute."
+    unpunctuated_change = change.removesuffix(".")
     other_change = "A customer described a previous sensor prototype."
-    publisher_text = f"{change.removesuffix('.')}\n{change}\n{other_change}\nThe vendor redesigned the help page."
+    publisher_text = f"{unpunctuated_change}\n{change}\n{other_change}\nThe vendor redesigned the help page."
     active = peak = 0
     slack_posts: list[str] = []
 
@@ -266,7 +302,7 @@ def test_worker_retries_handoff_and_limits_model_calls(
             assert evidence["publisher_text"] == publisher_text
             item, summary = "article-draft", publisher_text
         elif "candidate_passages" in evidence:
-            assert evidence["candidate_passages"] == [change, other_change]
+            assert evidence["candidate_passages"] == [unpunctuated_change, change, other_change]
             assert set(evidence) == {"candidate_passages", "team_interests", "business_context"}
             item, summary = "article-verifier", "The verifier's summary should not be saved."
         else:
@@ -526,6 +562,17 @@ def test_evidence_keeps_scattered_edits_on_a_long_page(
         assert sum(map(len, evidence[side])) <= 12_000
 
 
+def test_feed_uses_article_link_with_comments_fragment() -> None:
+    body = b"""<rss version="2.0"><channel>
+      <item><title>Release notes</title><link>https://example.com/post</link>
+        <comments>https://example.com/post#comments</comments></item>
+    </channel></rss>"""
+
+    assert article_feeds.parse_feed(body, "https://example.com/feed.xml") == [
+        storage.Article("Release notes", "https://example.com/post")
+    ]
+
+
 def test_feed_sync_pins_requests_and_isolates_failed_feeds(monkeypatch: pytest.MonkeyPatch) -> None:
     feed = storage.ArticleFeed(3, "https://source.test/feed.xml")
     feeds = [
@@ -538,8 +585,8 @@ def test_feed_sync_pins_requests_and_isolates_failed_feeds(monkeypatch: pytest.M
     body = b"""<rss version="2.0"><channel><link>https://source.test/</link>
       <item><title>Listing</title><link>http://source.test/#latest</link></item>
       <item><title>Feed</title><link>https://source.test/feed.xml</link></item>
-      <item><title>Discussion</title><link>https://source.test/discussion</link>
-        <comments>https://source.test/discussion#comments</comments></item>
+      <item><title>Update</title><link>https://source.test/update</link>
+        <comments>https://source.test/update</comments></item>
       <item><title>Private</title><link>http://0x7f.0.0.1/</link></item>
       <item><title>Credentials</title><link>https://user:password@publisher.test/</link></item>
       <item><title>Release &amp; details</title><link>https://source.test/story?edition=1&amp;ref=rss</link></item>
@@ -569,7 +616,9 @@ def test_feed_sync_pins_requests_and_isolates_failed_feeds(monkeypatch: pytest.M
     article_feeds.sync_feeds()
 
     assert requested == ["broken.test", "source.test"]
-    assert saved == [(feed, [storage.Article("Release & details", "https://source.test/story?edition=1&ref=rss")])]
+    update = storage.Article("Update", "https://source.test/update")
+    release = storage.Article("Release & details", "https://source.test/story?edition=1&ref=rss")
+    assert saved == [(feed, [update, release])]
 
 
 @pytest.mark.parametrize("status", [HTTPStatus.OK, HTTPStatus.FOUND])
