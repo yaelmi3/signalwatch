@@ -34,3 +34,5 @@ GitHub Actions builds the exact revision pushed to `main` and deploys it to a si
 ## Where the design stops
 
 More sources mean more fetches, more topics give the model more to evaluate, and more channels mean more sends. The worker runs up to two analysis jobs at a time. Queue delay, source freshness, and model cost would guide when to add capacity or move to PostgreSQL for multiple hosts. Article discovery is limited to configured RSS feeds. For a business handoff, the remaining work is private access with separate roles, off-host backups with a tested restore, and an owner for credentials and alerts.
+
+Automatic retention and cleanup are future work. Long-running deployments need retention policies for detector snapshots, application history, article evidence, completed DBOS workflows, and backups. Cleanup must preserve change-detection checkpoints, article deduplication, unfinished workflows, and evidence needed to evaluate analysis quality.
